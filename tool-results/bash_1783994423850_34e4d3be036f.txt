@@ -1,0 +1,982 @@
+===== .zscripts/start.sh =====
+#!/bin/sh
+
+set -e
+
+# 获取脚本所在目录
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUILD_DIR="$SCRIPT_DIR"
+
+# 存储所有子进程的 PID
+pids=""
+
+# 清理函数：优雅关闭所有服务
+cleanup() {
+    echo ""
+    echo "🛑 正在关闭所有服务..."
+    
+    # 发送 SIGTERM 信号给所有子进程
+    for pid in $pids; do
+        if kill -0 "$pid" 2>/dev/null; then
+            service_name=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
+            echo "   关闭进程 $pid ($service_name)..."
+            kill -TERM "$pid" 2>/dev/null
+        fi
+    done
+    
+    # 等待所有进程退出（最多等待 5 秒）
+    sleep 1
+    for pid in $pids; do
+        if kill -0 "$pid" 2>/dev/null; then
+            # 如果还在运行，等待最多 4 秒
+            timeout=4
+            while [ $timeout -gt 0 ] && kill -0 "$pid" 2>/dev/null; do
+                sleep 1
+                timeout=$((timeout - 1))
+            done
+            # 如果仍然在运行，强制关闭
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "   强制关闭进程 $pid..."
+                kill -KILL "$pid" 2>/dev/null
+            fi
+        fi
+    done
+    
+    echo "✅ 所有服务已关闭"
+    exit 0
+}
+
+echo "🚀 开始启动所有服务..."
+echo ""
+
+# 切换到构建目录
+cd "$BUILD_DIR" || exit 1
+
+ls -lah
+
+DEFAULT_PACKAGED_DB_PATH="/app/db/custom.db"
+DEFAULT_PACKAGED_DATABASE_URL="file:$DEFAULT_PACKAGED_DB_PATH"
+
+# 启动 Next.js 服务器
+if [ -f "./next-service-dist/server.js" ]; then
+    echo "🚀 启动 Next.js 服务器..."
+    cd next-service-dist/ || exit 1
+    
+    # 设置环境变量
+    export NODE_ENV=production
+    export PORT="${PORT:-3000}"
+    export HOSTNAME="${HOSTNAME:-0.0.0.0}"
+    export DATABASE_URL="${DATABASE_URL:-$DEFAULT_PACKAGED_DATABASE_URL}"
+
+    if [ "$DATABASE_URL" = "$DEFAULT_PACKAGED_DATABASE_URL" ]; then
+        if [ ! -f "$DEFAULT_PACKAGED_DB_PATH" ]; then
+            echo "❌ 未找到打包后的数据库文件 $DEFAULT_PACKAGED_DB_PATH"
+            echo "   为避免生产环境启动到空数据库，启动已终止"
+            exit 1
+        fi
+
+        echo "🗄️  当前使用打包数据库: $DEFAULT_PACKAGED_DB_PATH"
+    else
+        echo "🗄️  当前使用外部指定数据库: $DATABASE_URL"
+    fi
+    
+    # 后台启动 Next.js
+    bun server.js &
+    NEXT_PID=$!
+    pids="$NEXT_PID"
+    
+    # 等待一小段时间检查进程是否成功启动
+    sleep 1
+    if ! kill -0 "$NEXT_PID" 2>/dev/null; then
+        echo "❌ Next.js 服务器启动失败"
+        exit 1
+    else
+        echo "✅ Next.js 服务器已启动 (PID: $NEXT_PID, Port: $PORT)"
+    fi
+    
+    cd ../
+else
+    echo "⚠️  未找到 Next.js 服务器文件: ./next-service-dist/server.js"
+fi
+
+# 启动 mini-services
+if [ -f "./mini-services-start.sh" ]; then
+    echo "🚀 启动 mini-services..."
+    
+    # 运行启动脚本（从根目录运行，脚本内部会处理 mini-services-dist 目录）
+    sh ./mini-services-start.sh &
+    MINI_PID=$!
+    pids="$pids $MINI_PID"
+    
+    # 等待一小段时间检查进程是否成功启动
+    sleep 1
+    if ! kill -0 "$MINI_PID" 2>/dev/null; then
+        echo "⚠️  mini-services 可能启动失败，但继续运行..."
+    else
+        echo "✅ mini-services 已启动 (PID: $MINI_PID)"
+    fi
+elif [ -d "./mini-services-dist" ]; then
+    echo "⚠️  未找到 mini-services 启动脚本，但目录存在"
+else
+    echo "ℹ️  mini-services 目录不存在，跳过"
+fi
+
+# 启动 Caddy（如果存在 Caddyfile）
+echo "🚀 启动 Caddy..."
+
+# Caddy 作为前台进程运行（主进程）
+echo "✅ Caddy 已启动（前台运行）"
+echo ""
+echo "🎉 所有服务已启动！"
+echo ""
+echo "💡 按 Ctrl+C 停止所有服务"
+echo ""
+
+# Caddy 作为主进程运行
+exec caddy run --config Caddyfile --adapter caddyfile
+
+===== .zscripts/.zscripts/supervise-server.sh =====
+#!/bin/bash
+# Self-restarting supervisor for the Next.js production server.
+# Restarts the server if it crashes, with a small backoff.
+cd /home/z/my-project
+export NODE_ENV=production
+export PORT=3000
+export HOSTNAME=0.0.0.0
+
+while true; do
+  echo "[$(date '+%H:%M:%S')] Starting next start..."
+  ./node_modules/.bin/next start -p 3000
+  EXIT_CODE=$?
+  echo "[$(date '+%H:%M:%S')] Server exited with code $EXIT_CODE. Restarting in 3s..."
+  sleep 3
+done
+
+===== .zscripts/dev.sh =====
+#!/bin/bash
+
+set -euo pipefail
+
+# 获取脚本所在目录（.zscripts）
+# 使用 $0 获取脚本路径（与 build.sh 保持一致）
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+log_step_start() {
+	local step_name="$1"
+	echo "=========================================="
+	echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting: $step_name"
+	echo "=========================================="
+	export STEP_START_TIME
+	STEP_START_TIME=$(date +%s)
+}
+
+log_step_end() {
+	local step_name="${1:-Unknown step}"
+	local end_time
+	end_time=$(date +%s)
+	local duration=$((end_time - STEP_START_TIME))
+	echo "=========================================="
+	echo "[$(date '+%Y-%m-%d %H:%M:%S')] Completed: $step_name"
+	echo "[LOG] Step: $step_name | Duration: ${duration}s"
+	echo "=========================================="
+	echo ""
+}
+
+start_mini_services() {
+	local mini_services_dir="$PROJECT_DIR/mini-services"
+	local started_count=0
+
+	log_step_start "Starting mini-services"
+	if [ ! -d "$mini_services_dir" ]; then
+		echo "Mini-services directory not found, skipping..."
+		log_step_end "Starting mini-services"
+		return 0
+	fi
+
+	echo "Found mini-services directory, scanning for sub-services..."
+
+	for service_dir in "$mini_services_dir"/*; do
+		if [ ! -d "$service_dir" ]; then
+			continue
+		fi
+
+		local service_name
+		service_name=$(basename "$service_dir")
+		echo "Checking service: $service_name"
+
+		if [ ! -f "$service_dir/package.json" ]; then
+			echo "[$service_name] No package.json found, skipping..."
+			continue
+		fi
+
+		if ! grep -q '"dev"' "$service_dir/package.json"; then
+			echo "[$service_name] No dev script found, skipping..."
+			continue
+		fi
+
+		echo "Starting $service_name in background..."
+		(
+			cd "$service_dir"
+			echo "[$service_name] Installing dependencies..."
+			bun install
+			echo "[$service_name] Running bun run dev..."
+			exec bun run dev
+		) >"$PROJECT_DIR/.zscripts/mini-service-${service_name}.log" 2>&1 &
+
+		local service_pid=$!
+		echo "[$service_name] Started in background (PID: $service_pid)"
+		echo "[$service_name] Log: $PROJECT_DIR/.zscripts/mini-service-${service_name}.log"
+		disown "$service_pid" 2>/dev/null || true
+		started_count=$((started_count + 1))
+	done
+
+	echo "Mini-services startup completed. Started $started_count service(s)."
+	log_step_end "Starting mini-services"
+}
+
+wait_for_service() {
+	local host="$1"
+	local port="$2"
+	local service_name="$3"
+	local max_attempts="${4:-60}"
+	local attempt=1
+
+	echo "Waiting for $service_name to be ready on $host:$port..."
+
+	while [ "$attempt" -le "$max_attempts" ]; do
+		if curl -s --connect-timeout 2 --max-time 5 "http://$host:$port" >/dev/null 2>&1; then
+			echo "$service_name is ready!"
+			return 0
+		fi
+
+		echo "Attempt $attempt/$max_attempts: $service_name not ready yet, waiting..."
+		sleep 1
+		attempt=$((attempt + 1))
+	done
+
+	echo "ERROR: $service_name failed to start within $max_attempts seconds"
+	return 1
+}
+
+cleanup() {
+	if [ -n "${DEV_PID:-}" ] && kill -0 "$DEV_PID" >/dev/null 2>&1; then
+		echo "Stopping Next.js dev server (PID: $DEV_PID)..."
+		kill "$DEV_PID" >/dev/null 2>&1 || true
+	fi
+}
+
+trap cleanup EXIT INT TERM
+
+cd "$PROJECT_DIR"
+
+if ! command -v bun >/dev/null 2>&1; then
+	echo "ERROR: bun is not installed or not in PATH"
+	exit 1
+fi
+
+log_step_start "bun install"
+echo "[BUN] Installing dependencies..."
+bun install
+log_step_end "bun install"
+
+log_step_start "bun run db:push"
+echo "[BUN] Setting up database..."
+bun run db:push
+log_step_end "bun run db:push"
+
+log_step_start "Starting Next.js dev server"
+echo "[BUN] Starting development server..."
+bun run dev &
+DEV_PID=$!
+log_step_end "Starting Next.js dev server"
+
+log_step_start "Waiting for Next.js dev server"
+wait_for_service "localhost" "3000" "Next.js dev server"
+log_step_end "Waiting for Next.js dev server"
+
+log_step_start "Health check"
+echo "[BUN] Performing health check..."
+curl -fsS localhost:3000 >/dev/null
+echo "[BUN] Health check passed"
+log_step_end "Health check"
+
+start_mini_services
+
+echo "Next.js dev server is running in background (PID: $DEV_PID)."
+echo "Use 'kill $DEV_PID' to stop it."
+disown "$DEV_PID" 2>/dev/null || true
+unset DEV_PID
+
+===== .zscripts/mini-services-start.sh =====
+#!/bin/sh
+
+# 配置项
+DIST_DIR="./mini-services-dist"
+
+# 存储所有子进程的 PID
+pids=""
+
+# 清理函数：优雅关闭所有服务
+cleanup() {
+    echo ""
+    echo "🛑 正在关闭所有服务..."
+    
+    # 发送 SIGTERM 信号给所有子进程
+    for pid in $pids; do
+        if kill -0 "$pid" 2>/dev/null; then
+            service_name=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
+            echo "   关闭进程 $pid ($service_name)..."
+            kill -TERM "$pid" 2>/dev/null
+        fi
+    done
+    
+    # 等待所有进程退出（最多等待 5 秒）
+    sleep 1
+    for pid in $pids; do
+        if kill -0 "$pid" 2>/dev/null; then
+            # 如果还在运行，等待最多 4 秒
+            timeout=4
+            while [ $timeout -gt 0 ] && kill -0 "$pid" 2>/dev/null; do
+                sleep 1
+                timeout=$((timeout - 1))
+            done
+            # 如果仍然在运行，强制关闭
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "   强制关闭进程 $pid..."
+                kill -KILL "$pid" 2>/dev/null
+            fi
+        fi
+    done
+    
+    echo "✅ 所有服务已关闭"
+}
+
+main() {
+    echo "🚀 开始启动所有 mini services..."
+    
+    # 检查 dist 目录是否存在
+    if [ ! -d "$DIST_DIR" ]; then
+        echo "ℹ️  目录 $DIST_DIR 不存在"
+        return
+    fi
+    
+    # 查找所有 mini-service-*.js 文件
+    service_files=""
+    for file in "$DIST_DIR"/mini-service-*.js; do
+        if [ -f "$file" ]; then
+            if [ -z "$service_files" ]; then
+                service_files="$file"
+            else
+                service_files="$service_files $file"
+            fi
+        fi
+    done
+    
+    # 计算服务文件数量
+    service_count=0
+    for file in $service_files; do
+        service_count=$((service_count + 1))
+    done
+    
+    if [ $service_count -eq 0 ]; then
+        echo "ℹ️  未找到任何 mini service 文件"
+        return
+    fi
+    
+    echo "📦 找到 $service_count 个服务，开始启动..."
+    echo ""
+    
+    # 启动每个服务
+    for file in $service_files; do
+        service_name=$(basename "$file" .js | sed 's/mini-service-//')
+        echo "▶️  启动服务: $service_name..."
+        
+        # 使用 bun 运行服务（后台运行）
+        bun "$file" &
+        pid=$!
+        if [ -z "$pids" ]; then
+            pids="$pid"
+        else
+            pids="$pids $pid"
+        fi
+        
+        # 等待一小段时间检查进程是否成功启动
+        sleep 0.5
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "❌ $service_name 启动失败"
+            # 从字符串中移除失败的 PID
+            pids=$(echo "$pids" | sed "s/\b$pid\b//" | sed 's/  */ /g' | sed 's/^ *//' | sed 's/ *$//')
+        else
+            echo "✅ $service_name 已启动 (PID: $pid)"
+        fi
+    done
+    
+    # 计算运行中的服务数量
+    running_count=0
+    for pid in $pids; do
+        if kill -0 "$pid" 2>/dev/null; then
+            running_count=$((running_count + 1))
+        fi
+    done
+    
+    echo ""
+    echo "🎉 所有服务已启动！共 $running_count 个服务正在运行"
+    echo ""
+    echo "💡 按 Ctrl+C 停止所有服务"
+    echo ""
+    
+    # 等待所有后台进程
+    wait
+}
+
+main
+
+
+===== .zscripts/build.sh =====
+#!/bin/bash
+
+# 将 stderr 重定向到 stdout，避免 execute_command 因为 stderr 输出而报错
+exec 2>&1
+
+set -e
+
+# 获取脚本所在目录（.zscripts 目录，即 workspace-agent/.zscripts）
+# 使用 $0 获取脚本路径（兼容 sh 和 bash）
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Next.js 项目路径
+NEXTJS_PROJECT_DIR="/home/z/my-project"
+
+# 检查 Next.js 项目目录是否存在
+if [ ! -d "$NEXTJS_PROJECT_DIR" ]; then
+    echo "❌ 错误: Next.js 项目目录不存在: $NEXTJS_PROJECT_DIR"
+    exit 1
+fi
+
+echo "🚀 开始构建 Next.js 应用和 mini-services..."
+echo "📁 Next.js 项目路径: $NEXTJS_PROJECT_DIR"
+
+# 切换到 Next.js 项目目录
+cd "$NEXTJS_PROJECT_DIR" || exit 1
+
+# 设置环境变量
+export NEXT_TELEMETRY_DISABLED=1
+
+BUILD_DIR="/tmp/build_fullstack_$BUILD_ID"
+echo "📁 清理并创建构建目录: $BUILD_DIR"
+mkdir -p "$BUILD_DIR"
+
+# 安装依赖
+echo "📦 安装依赖..."
+bun install
+
+# 构建 Next.js 应用
+echo "🔨 构建 Next.js 应用..."
+bun run build
+
+# 构建 mini-services
+# 检查 Next.js 项目目录下是否有 mini-services 目录
+if [ -d "$NEXTJS_PROJECT_DIR/mini-services" ]; then
+    echo "🔨 构建 mini-services..."
+    # 使用 workspace-agent 目录下的 mini-services 脚本
+    sh "$SCRIPT_DIR/mini-services-install.sh"
+    sh "$SCRIPT_DIR/mini-services-build.sh"
+
+    # 复制 mini-services-start.sh 到 mini-services-dist 目录
+    echo "  - 复制 mini-services-start.sh 到 $BUILD_DIR"
+    cp "$SCRIPT_DIR/mini-services-start.sh" "$BUILD_DIR/mini-services-start.sh"
+    chmod +x "$BUILD_DIR/mini-services-start.sh"
+else
+    echo "ℹ️  mini-services 目录不存在，跳过"
+fi
+
+# 将所有构建产物复制到临时构建目录
+echo "📦 收集构建产物到 $BUILD_DIR..."
+
+# 复制 Next.js standalone 构建输出
+if [ -d ".next/standalone" ]; then
+    echo "  - 复制 .next/standalone"
+    cp -r .next/standalone "$BUILD_DIR/next-service-dist/"
+fi
+
+# 复制 Next.js 静态文件
+if [ -d ".next/static" ]; then
+    echo "  - 复制 .next/static"
+    mkdir -p "$BUILD_DIR/next-service-dist/.next"
+    cp -r .next/static "$BUILD_DIR/next-service-dist/.next/"
+fi
+
+# 复制 public 目录
+if [ -d "public" ]; then
+    echo "  - 复制 public"
+    cp -r public "$BUILD_DIR/next-service-dist/"
+fi
+
+# 将测试环境数据库复制到构建产物中，生产环境直接使用这份数据库
+if [ -f "./db/custom.db" ]; then
+    echo "🗄️  复制测试环境数据库到构建产物..."
+    mkdir -p "$BUILD_DIR/db"
+    cp -r ./db/. "$BUILD_DIR/db/"
+
+    echo "🗄️  同步构建产物中的数据库结构..."
+    DATABASE_URL="file:$BUILD_DIR/db/custom.db" bun run db:push
+    echo "✅ 构建产物数据库已准备完成"
+    ls -lah "$BUILD_DIR/db"
+else
+    echo "❌ 未找到测试环境数据库文件 ./db/custom.db，无法继续构建生产包"
+    exit 1
+fi
+
+# 复制 Caddyfile（如果存在）
+if [ -f "Caddyfile" ]; then
+    echo "  - 复制 Caddyfile"
+    cp Caddyfile "$BUILD_DIR/"
+else
+    echo "ℹ️  Caddyfile 不存在，跳过"
+fi
+
+# 复制 start.sh 脚本
+echo "  - 复制 start.sh 到 $BUILD_DIR"
+cp "$SCRIPT_DIR/start.sh" "$BUILD_DIR/start.sh"
+chmod +x "$BUILD_DIR/start.sh"
+
+# 打包到 $BUILD_DIR.tar.gz
+PACKAGE_FILE="${BUILD_DIR}.tar.gz"
+echo ""
+echo "📦 打包构建产物到 $PACKAGE_FILE..."
+cd "$BUILD_DIR" || exit 1
+tar -czf "$PACKAGE_FILE" .
+cd - > /dev/null || exit 1
+
+# # 清理临时目录
+# rm -rf "$BUILD_DIR"
+
+echo ""
+echo "✅ 构建完成！所有产物已打包到 $PACKAGE_FILE"
+echo "📊 打包文件大小:"
+ls -lh "$PACKAGE_FILE"
+
+===== /start.sh (sandbox init) =====
+#!/bin/bash
+
+set -e
+
+# Boot timeline observability: lets us attribute FC 412 (port 81 health check
+# failed in 120s) to image-pull vs start.sh-step latency. /proc/uptime gives
+# seconds since container start, so subtracting from current time isolates the
+# FC platform overhead from anything start.sh itself does.
+BOOT_TIMELINE=/tmp/boot-timeline.log
+: > "$BOOT_TIMELINE"
+# All helpers below guard /proc/uptime with `|| echo ?` so a missing file
+# (non-Linux dev shells, broken procfs) never trips set -e and kills bootstrap.
+boot_uptime() { awk '{print $1}' /proc/uptime 2>/dev/null || echo "?"; }
+boot_ts()     { date -u +%FT%TZ; }
+echo "[BOOT] start.sh entered at $(boot_ts) uptime=$(boot_uptime)s" | tee -a "$BOOT_TIMELINE"
+
+# Dump the full timeline on any exit. FC's 412 error body only captures stdout
+# tail; without this, all early-step durations get truncated and we lose the
+# evidence we need to pick a real fix.
+dump_boot_timeline() {
+    local rc=$?
+    echo "[BOOT] exit rc=$rc at $(boot_ts) uptime=$(boot_uptime)s" >> "$BOOT_TIMELINE"
+    echo ""
+    echo "==== BOOT TIMELINE (full) ===="
+    cat "$BOOT_TIMELINE" 2>/dev/null || true
+    echo "==== END BOOT TIMELINE ===="
+}
+trap dump_boot_timeline EXIT
+
+# 添加耗时统计函数
+log_step_start() {
+    local step_name="$1"
+    echo "=========================================="
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting: $step_name"
+    echo "=========================================="
+    echo "[BOOT] $(boot_ts) start step=\"$step_name\" uptime=$(boot_uptime)s" >> "$BOOT_TIMELINE"
+    export STEP_START_TIME=$(date +%s)
+}
+
+log_step_end() {
+    local step_name="$1"
+    if [ -z "$step_name" ]; then
+        step_name="Unknown step"
+    fi
+    local end_time=$(date +%s)
+    local duration=$((end_time - STEP_START_TIME))
+    echo "=========================================="
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Completed: $step_name"
+    echo "[LOG] Step: $step_name | Duration: ${duration}s"
+    echo "=========================================="
+    echo ""
+    echo "[BOOT] $(boot_ts) end   step=\"$step_name\" duration=${duration}s uptime=$(boot_uptime)s" >> "$BOOT_TIMELINE"
+}
+
+# 导出函数以便子shell可以使用
+export -f log_step_start
+export -f log_step_end
+
+# 检查 /home/sync 是否存在 repo.tar，决定走"全新项目"还是"恢复"分支
+log_step_start "Project initialization check"
+SYNC_DIR=/home/sync
+ARCHIVE="$SYNC_DIR/repo.tar"
+if [ ! -f "$ARCHIVE" ]; then
+  # 没有 repo.tar：要么是全新 chat，要么上次 pre-stop 写失败
+  if [ -n "$(ls -A $SYNC_DIR 2>/dev/null | grep -v '^\.' | grep -v '^upload$')" ]; then
+    echo "WARNING: $ARCHIVE missing but $SYNC_DIR has other content (likely failed pre-stop), treating as clean project"
+  else
+    echo "Whoa, wat a nice clean project"
+  fi
+  echo "DATABASE_URL=file:/home/z/my-project/db/custom.db" > /home/z/my-project/.env
+  mkdir -p /home/z/my-project/download && echo "Here are all the generated files." > /home/z/my-project/download/README.md
+  chown -R z:z /home/z/my-project/download
+  chmod -R 755 /home/z/my-project/download
+  # 确保 skills 目录存在并设置权限（只 chown skills，避免递归整个项目）
+  mkdir -p /home/z/my-project/skills
+  chown -R z:z /home/z/my-project/skills
+  chmod -R 755 /home/z/my-project/skills
+else
+  echo "restoring $SYNC_DIR to /home/z/my-project (archive size: $(stat -c%s "$ARCHIVE" 2>/dev/null || echo unknown) bytes)"
+  # 检查并处理可能存在的挂载点（如 upload 目录）
+  if [ -d "/home/z/my-project" ]; then
+    echo "Cleaning project directory (preserving mount points)..."
+    # 删除所有文件和目录，但跳过挂载点
+    find /home/z/my-project -mindepth 1 -maxdepth 1 ! -path "/home/z/my-project/upload" -exec rm -rf {} + 2>/dev/null || true
+    # 如果 upload 不是挂载点，也删除它
+    if ! mountpoint -q /home/z/my-project/upload 2>/dev/null; then
+      rm -rf /home/z/my-project/upload
+    else
+      echo "Skipping /home/z/my-project/upload (mount point detected)"
+    fi
+  fi
+  mkdir -p /home/z/my-project
+  if ! tar xf "$ARCHIVE" -C /home/z/my-project \
+    --exclude='./upload' \
+    --exclude='upload'; then
+    echo "WARNING: tar extraction failed (corrupted $ARCHIVE?), continuing with partially-restored project"
+  fi
+  echo "DATABASE_URL=file:/home/z/my-project/db/custom.db" > /home/z/my-project/.env
+
+  # 修改所有权和权限，但排除挂载点
+  if mountpoint -q /home/z/my-project/upload 2>/dev/null; then
+    echo "Setting ownership (handling upload mount point specially)..."
+    # 对根目录下的文件和目录分别处理（排除 upload）
+    find /home/z/my-project -mindepth 1 -maxdepth 1 ! -path "/home/z/my-project/upload" -exec chown -R z:z {} + 2>/dev/null || true
+    find /home/z/my-project -mindepth 1 -maxdepth 1 ! -path "/home/z/my-project/upload" -exec chmod -R 755 {} + 2>/dev/null || true
+    # OSS 挂载点是只读的，跳过权限设置
+    echo "Skipping permission changes on OSS mount point: /home/z/my-project/upload"
+  else
+    echo "Setting ownership (no mount points detected)..."
+    chown -R z:z /home/z/my-project
+    chmod -R 755 /home/z/my-project
+  fi
+fi
+chown -R z:z /home/z/my-project/.env
+log_step_end "Project initialization check"
+
+# 解压 official skills 文件到项目目录
+log_step_start "Extracting official skills to project"
+if [ -d "/home/official_skills" ]; then
+  echo "Extracting skills from /home/official_skills to /home/z/my-project/skills..."
+  mkdir -p /home/z/my-project/skills
+
+  # 从 stages.yaml 收集允许的 skill 名（所有 stage 的正向引用，去重），无配置则不限制
+  allowed_skills=""
+  if [ -f "/home/official_skills/stages.yaml" ]; then
+    allowed_skills=$(grep -E '^\s+-\s+\S' /home/official_skills/stages.yaml | sed 's/^\s*-\s*//' | tr -d '"'"'" | sort -u)
+    echo "Stages config found, allowed skills: $(echo "$allowed_skills" | tr '\n' ' ')"
+  fi
+
+  # 先按 allowed_skills 过滤，把要解压的 zip 写进临时列表，避免 unzip 阶段再判断
+  todo_file=$(mktemp)
+  zip_count=0
+  for zip_file in /home/official_skills/*.zip; do
+    [ -f "$zip_file" ] || continue
+    skill_name=$(basename "$zip_file" .zip)
+    if [ -n "$allowed_skills" ] && ! echo "$allowed_skills" | grep -qx "$skill_name"; then
+      echo "Skipping $skill_name: not in stages config"
+      continue
+    fi
+    echo "$zip_file" >> "$todo_file"
+    zip_count=$((zip_count + 1))
+  done
+
+  # 并行解压。FC 实例通常 1-2 vCPU，但 unzip 在 decompress 间隙会让出 CPU，
+  # -P 4 实测能把解压总耗时压到串行的 30-50%。-qq 比 -q 更安静，少了 -x 的
+  # "caution: excluded filename" 噪音行，减少 FC stdout buffering 开销。
+  #
+  # 每个 worker 先把 zip 顺序 cp 到本地 /tmp 再 unzip：FC layer 挂载点对随机小块
+  # 读延迟高（unzip 内部按小块读），改成"cp（大块顺序读）+ 本地 unzip"FC 团队
+  # 反馈能显著快于直接对挂载点 unzip。
+  if [ "$zip_count" -gt 0 ]; then
+    stage_dir=$(mktemp -d /tmp/skills_zip_XXXXXX)
+    xargs -a "$todo_file" -P 4 -I{} \
+      sh -c '
+        src="$1"; stage="$2"
+        base=$(basename "$src")
+        echo "Extracting $base..."
+        cp -f "$src" "$stage/$base"
+        unzip -qq -o "$stage/$base" -x "__MACOSX/*" -x "*.DS_Store" -x "._*" -d /home/z/my-project/skills/
+        rm -f "$stage/$base"
+      ' _ {} "$stage_dir"
+    rmdir "$stage_dir" 2>/dev/null || true
+  fi
+  rm -f "$todo_file"
+
+  # 修正所有权和权限。root 解压导致 owner 是 root，zip 内可能含受限权限位。
+  # 按 skills 下的顶层条目并发执行（不加 -type d，兼顾极少数直接散在顶层的文件），
+  # 比单线程 chown -R / chmod -R 在大量小文件上更快。
+  chown z:z /home/z/my-project/skills 2>/dev/null || true
+  find /home/z/my-project/skills -maxdepth 1 -mindepth 1 -print0 \
+    | xargs -0 -P 4 -I{} sh -c 'chown -R z:z "$1" 2>/dev/null; chmod -R 755 "$1" 2>/dev/null' _ {} \
+    || true
+
+  if [ "$zip_count" -eq 0 ]; then
+    echo "No zip files found in /home/official_skills"
+  else
+    echo "Successfully extracted $zip_count skill(s)"
+  fi
+else
+  echo "Warning: /home/official_skills directory not found"
+fi
+log_step_end "Extracting official skills to project"
+
+
+# 先给权限，防止产生一些用户配置
+log_step_start "Setting permissions"
+chown z:z /home/z
+chmod 755 /home/z
+# 确保 /home/sync 目录存在并给 z 用户读写权限
+mkdir -p /home/sync
+# 检查 /home/sync 是否为挂载点，如果是则跳过权限设置
+if mountpoint -q /home/sync 2>/dev/null; then
+  echo "Skipping permission changes on mount point: /home/sync"
+else
+  chmod 777 /home/sync
+fi
+log_step_end "Setting permissions"
+
+log_step_start "Loading z user profile"
+if [ -f /home/z/.bash_profile ]; then
+  # 非交互执行时，部分 .bash_profile 会判断 [ -z "$PS1" ] 直接 return
+  set -a
+  # shellcheck disable=SC1090
+  source /home/z/.bash_profile || true
+  set +a
+fi
+log_step_end "Loading z user profile"
+
+# 初始化 git（仅首次）
+log_step_start "Git setup"
+cd /home/z/my-project
+
+su z -c "
+git config --global --add safe.directory /home/z/my-project
+git config --global user.email 'z@container'
+git config --global user.name 'Z User'
+"
+
+# Write .gitignore BEFORE any git op so git can prune skills/ as it walks the
+# working tree. Without this, `git add .` lstats every file under
+# /home/z/my-project/skills/ (~10k+ files from the 58 freshly-extracted official
+# skill zips), blows past the 60s boot budget, and trips the EXIT trap — FC
+# treats the SIGTERM as an unhealthy instance and rebuilds, looping forever.
+# Incident 2026-06-09: agent-claw-cb40fa5b boot-looped 36 times in 12.5h.
+# The same .gitignore also keeps runtime git_commit (app/util/git.py, git add -A)
+# from hashing the skill tree on every user commit.
+#
+# Scope is intentionally narrow: only skills/ and node_modules/. Both are already
+# explicitly excluded in the /git/ls-tree handler (mcp.py:600
+# `iglob("!node_modules").iglob("!skills")`), so adding them to .gitignore
+# costs nothing visible. Wider entries (upload/, download/, db/, *.log, .venv/,
+# __pycache__/, .next/, dist/, build/) used to live here too but `ripgrep --files`
+# honors .gitignore by default, which silently hid those dirs from /git/ls-tree —
+# the dir tree the agent uses to enumerate user-visible project content. Keep
+# this list minimal; do not add anything that the ls-tree handler doesn't
+# already exclude.
+#
+# Auto-heal for instances polluted by b407e6a's broad .gitignore: that commit
+# wrote `upload/` `download/` `db/` etc. into the file, then `git add . && git
+# commit` tracked the .gitignore, so the broad version is baked into repo.tar
+# and self-perpetuates across cold starts. Detect via the unique triple
+# upload/+download/+db/ (sandbox-internal dir names that would never coincide
+# in a user-authored .gitignore) and rewrite to the narrow version. Runs once
+# per affected instance; after the rewrite + the next runtime git_commit, the
+# narrow version lands in tar and the trigger no longer fires (convergent).
+needs_gitignore_write=false
+if [ ! -f /home/z/my-project/.gitignore ]; then
+  needs_gitignore_write=true
+elif grep -qE '^upload/$' /home/z/my-project/.gitignore \
+     && grep -qE '^download/$' /home/z/my-project/.gitignore \
+     && grep -qE '^db/$' /home/z/my-project/.gitignore; then
+  echo "[BOOT] auto-heal: detected broad .gitignore from b407e6a, rewriting to narrow"
+  needs_gitignore_write=true
+fi
+if [ "$needs_gitignore_write" = "true" ]; then
+  cat > /home/z/my-project/.gitignore <<'EOF'
+skills/
+node_modules/
+EOF
+  chown z:z /home/z/my-project/.gitignore
+fi
+
+if [ ! -d ".git" ]; then
+  echo "Initializing git repository for the first time..."
+  # Split init/add/commit into per-command timing so the next 412 tells us
+  # *which* sub-step hangs. Each command is wrapped in `timeout` so a real
+  # hang fails fast (~60s) instead of dragging out to FC's 120s deadline +
+  # SIGKILL — failing via bash's normal exit path lets the EXIT trap fire
+  # and dump /tmp/boot-timeline.log to FC's log buffer.
+  echo "[BOOT] $(boot_ts) git: starting init" | tee -a "$BOOT_TIMELINE"
+  su z -c "cd /home/z/my-project && git config --global init.defaultBranch main && timeout --kill-after=10s 60s git init"
+  echo "[BOOT] $(boot_ts) git: init done" >> "$BOOT_TIMELINE"
+
+  echo "[BOOT] $(boot_ts) git: starting add ." | tee -a "$BOOT_TIMELINE"
+  su z -c "cd /home/z/my-project && timeout --kill-after=10s 60s git add ."
+  echo "[BOOT] $(boot_ts) git: add done" >> "$BOOT_TIMELINE"
+
+  echo "[BOOT] $(boot_ts) git: starting commit" | tee -a "$BOOT_TIMELINE"
+  su z -c "cd /home/z/my-project && timeout --kill-after=10s 60s git commit -m 'Initial commit'"
+  echo "[BOOT] $(boot_ts) git: commit done" >> "$BOOT_TIMELINE"
+else
+  echo "Existing git repository detected, preserving current git state."
+fi
+log_step_end "Git setup"
+
+log_step_start "Z.ai config setup"
+echo '{"baseUrl": "https://internal-api.z.ai/v1", "apiKey": "Z.ai"}' > /etc/.z-ai-config
+chmod 444 /etc/.z-ai-config
+log_step_end "Z.ai config setup"
+
+# 添加服务就绪检查函数
+wait_for_service() {
+    local host="$1"
+    local port="$2"
+    local service_name="$3"
+    local max_attempts=60
+    local attempt=1
+    
+    echo "Waiting for $service_name to be ready on $host:$port..."
+    
+    while [ $attempt -le $max_attempts ]; do
+        if curl -s --connect-timeout 2 --max-time 5 "http://$host:$port" > /dev/null 2>&1; then
+            echo "$service_name is ready!"
+            return 0
+        fi
+        
+        echo "Attempt $attempt/$max_attempts: $service_name not ready yet, waiting..."
+        sleep 1
+        attempt=$((attempt + 1))
+    done
+    
+    echo "ERROR: $service_name failed to start within $((max_attempts * 2)) seconds"
+    return 1
+}
+
+log_step_start "Starting ZAI service"
+# 启动ZAI服务（在后台运行，以 root 用户运行）
+# 注意：z 用户无法访问 /app/（700 权限）
+echo "Starting ZAI service in background as root..."
+(cd /app && uv run main.py) &
+ZAI_PID=$!
+log_step_end "Starting ZAI service"
+
+# 启动 bun 项目初始化（在后台运行）(如需)
+echo "Starting project initialization in background..."
+# 新版 走全栈 skill 逻辑
+if [ -f "/home/z/my-project/.zscripts/dev.sh" ]; then
+  echo "[INIT] Found custom dev script, running custom flow..."
+  (
+    log_step_start "custom dev script"
+    echo "[DEV] Found /home/z/my-project/.zscripts/dev.sh, executing..."
+    sudo -u z bash /home/z/my-project/.zscripts/dev.sh
+    log_step_end "custom dev script"
+  ) &
+  BUN_PID=$!
+# 兼容旧版，如果没有自定义 dev.sh，但存在 package.json，则走 bun + mini-services 逻辑
+elif [ -f "/home/z/my-project/package.json" ]; then
+  echo "[INIT] No custom dev script found, running bun + mini-services flow..."
+  (
+    log_step_start "bun install"
+    echo "[BUN] Installing dependencies..."
+    sudo -u z bun install
+    log_step_end "bun install"
+
+    log_step_start "bun run db:push"
+    echo "[BUN] Setting up database..."
+    sudo -u z bun run db:push
+    log_step_end "bun run db:push"
+
+    echo "[BUN] Starting development server..."
+    sudo -u z bun run dev &
+
+    # 等待开发服务器就绪
+    wait_for_service "localhost" "3000" "Next.js dev server"
+
+    # 服务就绪后执行健康检查
+    echo "[BUN] Performing health check..."
+    curl localhost:3000 || echo "[BUN] Health check failed, but continuing..."
+  ) &
+  BUN_PID=$!
+
+  # 启动 mini-services 目录下的所有子服务（后台运行，不阻塞）
+  log_step_start "Starting mini-services"
+  MINI_SERVICES_DIR="/home/z/my-project/mini-services"
+  if [ -d "$MINI_SERVICES_DIR" ]; then
+    echo "Found mini-services directory, scanning for sub-services..."
+
+    # 遍历 mini-services 目录下的所有子目录
+    for service_dir in "$MINI_SERVICES_DIR"/*; do
+      if [ -d "$service_dir" ]; then
+        service_name=$(basename "$service_dir")
+        echo "Checking service: $service_name"
+
+        # 检查是否有 package.json
+        if [ -f "$service_dir/package.json" ]; then
+          echo "Starting $service_name (has package.json) in background..."
+          (
+            cd "$service_dir"
+            # 先安装依赖
+            echo "[$service_name] Installing dependencies in background..."
+            sudo -u z bun install
+            # 只运行 dev 脚本
+            if grep -q '"dev"' package.json; then
+              echo "[$service_name] Running bun run dev..."
+              sudo -u z bun run dev
+            else
+              echo "[$service_name] No dev script found, skipping..."
+            fi
+          ) > /tmp/mini-service-${service_name}.log 2>&1 &
+          SERVICE_PID=$!
+          echo "[$service_name] Started in background (PID: $SERVICE_PID)"
+        else
+          echo "[$service_name] No package.json found, skipping..."
+        fi
+      fi
+    done
+
+    echo "Mini-services startup initiated (all running in background)"
+  else
+    echo "Mini-services directory not found, skipping..."
+  fi
+  log_step_end "Starting mini-services"
+else
+  echo "[INIT] Neither custom dev script nor package.json found, skipping project initialization."
+fi
+
+# 等待ZAI服务就绪
+log_step_start "Waiting for ZAI service"
+wait_for_service "localhost" "12600" "ZAI Control Service"
+if [ $? -ne 0 ]; then
+    echo "ERROR: ZAI service failed to start"
+    exit 1
+fi
+log_step_end "Waiting for ZAI service"
+
+# 启动 Caddy 服务器（最后运行，前台模式）
+log_step_start "Starting Caddy server"
+echo "Both services are ready. Starting Caddy with configuration from /app/Caddyfile..."
+echo "Caddy will run in foreground mode as the main process"
+exec caddy run --config /app/Caddyfile --adapter caddyfile
+
+===== /app/Caddyfile (if different) =====
