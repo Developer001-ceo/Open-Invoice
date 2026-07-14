@@ -27,8 +27,9 @@ export const CORNER_HANDLE_MAP = ['nw', 'ne', 'se', 'sw'] as const;
  * that shares the same horizontal edge as the given corner index.
  *   0 (TL) ↔ 1 (TR)   (top edge)
  *   2 (BR) ↔ 3 (BL)   (bottom edge)
- * When Alt+Shift is held, the partner corner's Y snaps to the dragged corner's
- * Y so both top (or both bottom) corners align perfectly horizontally.
+ * When Alt+Shift is held, the DRAGGED corner's Y snaps to this partner's Y so
+ * both top (or both bottom) corners align perfectly horizontally. The partner
+ * itself stays fixed.
  */
 export function horizontalAlignPartnerIndex(cornerIndex: number): number {
   // 0↔1, 1↔0, 2↔3, 3↔2
@@ -40,8 +41,9 @@ export function horizontalAlignPartnerIndex(cornerIndex: number): number {
  * that shares the same vertical edge as the given corner index.
  *   0 (TL) ↔ 3 (BL)   (left edge)
  *   1 (TR) ↔ 2 (BR)   (right edge)
- * When Alt+Ctrl is held, the partner corner's X snaps to the dragged corner's
- * X so both left (or both right) corners align perfectly vertically.
+ * When Alt+Ctrl is held, the DRAGGED corner's X snaps to this partner's X so
+ * both left (or both right) corners align perfectly vertically. The partner
+ * itself stays fixed.
  */
 export function verticalAlignPartnerIndex(cornerIndex: number): number {
   // 0↔3, 1↔2, 2↔1, 3↔0

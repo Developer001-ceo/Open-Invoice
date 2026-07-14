@@ -2521,47 +2521,60 @@ export const useDesignerStore = create<DesignerState>((set, get) => {
     // The store-level shiftHeld/ctrlHeld flags are driven by the canvas.tsx
     // keydown/keyup listeners, and the signature falls back to undefined → false
     // for any caller that didn't pass it (back-compat). The three modes are
-    // ORTHOGONAL and compose cleanly when both Shift and Ctrl are held:
+    // ORTHOGONAL and compose cleanly when both Shift and Ctrl are held.
+    //
+    // In ALL modes the DRAGGED corner is the one that moves into alignment;
+    // the partner corner(s) stay fixed at their original positions. (This is
+    // the inverse of the older behavior where the partner moved to meet the
+    // dragged corner.)
     //
     //   Alt + Shift             → HORIZONTAL align
-    //     The partner corner on the SAME horizontal edge snaps its Y to the
-    //     dragged corner's Y, so both top corners (or both bottom corners)
-    //     align perfectly horizontally. X of the partner is unchanged.
-    //       - Dragging TL (0) → TR (1) snaps to TL's Y
-    //       - Dragging TR (1) → TL (0) snaps to TR's Y
-    //       - Dragging BR (2) → BL (3) snaps to BR's Y
-    //       - Dragging BL (3) → BR (2) snaps to BL's Y
+    //     The DRAGGED corner's Y locks to its horizontal partner's Y, so both
+    //     top corners (or both bottom corners) end up on the same horizontal
+    //     line. The dragged corner's X is still free (follows the mouse).
+    //       - Dragging TL (0) → TL's Y snaps to TR (1)'s Y
+    //       - Dragging TR (1) → TR's Y snaps to TL (0)'s Y
+    //       - Dragging BR (2) → BR's Y snaps to BL (3)'s Y
+    //       - Dragging BL (3) → BL's Y snaps to BR (2)'s Y
     //
     //   Alt + Ctrl              → VERTICAL align
-    //     The partner corner on the SAME vertical edge snaps its X to the
-    //     dragged corner's X, so both left corners (or both right corners)
-    //     align perfectly vertically. Y of the partner is unchanged.
-    //       - Dragging TL (0) → BL (3) snaps to TL's X
-    //       - Dragging TR (1) → BR (2) snaps to TR's X
-    //       - Dragging BR (2) → TR (1) snaps to BR's X
-    //       - Dragging BL (3) → TL (0) snaps to BL's X
+    //     The DRAGGED corner's X locks to its vertical partner's X, so both
+    //     left corners (or both right corners) end up on the same vertical
+    //     line. The dragged corner's Y is still free (follows the mouse).
+    //       - Dragging TL (0) → TL's X snaps to BL (3)'s X
+    //       - Dragging TR (1) → TR's X snaps to BR (2)'s X
+    //       - Dragging BR (2) → BR's X snaps to TR (1)'s X
+    //       - Dragging BL (3) → BL's X snaps to TL (0)'s X
     //
     //   Alt + Shift + Ctrl      → BOTH (horizontal + vertical)
-    //     Both partner corners snap: the horizontal-edge partner's Y AND the
-    //     vertical-edge partner's X. For corners 0/2 the two partners are
+    //     The dragged corner snaps to (verticalPartner.X, horizontalPartner.Y).
+    //     Both partner corners stay fixed. For corners 0/2 the two partners are
     //     distinct (1 and 3); for corners 1/3 they're also distinct (0 and 2).
-    //     The dragged corner itself is always the new free-movement point.
     const alignH = !!shiftHeld;
     const alignV = !!ctrlHeld;
     const hPartner = horizontalAlignPartnerIndex(cornerIndex);
     const vPartner = verticalAlignPartnerIndex(cornerIndex);
 
+    // When an alignment modifier is held, the DRAGGED corner snaps to its
+    // partner corner's coordinate (the partner stays put). This is the inverse
+    // of the older behavior where the partner moved to meet the dragged corner.
+    //   Alt+Shift        → dragged corner's Y locks to the horizontal partner's Y
+    //   Alt+Ctrl         → dragged corner's X locks to the vertical partner's X
+    //   Alt+Shift+Ctrl   → dragged corner snaps to (vPartner.X, hPartner.Y)
+    // The free (unconstrained) axis keeps its snapped value from above so the
+    // corner still follows the mouse along the unconstrained direction.
+    let draggedX = newCornerX;
+    let draggedY = newCornerY;
+    if (alignH) {
+      draggedY = origCorners[hPartner].y;
+    }
+    if (alignV) {
+      draggedX = origCorners[vPartner].x;
+    }
+
     const newCorners: Point[] = origCorners.map((c, i) => {
       if (i === cornerIndex) {
-        return { x: newCornerX, y: newCornerY };
-      }
-      if (alignH && i === hPartner) {
-        // Horizontal align: snap partner's Y to the dragged corner's new Y.
-        return { x: c.x, y: newCornerY };
-      }
-      if (alignV && i === vPartner) {
-        // Vertical align: snap partner's X to the dragged corner's new X.
-        return { x: newCornerX, y: c.y };
+        return { x: draggedX, y: draggedY };
       }
       return { x: c.x, y: c.y };
     });

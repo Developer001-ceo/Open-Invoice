@@ -157,12 +157,13 @@ function EndpointHandle({
 //  - Plain drag (no Alt) → standard corner resize (nw/ne/se/sw). For a normal
 //    rect this preserves the axis-aligned box; for a deformed rect the polygon
 //    resizes per-edge (the opposite corner stays fixed).
-// Alignment modifiers (held during an Alt+drag):
-//  - Alt+Shift             → horizontal align (partner corner on the same
-//                            horizontal edge snaps its Y to the dragged corner's Y).
-//  - Alt+Ctrl              → vertical align (partner corner on the same vertical
-//                            edge snaps its X to the dragged corner's X).
-//  - Alt+Shift+Ctrl        → both (horizontal + vertical simultaneously).
+// Alignment modifiers (held during an Alt+drag). The DRAGGED corner is the one
+// that moves into alignment; the partner corner(s) stay fixed:
+//  - Alt+Shift             → horizontal align (dragged corner's Y snaps to its
+//                            horizontal partner's Y).
+//  - Alt+Ctrl              → vertical align (dragged corner's X snaps to its
+//                            vertical partner's X).
+//  - Alt+Shift+Ctrl        → both (dragged corner snaps to (vPartner.X, hPartner.Y)).
 function CornerHandle({
   x,
   y,
