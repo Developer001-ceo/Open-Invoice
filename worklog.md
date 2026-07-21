@@ -510,3 +510,27 @@ Stage Summary:
 - Dev server running persistently on port 3000 (Next.js 16.1.3 Turbopack) via double-fork setsid daemon
 - dev.log clean — only successful 200 responses, no compile/runtime/hydration errors
 - Preview is live and interactive in the preview panel; golden path (create template → enter designer) confirmed working
+
+---
+Task ID: cleanup-env-1
+Agent: main (Z.ai Code)
+Task: Remove the unused DATABASE_URL environment variable completely, since no code uses the database.
+
+Work Log:
+- Verified zero references to Prisma/DB in application code: no `process.env.*` in src/, no `@prisma/client` imports, no `src/lib/db.ts`, no API routes, no server actions
+- Confirmed `package.json` does not list prisma as a dependency (only available via sandbox env)
+- Removed `.env` (contained only `DATABASE_URL=file:/home/z/my-project/db/custom.db`)
+- Removed `prisma/` directory (unused schema.prisma with User/Post models)
+- Removed `db/` directory (unused SQLite file custom.db)
+- Left `.zscripts/` build/start scripts untouched (sandbox infrastructure scripts, not app code; modifying could break preview orchestration)
+- Left `.gitignore` `.env*` entry in place (good practice to keep)
+- Verified `bun run lint` passes clean (zero errors)
+- Restarted dev server WITHOUT .env: booted in 845ms, no DATABASE_URL error, "Ready" confirmed
+- Verified HTTP 200 on GET / (157KB page, title "Open Invoice"), dev.log shows only successful 200 responses
+- Browser-verified: page loads, no page errors, no console errors
+
+Stage Summary:
+- `.env`, `prisma/`, and `db/` all removed — the app is now a pure client-side application with zero env var dependencies
+- No code modifications were made to any application file
+- Lint passes, server boots clean without any env file, page renders and is interactive
+- App is now even simpler to deploy: no DATABASE_URL to configure, no Prisma to worry about
