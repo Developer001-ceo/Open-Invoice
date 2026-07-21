@@ -3,6 +3,7 @@ import { Geist, Geist_Mono, Black_Ops_One, Inter } from "next/font/google";
 import "./globals.css";
 import { Toaster } from "@/components/ui/toaster";
 import { NavbarStyles } from "@/components/designer/navbar-styles";
+import { Analytics } from "@vercel/analytics/next";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -138,6 +139,7 @@ export default function RootLayout({
         {children}
         <Toaster />
         <NavbarStyles />
+        <Analytics />
         {/* Suppress hydration mismatch warnings caused by browser extensions
             (e.g. bis_skin_checked, bis_register, __processed_* attributes)
             that inject attributes into the DOM before React hydrates. */}
