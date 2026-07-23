@@ -1,0 +1,642 @@
+     1→'use client';
+     2→
+     3→import { useDesignerStore, CanvasSettings, DEFAULT_CANVAS_SETTINGS, MARGIN_PRESETS, MarginPreset, PropertyDisplayMode } from '@/store/designer-store';
+     4→import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog';
+     5→import { Button } from '@/components/ui/button';
+     6→import { Input } from '@/components/ui/input';
+     7→import { Label } from '@/components/ui/label';
+     8→import { FolderOpen, Sparkles, PanelRight, Layers, Columns2, Lightbulb } from 'lucide-react';
+     9→import { Switch } from '@/components/ui/switch';
+    10→import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
+    11→import { motion } from 'framer-motion';
+    12→
+    13→// ---------- Presets ----------
+    14→const SIZE_PRESETS = [
+    15→  { label: 'A4', sublabel: '210 × 297 mm', widthPx: 794, heightPx: 1123 },
+    16→  { label: 'Letter', sublabel: '8.5 × 11 in', widthPx: 816, heightPx: 1056 },
+    17→  { label: 'A5', sublabel: '148 × 210 mm', widthPx: 559, heightPx: 794 },
+    18→  { label: 'Legal', sublabel: '8.5 × 14 in', widthPx: 816, heightPx: 1344 },
+    19→  { label: 'Receipt', sublabel: '80 × 297 mm', widthPx: 302, heightPx: 1123 },
+    20→  { label: 'Custom', sublabel: 'Manual', widthPx: 794, heightPx: 1123 },
+    21→];
+    22→
+    23→const MARGIN_PRESET_OPTIONS: { value: MarginPreset; label: string; px: string }[] = [
+    24→  { value: 'none', label: 'None', px: '0' },
+    25→  { value: 'narrow', label: 'Narrow', px: '25' },
+    26→  { value: 'normal', label: 'Normal', px: '50' },
+    27→  { value: 'wide', label: 'Wide', px: '80' },
+    28→  { value: 'custom', label: 'Custom', px: '—' },
+    29→];
+    30→
+    31→// Default accent color used for preview + canvas margin guideline (pink)
+    32→const DEFAULT_ACCENT = '#ec4899';
+    33→
+    34→// Property display method options — segmented control
+    35→const PROPERTY_DISPLAY_OPTIONS = [
+    36→  { value: 'panel' as const, label: 'Panel', icon: PanelRight, description: 'Traditional side panel on the right.' },
+    37→  { value: 'floating' as const, label: 'Cards', icon: Layers, description: 'Floating cards via Shift+S spotlight.' },
+    38→  { value: 'both' as const, label: 'Both', icon: Columns2, description: 'Side panel + Shift+S floating cards.' },
+    39→];
+    40→
+    41→// ---------- Component ----------
+    42→interface WelcomeModalProps {
+    43→  open: boolean;
+    44→  onOpenChange: (open: boolean) => void;
+    45→}
+    46→
+    47→export function WelcomeModal({ open, onOpenChange }: WelcomeModalProps) {
+    48→  const newProject = useDesignerStore((s) => s.newProject);
+    49→  const loadProject = useDesignerStore((s) => s.loadProject);
+    50→  const setPropertyDisplayMode = useDesignerStore((s) => s.setPropertyDisplayMode);
+    51→  // On-canvas keyboard shortcut hints (the cursive text on the workspace
+    52→  // background). Toggling this updates the store in real time, so the hints
+    53→  // animate away/appear behind the modal immediately.
+    54→  const shortcutsOverlayVisible = useDesignerStore((s) => s.shortcutsOverlayVisible);
+    55→  const setShortcutsOverlayVisible = useDesignerStore((s) => s.setShortcutsOverlayVisible);
+    56→
+    57→  // Form state
+    58→  const [projectName, setProjectName] = useState('Untitled Template');
+    59→  const [sizePreset, setSizePreset] = useState('A4');
+    60→  const [widthPx, setWidthPx] = useState(794);
+    61→  const [heightPx, setHeightPx] = useState(1123);
+    62→  const [marginPreset, setMarginPreset] = useState<MarginPreset>('normal');
+    63→  const [customMargin, setCustomMargin] = useState(50);
+    64→  // Default to 'panel' — the traditional side panel is the most discoverable
+    65→  // property display method for new users.
+    66→  const [propertyMode, setPropertyMode] = useState<PropertyDisplayMode>('panel');
+    67→  const [creating, setCreating] = useState(false);
+    68→  const rightColRef = useRef<HTMLDivElement>(null);
+    69→  const createTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    70→
+    71→  // Cancel any pending create-shimmer timer if the dialog unmounts first
+    72→  // (otherwise it would call setState on an unmounted component).
+    73→  useEffect(() => {
+    74→    return () => {
+    75→      if (createTimerRef.current) clearTimeout(createTimerRef.current);
+    76→    };
+    77→  }, []);
+    78→
+    79→  // Callback ref — fires the moment the right column element mounts (Radix portals content async).
+    80→  // Immediately hide vertical scroll to prevent a brief scrollbar flash during entrance animation.
+    81→  const setRightColRef = useCallback((el: HTMLDivElement | null) => {
+    82→    rightColRef.current = el;
+    83→    if (el) {
+    84→      el.style.overflowY = 'hidden';
+    85→    }
+    86→  }, []);
+    87→
+    88→  // After the staggered entrance animation settles (~1.6s), re-enable vertical scroll.
+    89→  // Uses direct DOM manipulation to avoid React state churn.
+    90→  useEffect(() => {
+    91→    if (!open) return;
+    92→    const timer = setTimeout(() => {
+    93→      if (rightColRef.current) {
+    94→        rightColRef.current.style.overflowY = 'auto';
+    95→      }
+    96→    }, 1600);
+    97→    return () => clearTimeout(timer);
+    98→  }, [open]);
+    99→
+   100→  // ---------- Handlers ----------
+   101→  const handlePresetChange = useCallback((preset: typeof SIZE_PRESETS[number]) => {
+   102→    setSizePreset(preset.label);
+   103→    if (preset.label !== 'Custom') {
+   104→      setWidthPx(preset.widthPx);
+   105→      setHeightPx(preset.heightPx);
+   106→    }
+   107→  }, []);
+   108→
+   109→  const handleWidthChange = useCallback((val: number) => {
+   110→    setWidthPx(val);
+   111→    if (sizePreset !== 'Custom') setSizePreset('Custom');
+   112→  }, [sizePreset]);
+   113→
+   114→  const handleHeightChange = useCallback((val: number) => {
+   115→    setHeightPx(val);
+   116→    if (sizePreset !== 'Custom') setSizePreset('Custom');
+   117→  }, [sizePreset]);
+   118→
+   119→  const getMarginValues = useCallback(() => {
+   120→    if (marginPreset === 'custom') {
+   121→      return { top: customMargin, bottom: customMargin, left: customMargin, right: customMargin };
+   122→    }
+   123→    return MARGIN_PRESETS[marginPreset];
+   124→  }, [marginPreset, customMargin]);
+   125→
+   126→  const handleCreate = useCallback(() => {
+   127→    setCreating(true);
+   128→    const margins = getMarginValues();
+   129→    const canvasSettings: CanvasSettings = {
+   130→      ...DEFAULT_CANVAS_SETTINGS,
+   131→      pageWidth: Math.max(100, widthPx),
+   132→      pageHeight: Math.max(100, heightPx),
+   133→      marginPreset,
+   134→      marginTop: margins.top,
+   135→      marginBottom: margins.bottom,
+   136→      marginLeft: margins.left,
+   137→      marginRight: margins.right,
+   138→      pageBackgroundColor: '#ffffff',
+   139→      marginGuideline: {
+   140→        ...DEFAULT_CANVAS_SETTINGS.marginGuideline,
+   141→        color: DEFAULT_ACCENT,
+   142→      },
+   143→    };
+   144→    const name = projectName.trim() || 'Untitled Template';
+   145→    // Apply the chosen property display mode to the store
+   146→    setPropertyDisplayMode(propertyMode);
+   147→    // Brief shimmer then close + create
+   148→    if (createTimerRef.current) clearTimeout(createTimerRef.current);
+   149→    createTimerRef.current = setTimeout(() => {
+   150→      createTimerRef.current = null;
+   151→      newProject({ projectName: name, canvasSettings });
+   152→      onOpenChange(false);
+   153→      setCreating(false);
+   154→    }, 650);
+   155→  }, [projectName, widthPx, heightPx, marginPreset, customMargin, propertyMode, newProject, getMarginValues, onOpenChange, setPropertyDisplayMode]);
+   156→
+   157→  const handleOpen = useCallback(async () => {
+   158→    // Only close the welcome modal once a project file has actually been
+   159→    // selected and loaded. loadProject returns false when the user cancels
+   160→    // the file picker (or the load fails), so the modal stays open and the
+   161→    // user can try again or choose a different action.
+   162→    const loaded = await loadProject();
+   163→    if (loaded) {
+   164→      onOpenChange(false);
+   165→    }
+   166→  }, [loadProject, onOpenChange]);
+   167→
+   168→  // ---------- Derived ----------
+   169→  const marginValues = useMemo(() => getMarginValues(), [getMarginValues]);
+   170→
+   171→  // Preview dimensions — scaled by a reference max so different presets visibly differ in size
+   172→  // (not just aspect ratio). The largest preset dimension maps to PREVIEW_AREA_H.
+   173→  const PREVIEW_AREA_W = 288;
+   174→  const PREVIEW_AREA_H = 240;
+   175→  const REF_MAX_DIM = 1344; // largest dimension across all presets (Legal height)
+   176→  const baseScale = PREVIEW_AREA_H / REF_MAX_DIM; // ~0.179
+   177→  const fitScale = Math.min(
+   178→    PREVIEW_AREA_W / Math.max(1, widthPx),
+   179→    PREVIEW_AREA_H / Math.max(1, heightPx)
+   180→  );
+   181→  const previewScale = Math.min(baseScale, fitScale);
+   182→  const previewWidth = Math.max(24, widthPx * previewScale);
+   183→  const previewHeight = Math.max(24, heightPx * previewScale);
+   184→
+   185→  // Stagger config for entrance animation — tuned to be visible after loading screen fades
+   186→  const containerVariants = {
+   187→    hidden: { opacity: 0 },
+   188→    show: {
+   189→      opacity: 1,
+   190→      transition: { staggerChildren: 0.09, delayChildren: 0.15, when: 'beforeChildren' },
+   191→    },
+   192→  };
+   193→  const itemVariants = {
+   194→    hidden: { opacity: 0, y: 12 },
+   195→    show: {
+   196→      opacity: 1,
+   197→      y: 0,
+   198→      transition: { duration: 0.5, ease: [0.22, 1, 0.36, 1] as const },
+   199→    },
+   200→  };
+   201→
+   202→  return (
+   203→    <Dialog open={open} onOpenChange={onOpenChange}>
+   204→      <DialogContent
+   205→        className="max-w-[920px] w-[92vw] p-0 gap-0 overflow-hidden rounded-2xl border-border/60 shadow-[0_1px_2px_rgba(0,0,0,0.04),0_8px_24px_rgba(0,0,0,0.08),0_24px_48px_rgba(0,0,0,0.06)] ring-1 ring-inset ring-white/[0.06] dark:ring-white/[0.04]"
+   206→        showCloseButton={false}
+   207→        onInteractOutside={(e) => e.preventDefault()}
+   208→        onEscapeKeyDown={(e) => e.preventDefault()}
+   209→      >
+   210→        {/* Film grain overlay — applies to entire modal */}
+   211→        <div
+   212→          className="pointer-events-none absolute inset-0 z-[60] opacity-[0.015] mix-blend-overlay"
+   213→          aria-hidden="true"
+   214→          style={{
+   215→            backgroundImage:
+   216→              "url(\"data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E\")",
+   217→            backgroundRepeat: 'repeat',
+   218→            backgroundSize: '200px 200px',
+   219→          }}
+   220→        />
+   221→
+   222→        <motion.div
+   223→          variants={containerVariants}
+   224→          initial="hidden"
+   225→          animate="show"
+   226→          className="grid grid-cols-[40%_60%] min-h-[560px] max-h-[88vh] overflow-x-hidden"
+   227→        >
+   228→          {/* ===================== LEFT: Branding Hero ===================== */}
+   229→          <div className="relative bg-gradient-to-br from-primary/8 via-primary/4 to-transparent overflow-hidden flex flex-col">
+   230→            {/* Animated mesh gradient blobs */}
+   231→            <motion.div
+   232→              className="absolute -top-20 -left-20 w-72 h-72 rounded-full bg-primary/10 blur-3xl"
+   233→              animate={{
+   234→                x: [0, 30, 0],
+   235→                y: [0, 20, 0],
+   236→                scale: [1, 1.1, 1],
+   237→              }}
+   238→              transition={{ duration: 18, repeat: Infinity, ease: 'easeInOut' }}
+   239→            />
+   240→            <motion.div
+   241→              className="absolute bottom-0 right-0 w-64 h-64 rounded-full bg-amber-400/[0.04] blur-3xl"
+   242→              animate={{
+   243→                x: [0, -25, 0],
+   244→                y: [0, -15, 0],
+   245→                scale: [1, 1.15, 1],
+   246→              }}
+   247→              transition={{ duration: 22, repeat: Infinity, ease: 'easeInOut' }}
+   248→            />
+   249→            <motion.div
+   250→              className="absolute top-1/3 right-1/4 w-48 h-48 rounded-full bg-rose-400/[0.03] blur-3xl"
+   251→              animate={{
+   252→                x: [0, 20, 0],
+   253→                y: [0, 25, 0],
+   254→              }}
+   255→              transition={{ duration: 16, repeat: Infinity, ease: 'easeInOut' }}
+   256→            />
+   257→
+   258→            {/* Content */}
+   259→            <div className="relative z-10 flex flex-col h-full px-8 pt-10 pb-8 flex-1">
+   260→              {/* Sparkle accent + brand */}
+   261→              <motion.div variants={itemVariants} className="flex items-center gap-2 mb-1">
+   262→                <Sparkles className="h-3.5 w-3.5 text-primary/60" />
+   263→                <span className="text-[10px] font-semibold uppercase tracking-[0.2em] text-muted-foreground/80">
+   264→                  Invoice Studio
+   265→                </span>
+   266→              </motion.div>
+   267→
+   268→              <motion.div variants={itemVariants} className="mt-2">
+   269→                <h1
+   270→                  className="text-3xl font-bold tracking-tight leading-[1.05] bg-gradient-to-br from-foreground via-foreground to-foreground/60 bg-clip-text text-transparent"
+   271→                >
+   272→                  Open Invoice
+   273→                </h1>
+   274→                {/* MJC brand mark — same size as the heading, gradient starts with primary on the left and ends with pink */}
+   275→                <div className="mt-2 flex flex-col">
+   276→                  <span className="text-3xl font-black tracking-[0.22em] leading-none bg-gradient-to-r from-primary via-rose-400 to-pink-500 bg-clip-text text-transparent">
+   277→                    MJC
+   278→                  </span>
+   279→                  {/* Brand-signature flourish — thin gradient underline */}
+   280→                  <span className="h-[2px] w-14 mt-2 rounded-full bg-gradient-to-r from-primary via-rose-400 to-pink-500 opacity-50" />
+   281→                </div>
+   282→                <p className="text-xs text-muted-foreground/70 mt-3 leading-relaxed">
+   283→                  Let&apos;s set up your workspace.<br />
+   284→                  You can change everything later.
+   285→                </p>
+   286→              </motion.div>
+   287→
+   288→              {/* Spacer */}
+   289→              <div className="flex-1" />
+   290→
+   291→              {/* Live canvas preview — actual size scaled to fit, with turtle logo watermark */}
+   292→              <motion.div variants={itemVariants} className="relative">
+   293→                <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/60 mb-2">
+   294→                  Preview
+   295→                </div>
+   296→                <div
+   297→                  className="relative flex items-center justify-center"
+   298→                  style={{ height: PREVIEW_AREA_H }}
+   299→                >
+   300→                  {/* Page — uses actual pixel dimensions × scale, so different presets visibly differ */}
+   301→                  <div
+   302→                    className="relative bg-white rounded-sm shadow-md ring-1 ring-black/[0.06] transition-all duration-300 overflow-hidden"
+   303→                    style={{
+   304→                      width: `${previewWidth}px`,
+   305→                      height: `${previewHeight}px`,
+   306→                    }}
+   307→                  >
+   308→                    {/* Turtle logo watermark — faded brand mark on the invoice page; scales with preview size */}
+   309→                    <img
+   310→                      src="/Logo.png"
+   311→                      alt=""
+   312→                      aria-hidden="true"
+   313→                      className="absolute inset-0 m-auto pointer-events-none select-none object-contain mix-blend-multiply"
+   314→                      style={{
+   315→                        width: '55%',
+   316→                        height: '55%',
+   317→                        opacity: 0.09,
+   318→                      }}
+   319→                    />
+   320→                    {/* Margin guide */}
+   321→                    <div
+   322→                      className="absolute border-dashed rounded-[1px] transition-all duration-300"
+   323→                      style={{
+   324→                        top: `${(marginValues.top / heightPx) * 100}%`,
+   325→                        bottom: `${(marginValues.bottom / heightPx) * 100}%`,
+   326→                        left: `${(marginValues.left / widthPx) * 100}%`,
+   327→                        right: `${(marginValues.right / widthPx) * 100}%`,
+   328→                        borderColor: `${DEFAULT_ACCENT}66`,
+   329→                        borderWidth: 1,
+   330→                      }}
+   331→                    />
+   332→                    {/* Accent corner — scales with preview size */}
+   333→                    <div
+   334→                      className="absolute top-0 left-0 rounded-full transition-all duration-300"
+   335→                      style={{
+   336→                        width: `${Math.min(34, Math.max(10, previewWidth * 0.22))}px`,
+   337→                        height: `${Math.max(2, previewHeight * 0.014)}px`,
+   338→                        backgroundColor: DEFAULT_ACCENT,
+   339→                      }}
+   340→                    />
+   341→                  </div>
+   342→                </div>
+   343→                <div className="flex items-center justify-center gap-1.5 mt-2 text-[10px] text-muted-foreground/70">
+   344→                  <span>{widthPx} × {heightPx}</span>
+   345→                  <span className="text-muted-foreground/40">px</span>
+   346→                </div>
+   347→              </motion.div>
+   348→
+   349→              {/* Version badge + hints toggle — bottom row of the branding hero.
+   350→                  The toggle controls the on-canvas keyboard shortcut hints in
+   351→                  the workspace background in real time. Default ON (hints
+   352→                  visible); unchecking animates them away smoothly. */}
+   353→              <motion.div variants={itemVariants} className="flex items-center justify-between mt-4 pt-3 border-t border-border/40">
+   354→                <span className="text-[10px] text-muted-foreground/50">v1.0</span>
+   355→                <label
+   356→                  htmlFor="welcome-show-hints"
+   357→                  className="flex items-center gap-1.5 text-[10px] font-medium text-muted-foreground/70 hover:text-foreground transition-colors cursor-pointer select-none"
+   358→                >
+   359→                  <Lightbulb className="h-3 w-3" />
+   360→                  Hints
+   361→                  <Switch
+   362→                    id="welcome-show-hints"
+   363→                    checked={shortcutsOverlayVisible}
+   364→                    onCheckedChange={setShortcutsOverlayVisible}
+   365→                    aria-label="Show on-canvas hints"
+   366→                    className="scale-90 ml-0.5"
+   367→                  />
+   368→                </label>
+   369→              </motion.div>
+   370→            </div>
+   371→          </div>
+   372→
+   373→          {/* ===================== RIGHT: Form ===================== */}
+   374→          <div ref={setRightColRef} className="relative bg-background overflow-y-auto overflow-x-hidden flex flex-col">
+   375→            {/* Form content */}
+   376→            <div className="relative flex flex-col h-full">
+   377→              {/* Header */}
+   378→              <motion.div variants={itemVariants} className="px-7 pt-7 pb-5 border-b border-border/50">
+   379→                <DialogHeader className="space-y-0">
+   380→                  <DialogTitle className="text-lg font-semibold tracking-tight">
+   381→                    Create a new template
+   382→                  </DialogTitle>
+   383→                  <DialogDescription className="sr-only">
+   384→                    Configure your invoice template settings
+   385→                  </DialogDescription>
+   386→                </DialogHeader>
+   387→              </motion.div>
+   388→
+   389→              {/* Scrollable form */}
+   390→              <div className="flex-1 px-7 py-6 space-y-6">
+   391→                {/* Template Name */}
+   392→                <motion.div variants={itemVariants} className="space-y-1.5">
+   393→                  <Label className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+   394→                    Template Name
+   395→                  </Label>
+   396→                  <Input
+   397→                    value={projectName}
+   398→                    onChange={(e) => setProjectName(e.target.value)}
+   399→                    placeholder="Enter template name..."
+   400→                    className="h-9 text-sm rounded-md border-border/60 focus-visible:ring-2 focus-visible:ring-primary/20 focus-visible:ring-offset-0 focus-visible:border-primary/40 transition-all"
+   401→                    autoFocus
+   402→                    onKeyDown={(e) => {
+   403→                      if (e.key === 'Enter') handleCreate();
+   404→                    }}
+   405→                  />
+   406→                </motion.div>
+   407→
+   408→                {/* Canvas Size — Quick-start chips */}
+   409→                <motion.div variants={itemVariants} className="space-y-2">
+   410→                  <Label className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+   411→                    Canvas Size
+   412→                  </Label>
+   413→                  <div className="flex flex-wrap gap-1.5">
+   414→                    {SIZE_PRESETS.map((preset) => {
+   415→                      const selected = sizePreset === preset.label;
+   416→                      return (
+   417→                        <button
+   418→                          key={preset.label}
+   419→                          type="button"
+   420→                          onClick={() => handlePresetChange(preset)}
+   421→                          className={`px-2.5 py-1 rounded-full text-[11px] font-medium transition-all border ${
+   422→                            selected
+   423→                              ? 'bg-primary text-primary-foreground border-primary'
+   424→                              : 'bg-background text-muted-foreground border-border/60 hover:border-border hover:text-foreground'
+   425→                          }`}
+   426→                        >
+   427→                          {preset.label}
+   428→                        </button>
+   429→                      );
+   430→                    })}
+   431→                  </div>
+   432→
+   433→                  {/* Width / Height (px only) */}
+   434→                  <div className="grid grid-cols-2 gap-2 mt-2">
+   435→                    <div className="space-y-1">
+   436→                      <Label className="text-[10px] text-muted-foreground">Width (px)</Label>
+   437→                      <Input
+   438→                        type="number"
+   439→                        min={1}
+   440→                        value={widthPx}
+   441→                        onChange={(e) => {
+   442→                          const val = parseInt(e.target.value) || 0;
+   443→                          handleWidthChange(val);
+   444→                        }}
+   445→                        className="h-8 text-xs rounded-md border-border/60 focus-visible:ring-2 focus-visible:ring-primary/20 focus-visible:border-primary/40 transition-all"
+   446→                      />
+   447→                    </div>
+   448→                    <div className="space-y-1">
+   449→                      <Label className="text-[10px] text-muted-foreground">Height (px)</Label>
+   450→                      <Input
+   451→                        type="number"
+   452→                        min={1}
+   453→                        value={heightPx}
+   454→                        onChange={(e) => {
+   455→                          const val = parseInt(e.target.value) || 0;
+   456→                          handleHeightChange(val);
+   457→                        }}
+   458→                        className="h-8 text-xs rounded-md border-border/60 focus-visible:ring-2 focus-visible:ring-primary/20 focus-visible:border-primary/40 transition-all"
+   459→                      />
+   460→                    </div>
+   461→                  </div>
+   462→                </motion.div>
+   463→
+   464→                {/* Margin */}
+   465→                <motion.div variants={itemVariants} className="space-y-2">
+   466→                  <Label className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+   467→                    Margin
+   468→                  </Label>
+   469→                  {/* Preset buttons + custom margin input share ONE row so toggling
+   470→                      "Custom" never changes the modal height — the input animates its
+   471→                      width in place rather than appearing on a new line. */}
+   472→                  <div className="flex items-center gap-1 flex-wrap">
+   473→                    {MARGIN_PRESET_OPTIONS.map((opt) => {
+   474→                      const selected = marginPreset === opt.value;
+   475→                      return (
+   476→                        <button
+   477→                          key={opt.value}
+   478→                          type="button"
+   479→                          onClick={() => setMarginPreset(opt.value)}
+   480→                          className={`px-2 py-1 rounded-full text-[10px] font-medium transition-all border ${
+   481→                            selected
+   482→                              ? 'bg-primary text-primary-foreground border-primary'
+   483→                              : 'bg-background text-muted-foreground border-border/60 hover:border-border hover:text-foreground'
+   484→                          }`}
+   485→                        >
+   486→                          {opt.label}
+   487→                        </button>
+   488→                      );
+   489→                    })}
+   490→                    {/* Custom margin input — animates width/opacity in place when
+   491→                        "Custom" is selected, so the modal height stays constant. */}
+   492→                    <motion.div
+   493→                      initial={false}
+   494→                      animate={{
+   495→                        width: marginPreset === 'custom' ? 'auto' : 0,
+   496→                        opacity: marginPreset === 'custom' ? 1 : 0,
+   497→                        marginLeft: marginPreset === 'custom' ? 4 : 0,
+   498→                      }}
+   499→                      transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+   500→                      className="overflow-hidden"
+   501→                      style={{ alignSelf: 'center' }}
+   502→                    >
+   503→                      <Input
+   504→                        type="number"
+   505→                        min={0}
+   506→                        max={500}
+   507→                        value={customMargin}
+   508→                        onChange={(e) => setCustomMargin(Math.max(0, +e.target.value))}
+   509→                        className="h-7 w-20 text-[11px] rounded-md border-border/60 focus-visible:ring-2 focus-visible:ring-primary/20 focus-visible:border-primary/40 transition-all"
+   510→                      />
+   511→                    </motion.div>
+   512→                  </div>
+   513→                </motion.div>
+   514→
+   515→                {/* Property Display — segmented control */}
+   516→                <motion.div variants={itemVariants} className="space-y-2">
+   517→                  <Label className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+   518→                    Property Display
+   519→                  </Label>
+   520→                  <div className="grid grid-cols-3 gap-1.5">
+   521→                    {PROPERTY_DISPLAY_OPTIONS.map((opt) => {
+   522→                      const selected = propertyMode === opt.value;
+   523→                      const Icon = opt.icon;
+   524→                      return (
+   525→                        <button
+   526→                          key={opt.value}
+   527→                          type="button"
+   528→                          onClick={() => {
+   529→                            setPropertyMode(opt.value);
+   530→                            // Apply to the store IMMEDIATELY so the side panel
+   531→                            // appears/disappears in real time behind the modal
+   532→                            // (with a smooth transition handled by PropertiesPanel).
+   533→                            setPropertyDisplayMode(opt.value);
+   534→                          }}
+   535→                          className={`flex items-center justify-center gap-1.5 px-2 py-2 rounded-lg text-[11px] font-medium transition-all border ${
+   536→                            selected
+   537→                              ? 'bg-primary text-primary-foreground border-primary shadow-sm'
+   538→                              : 'bg-background text-muted-foreground border-border/60 hover:border-border hover:text-foreground'
+   539→                          }`}
+   540→                        >
+   541→                          <Icon className="h-3.5 w-3.5" />
+   542→                          {opt.label}
+   543→                        </button>
+   544→                      );
+   545→                    })}
+   546→                  </div>
+   547→                  {/* Dynamic description — subtle, fades on change */}
+   548→                  <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground/60 leading-tight h-3.5">
+   549→                    <motion.span
+   550→                      key={propertyMode}
+   551→                      initial={{ opacity: 0, y: -3 }}
+   552→                      animate={{ opacity: 1, y: 0 }}
+   553→                      transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }}
+   554→                      className="truncate"
+   555→                    >
+   556→                      {PROPERTY_DISPLAY_OPTIONS.find((o) => o.value === propertyMode)?.description}
+   557→                    </motion.span>
+   558→                    <span className="text-muted-foreground/30">·</span>
+   559→                    <span className="text-muted-foreground/45 whitespace-nowrap">Change anytime in Settings</span>
+   560→                  </div>
+   561→                </motion.div>
+   562→              </div>
+   563→
+   564→              {/* Footer buttons */}
+   565→              <motion.div variants={itemVariants} className="px-7 py-4 border-t border-border/50 flex items-center justify-end bg-background/80 backdrop-blur-sm">
+   566→                <div className="flex items-center gap-2">
+   567→                  <Button
+   568→                    variant="outline"
+   569→                    size="sm"
+   570→                    className="h-9 gap-1.5 text-xs"
+   571→                    onClick={handleOpen}
+   572→                  >
+   573→                    <FolderOpen className="h-3.5 w-3.5" />
+   574→                    Open
+   575→                  </Button>
+   576→                  <Button
+   577→                    size="sm"
+   578→                    className="h-9 gap-1.5 text-xs shadow-sm relative overflow-hidden"
+   579→                    onClick={handleCreate}
+   580→                    disabled={creating}
+   581→                  >
+   582→                    {creating ? (
+   583→                      <>
+   584→                        {/* Shimmer overlay */}
+   585→                        <span
+   586→                          className="absolute inset-0 -translate-x-full animate-[shimmer_0.65s_ease-out]"
+   587→                          style={{
+   588→                            background:
+   589→                              'linear-gradient(90deg, transparent, rgba(255,255,255,0.4), transparent)',
+   590→                          }}
+   591→                        />
+   592→                        <Sparkles className="h-3.5 w-3.5" />
+   593→                        Creating...
+   594→                      </>
+   595→                    ) : (
+   596→                      <>
+   597→                        <Sparkles className="h-3.5 w-3.5" />
+   598→                        Create
+   599→                        <kbd className="ml-0.5 text-[9px] font-medium opacity-70 px-1 py-0.5 rounded bg-primary-foreground/15">
+   600→                          ⌘↵
+   601→                        </kbd>
+   602→                      </>
+   603→                    )}
+   604→                  </Button>
+   605→                </div>
+   606→              </motion.div>
+   607→            </div>
+   608→          </div>
+   609→        </motion.div>
+   610→
+   611→        {/* Local style: shimmer keyframe + scroll refinements */}
+   612→        <style jsx global>{`
+   613→          @keyframes shimmer {
+   614→            0% { transform: translateX(-100%); }
+   615→            100% { transform: translateX(100%); }
+   616→          }
+   617→          /* Hide horizontal scrollbar everywhere in the dialog — prevents brief flash during entrance animation.
+   618→             Firefox: relies on overflow-x: hidden (set via Tailwind classes) to prevent horizontal scroll entirely.
+   619→             WebKit: explicitly hide only the horizontal scrollbar track. */
+   620→          [data-slot="dialog-content"]::-webkit-scrollbar:horizontal,
+   621→          [data-slot="dialog-content"] *::-webkit-scrollbar:horizontal {
+   622→            display: none !important;
+   623→          }
+   624→          .max-h-\\[88vh\\]::-webkit-scrollbar {
+   625→            width: 6px;
+   626→          }
+   627→          .max-h-\\[88vh\\]::-webkit-scrollbar-track {
+   628→            background: transparent;
+   629→          }
+   630→          .max-h-\\[88vh\\]::-webkit-scrollbar-thumb {
+   631→            background: hsl(var(--border) / 0.5);
+   632→            border-radius: 3px;
+   633→          }
+   634→          .max-h-\\[88vh\\]::-webkit-scrollbar-thumb:hover {
+   635→            background: hsl(var(--border));
+   636→          }
+   637→        `}</style>
+   638→      </DialogContent>
+   639→    </Dialog>
+   640→  );
+   641→}
+   642→

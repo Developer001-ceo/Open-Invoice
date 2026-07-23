@@ -68,6 +68,86 @@ export function WelcomeModal({ open, onOpenChange }: WelcomeModalProps) {
   const rightColRef = useRef<HTMLDivElement>(null);
   const createTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // ── Responsive fit-to-viewport scaling ─────────────────────────────────
+  // The welcome modal has a natural min-height (560px) and a wide 2-column
+  // layout. On short/narrow viewports it would clip top & bottom (or force a
+  // scrollbar the user explicitly doesn't want). Instead, we measure the
+  // modal's natural (unscaled) size and apply a uniform `transform: scale()`
+  // so the entire modal shrinks to fit — keeping the design pixel-perfect
+  // with no reflow and no scrollbars. Scale is capped at 1 so large screens
+  // keep the natural, readable size.
+  //
+  // The DialogContent is centered via translate(-50%, -50%); we combine that
+  // translate with our scale in one inline `transform` so Radix's centering
+  // keeps working (translate is computed from the layout box, which the CSS
+  // scale transform does NOT change).
+  //
+  // Implementation note: Radix portals the DialogContent into the DOM
+  // asynchronously after `open` flips true, so a useLayoutEffect keyed on
+  // `open` runs BEFORE the element exists. We use a callback ref instead — it
+  // fires the moment the element actually mounts — and register a
+  // ResizeObserver + window resize listener there.
+  const contentRef = useRef<HTMLDivElement | null>(null);
+  const [modalFitScale, setModalFitScale] = useState(1);
+
+  // Measure the modal's natural size vs. the viewport and compute a scale
+  // (capped at 1) so the entire modal fits with a comfortable margin. Has no
+  // deps — only uses stable refs, the stable setModalFitScale setter, and
+  // browser APIs — so its identity is stable for the callback ref below.
+  const measure = useCallback(() => {
+    const el = contentRef.current;
+    if (!el) return;
+    // offsetWidth/Height are layout sizes — unaffected by CSS transform,
+    // so they give the true natural size even when already scaled.
+    const naturalW = el.offsetWidth;
+    const naturalH = el.offsetHeight;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    // Leave a comfortable margin around the modal on all sides.
+    const margin = 32;
+    const availW = Math.max(0, vw - margin * 2);
+    const availH = Math.max(0, vh - margin * 2);
+    const sX = naturalW > 0 ? availW / naturalW : 1;
+    const sY = naturalH > 0 ? availH / naturalH : 1;
+    const next = Math.max(0.1, Math.min(1, sX, sY));
+    setModalFitScale((prev) => (Math.abs(prev - next) > 0.001 ? next : prev));
+  }, []);
+
+  // Callback ref — fires when the portaled DialogContent actually mounts.
+  const setContentRef = useCallback((el: HTMLDivElement | null) => {
+    // Tear down any previous observer/listeners attached to the old element.
+    const prev = contentRef.current;
+    const prevCleanup = (prev as HTMLDivElement & { __cleanupFit?: () => void })?.__cleanupFit;
+    if (prevCleanup) prevCleanup();
+
+    contentRef.current = el;
+    if (!el) return;
+    // Measure immediately (no flash) and observe future size changes.
+    measure();
+    const ro = new ResizeObserver(() => measure());
+    ro.observe(el);
+    const onResize = () => measure();
+    window.addEventListener('resize', onResize);
+    // Store cleanup on the element so it runs if the element unmounts.
+    (el as HTMLDivElement & { __cleanupFit?: () => void }).__cleanupFit = () => {
+      ro.disconnect();
+      window.removeEventListener('resize', onResize);
+    };
+  }, [measure]);
+
+  // Clean up observers/listeners when the modal closes. (Radix unmounts the
+  // portaled content on close, so the callback ref's null branch also fires —
+  // this is a belt-and-suspenders cleanup. We deliberately do NOT call
+  // setState here: the component remounts fresh on the next open, so the
+  // initial state of 1 resets naturally, and the callback ref's immediate
+  // measure() corrects it before paint.)
+  useEffect(() => {
+    if (open) return;
+    const el = contentRef.current;
+    const cleanup = (el as HTMLDivElement & { __cleanupFit?: () => void })?.__cleanupFit;
+    if (cleanup) cleanup();
+  }, [open]);
+
   // Cancel any pending create-shimmer timer if the dialog unmounts first
   // (otherwise it would call setState on an unmounted component).
   useEffect(() => {
@@ -202,10 +282,29 @@ export function WelcomeModal({ open, onOpenChange }: WelcomeModalProps) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
+        ref={setContentRef}
         className="max-w-[920px] w-[92vw] p-0 gap-0 overflow-hidden rounded-2xl border-border/60 shadow-[0_1px_2px_rgba(0,0,0,0.04),0_8px_24px_rgba(0,0,0,0.08),0_24px_48px_rgba(0,0,0,0.06)] ring-1 ring-inset ring-white/[0.06] dark:ring-white/[0.04]"
         showCloseButton={false}
         onInteractOutside={(e) => e.preventDefault()}
         onEscapeKeyDown={(e) => e.preventDefault()}
+        style={
+          // Responsive fit-to-viewport scaling. Radix centers this element
+          // using the CSS `translate` property (`translate-x/y-[-50%]` Tailwind
+          // utilities → `translate: -50% -50%`), which is SEPARATE from the
+          // `transform` property. That means we can scale via `transform`
+          // without disturbing the centering: the `translate` centers the
+          // unscaled box at the viewport center, and `transform: scale(s)`
+          // with `transform-origin: center` shrinks the visible content
+          // symmetrically around that same center point. Large screens
+          // (s === 1) leave the transform unset so Radix's entrance zoom
+          // animation plays normally.
+          modalFitScale < 1
+            ? {
+                transform: `scale(${modalFitScale})`,
+                transformOrigin: 'center center',
+              }
+            : undefined
+        }
       >
         {/* Film grain overlay — applies to entire modal */}
         <div
@@ -223,7 +322,13 @@ export function WelcomeModal({ open, onOpenChange }: WelcomeModalProps) {
           variants={containerVariants}
           initial="hidden"
           animate="show"
-          className="grid grid-cols-[40%_60%] min-h-[560px] max-h-[88vh] overflow-x-hidden"
+          // min-h keeps the designed proportions. On short/narrow viewports the
+          // parent DialogContent scales down to fit (see modalFitScale), so we
+          // no longer cap height with max-h — that would cap the *layout*
+          // height and defeat the scale measurement. overflow-x-hidden
+          // prevents the entrance animation from briefly showing a horizontal
+          // scrollbar.
+          className="grid grid-cols-[40%_60%] min-h-[560px] overflow-x-hidden"
         >
           {/* ===================== LEFT: Branding Hero ===================== */}
           <div className="relative bg-gradient-to-br from-primary/8 via-primary/4 to-transparent overflow-hidden flex flex-col">
