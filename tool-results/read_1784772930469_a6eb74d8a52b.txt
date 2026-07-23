@@ -1,0 +1,738 @@
+     1→'use client';
+     2→
+     3→import { useDesignerStore, FloatingCardData } from '@/store/designer-store';
+     4→import { CanvasElement } from '@/lib/element-types';
+     5→import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
+     6→import { PropertyContent } from './floating-card';
+     7→import {
+     8→  Type, Minus, Square, Circle, Move, Maximize2,
+     9→  AlignCenterVertical, AlignCenterHorizontal, Palette, Pen,
+    10→  BoxSelect, LayoutGrid, Rows3, Paintbrush, CornerDownRight, CircleDot,
+    11→  Sliders, Copy, Sparkles, ChevronUp, Trash2, Grid3x3,
+    12→  RotateCw,
+    13→  Image as ImageIcon,
+    14→} from 'lucide-react';
+    15→
+    16→// ── Property Section Definition ─────────────────────────────────────────────
+    17→
+    18→interface PropertySection {
+    19→  id: string;
+    20→  label: string;
+    21→  icon: React.ReactNode;
+    22→}
+    23→
+    24→function getPropertySections(elementType: string): PropertySection[] {
+    25→  // Groups have no per-type properties — they only get the common sections
+    26→  // (Position, Size, Alignment) plus a group-level Opacity.
+    27→  if (elementType === 'group') {
+    28→    return [
+    29→      { id: 'position', label: 'Position', icon: <Move className="h-4 w-4" /> },
+    30→      { id: 'size', label: 'Size', icon: <Maximize2 className="h-4 w-4" /> },
+    31→      { id: 'alignment', label: 'Alignment', icon: <AlignCenterHorizontal className="h-4 w-4" /> },
+    32→      { id: 'opacity', label: 'Opacity', icon: <CircleDot className="h-4 w-4" /> },
+    33→    ];
+    34→  }
+    35→
+    36→  const common: PropertySection[] = elementType !== 'line' ? [
+    37→    { id: 'position', label: 'Position', icon: <Move className="h-4 w-4" /> },
+    38→    { id: 'size', label: 'Size', icon: <Maximize2 className="h-4 w-4" /> },
+    39→    { id: 'alignment', label: 'Alignment', icon: <AlignCenterHorizontal className="h-4 w-4" /> },
+    40→  ] : [
+    41→    { id: 'alignment', label: 'Alignment', icon: <AlignCenterHorizontal className="h-4 w-4" /> },
+    42→  ];
+    43→
+    44→  const typeSections: Record<string, PropertySection[]> = {
+    45→    text: [
+    46→      { id: 'text-content', label: 'Formatting', icon: <Type className="h-4 w-4" /> },
+    47→      { id: 'typography', label: 'Typography', icon: <Palette className="h-4 w-4" /> },
+    48→      { id: 'text-alignment', label: 'Alignment & Spacing', icon: <AlignCenterVertical className="h-4 w-4" /> },
+    49→      { id: 'color', label: 'Color', icon: <Palette className="h-4 w-4" /> },
+    50→    ],
+    51→    table: [
+    52→      { id: 'structure', label: 'Structure', icon: <LayoutGrid className="h-4 w-4" /> },
+    53→      { id: 'remove-row', label: 'Remove Row', icon: <Trash2 className="h-4 w-4" /> },
+    54→      { id: 'remove-column', label: 'Remove Column', icon: <Trash2 className="h-4 w-4" /> },
+    55→      { id: 'reorder', label: 'Reorder', icon: <Rows3 className="h-4 w-4" /> },
+    56→      { id: 'header', label: 'Header Row', icon: <Rows3 className="h-4 w-4" /> },
+    57→      { id: 'cell-defaults', label: 'Cell Defaults', icon: <Paintbrush className="h-4 w-4" /> },
+    58→      { id: 'table-border', label: 'Table Border', icon: <Minus className="h-4 w-4" /> },
+    59→      { id: 'corner-radius', label: 'Corner Radius', icon: <CornerDownRight className="h-4 w-4" /> },
+    60→      { id: 'cell-properties', label: 'Cell Properties', icon: <Grid3x3 className="h-4 w-4" /> },
+    61→      { id: 'table-appearance', label: 'Appearance', icon: <CircleDot className="h-4 w-4" /> },
+    62→    ],
+    63→    image: [
+    64→      { id: 'image-source', label: 'Image Source', icon: <ImageIcon className="h-4 w-4" /> },
+    65→      { id: 'image-fitting', label: 'Fitting', icon: <Maximize2 className="h-4 w-4" /> },
+    66→      { id: 'image-adjustments', label: 'Adjustments', icon: <Sliders className="h-4 w-4" /> },
+    67→      { id: 'image-border', label: 'Image Border', icon: <Minus className="h-4 w-4" /> },
+    68→      { id: 'image-appearance', label: 'Appearance', icon: <CircleDot className="h-4 w-4" /> },
+    69→    ],
+    70→    line: [
+    71→      { id: 'start-point', label: 'Start Point', icon: <ChevronUp className="h-4 w-4" /> },
+    72→      { id: 'end-point', label: 'End Point', icon: <ChevronUp className="h-4 w-4" /> },
+    73→      { id: 'endpoints', label: 'Endpoints', icon: <ChevronUp className="h-4 w-4" /> },
+    74→      { id: 'stroke', label: 'Stroke', icon: <Pen className="h-4 w-4" /> },
+    75→      { id: 'line-appearance', label: 'Appearance', icon: <CircleDot className="h-4 w-4" /> },
+    76→    ],
+    77→    rectangle: [
+    78→      { id: 'fill-gradient', label: 'Fill & Gradient', icon: <Square className="h-4 w-4" /> },
+    79→      { id: 'border', label: 'Border', icon: <Minus className="h-4 w-4" /> },
+    80→      { id: 'corner-radius', label: 'Corner Radius', icon: <CornerDownRight className="h-4 w-4" /> },
+    81→      { id: 'transform', label: 'Transform', icon: <RotateCw className="h-4 w-4" /> },
+    82→      { id: 'shadow', label: 'Shadow', icon: <BoxSelect className="h-4 w-4" /> },
+    83→      { id: 'reflection', label: 'Reflection', icon: <Copy className="h-4 w-4" /> },
+    84→      { id: 'glow', label: 'Glow', icon: <Sparkles className="h-4 w-4" /> },
+    85→      { id: 'opacity', label: 'Opacity', icon: <CircleDot className="h-4 w-4" /> },
+    86→      { id: 'rect-appearance', label: 'Appearance', icon: <CircleDot className="h-4 w-4" /> },
+    87→    ],
+    88→    ellipse: [
+    89→      { id: 'fill-gradient', label: 'Fill & Gradient', icon: <Circle className="h-4 w-4" /> },
+    90→      { id: 'border', label: 'Border', icon: <Minus className="h-4 w-4" /> },
+    91→      { id: 'shadow', label: 'Shadow', icon: <BoxSelect className="h-4 w-4" /> },
+    92→      { id: 'reflection', label: 'Reflection', icon: <Copy className="h-4 w-4" /> },
+    93→      { id: 'glow', label: 'Glow', icon: <Sparkles className="h-4 w-4" /> },
+    94→      { id: 'opacity', label: 'Opacity', icon: <CircleDot className="h-4 w-4" /> },
+    95→      { id: 'ellipse-appearance', label: 'Appearance', icon: <CircleDot className="h-4 w-4" /> },
+    96→    ],
+    97→  };
+    98→
+    99→  return [...common, ...(typeSections[elementType] || [])];
+   100→}
+   101→
+   102→// ── Map spotlight section ID to PropertyContent sectionLabel ──────────────
+   103→
+   104→function sectionIdToLabel(sectionId: string): string {
+   105→  const map: Record<string, string> = {
+   106→    'position': 'Position',
+   107→    'size': 'Size',
+   108→    'alignment': 'Alignment',
+   109→    'multi-opacity': 'Multi-Selection Opacity',
+   110→    'text-content': 'Formatting',
+   111→    'typography': 'Typography',
+   112→    'text-alignment': 'Alignment & Spacing',
+   113→    'color': 'Color',
+   114→    'structure': 'Structure',
+   115→    'header': 'Header Row',
+   116→    'cell-styling': 'Cell Styling',
+   117→    'cell-defaults': 'Cell Defaults',
+   118→    'borders': 'Borders',
+   119→    'table-border': 'Table Border',
+   120→    'corner-radius': 'Corner Radius',
+   121→    'transform': 'Transform',
+   122→    'remove-row': 'Remove Row',
+   123→    'remove-column': 'Remove Column',
+   124→    'reorder': 'Reorder',
+   125→
+   126→    'cell-properties': 'Cell Properties',
+   127→    'table-appearance': 'Appearance',
+   128→    'image-source': 'Image Source',
+   129→    'fit-mode': 'Fit Mode',
+   130→    'image-fitting': 'Fitting',
+   131→    'image-filters': 'Image Filters',
+   132→    'image-adjustments': 'Adjustments',
+   133→    'image-border': 'Image Border',
+   134→    'image-opacity': 'Opacity',
+   135→    'image-appearance': 'Appearance',
+   136→    'endpoints': 'Endpoints',
+   137→    'start-point': 'Start Point',
+   138→    'end-point': 'End Point',
+   139→    'stroke': 'Stroke',
+   140→    'line-appearance': 'Appearance',
+   141→    'rect-appearance': 'Appearance',
+   142→    'ellipse-appearance': 'Appearance',
+   143→    'fill-gradient': 'Gradient',
+   144→    'fill': 'Fill',
+   145→    'gradient': 'Gradient',
+   146→    'border': 'Border',
+   147→    'shadow': 'Shadow',
+   148→    'reflection': 'Reflection',
+   149→    'glow': 'Glow',
+   150→    'opacity': 'Opacity',
+   151→  };
+   152→  return map[sectionId] ?? sectionId;
+   153→}
+   154→
+   155→// ── Dynamic card width based on section content ───────────────────────
+   156→function getSpotlightCardWidthClass(sectionLabel: string): string {
+   157→  const wideSections = new Set([
+   158→    'Fill & Gradient', 'Gradient',
+   159→    'Cell Properties',
+   160→    'Shadow',
+   161→    'Reflection',
+   162→  ]);
+   163→  const mediumSections = new Set([
+   164→    'Typography',
+   165→    'Borders', 'Table Border',
+   166→    'Corner Radius',
+   167→    'Header Row',
+   168→    'Cell Styling', 'Cell Defaults',
+   169→    'Image Filters', 'Adjustments',
+   170→    'Stroke',
+   171→    'Glow',
+   172→    'Reorder',
+   173→  ]);
+   174→
+   175→  if (wideSections.has(sectionLabel)) return 'w-[320px]';
+   176→  if (mediumSections.has(sectionLabel)) return 'w-[280px]';
+   177→  return 'w-[260px]';
+   178→}
+   179→
+   180→// ── Estimated card heights for layout calculation ────────────────────────
+   181→// Since cards show all properties without scrolling, we need realistic
+   182→// height estimates to position them correctly with masonry layout.
+   183→
+   184→function estimateCardHeight(sectionId: string): number {
+   185→  const heights: Record<string, number> = {
+   186→    'position': 90,
+   187→    'size': 90,
+   188→    'alignment': 60,
+   189→    'text-content': 110,
+   190→    'typography': 180,
+   191→    'text-alignment': 140,
+   192→    'color': 100,
+   193→    'structure': 130,
+   194→    'header': 160,
+   195→    'cell-styling': 140,
+   196→    'cell-defaults': 140,
+   197→    'borders': 200,
+   198→    'table-border': 200,
+   199→    'corner-radius': 160,
+   200→    'remove-row': 80,
+   201→    'remove-column': 80,
+   202→    'reorder-row': 100,
+   203→    'reorder-column': 100,
+   204→    'cell-properties': 120,
+   205→    'table-appearance': 80,
+   206→    'image-source': 150,
+   207→    'fit-mode': 90,
+   208→    'image-fitting': 90,
+   209→    'image-filters': 120,
+   210→    'image-adjustments': 120,
+   211→    'image-border': 100,
+   212→    'image-opacity': 80,
+   213→    'image-appearance': 100,
+   214→    'endpoints': 130,
+   215→    'start-point': 80,
+   216→    'end-point': 80,
+   217→    'stroke': 100,
+   218→    'line-appearance': 80,
+   219→    'rect-appearance': 80,
+   220→    'ellipse-appearance': 80,
+   221→    'fill-gradient': 200,
+   222→    'border': 120,
+   223→    'shadow': 160,
+   224→    'reflection': 120,
+   225→    'glow': 120,
+   226→    'opacity': 80,
+   227→    'transform': 90,
+   228→  };
+   229→  // Title bar height (~32px) + content height + padding (p-3 = 12px top + 12px bottom = 24px)
+   230→  const contentHeight = heights[sectionId] ?? 150;
+   231→  return 32 + contentHeight + 24;
+   232→}
+   233→
+   234→// ── Get actual pixel width for a section card ──────────────────────────────
+   235→// Maps section ID → label → pixel width, used for centering narrower cards
+   236→// within the 320px column slot.
+   237→
+   238→function getCardActualWidthPx(sectionId: string): number {
+   239→  const label = sectionIdToLabel(sectionId);
+   240→  const wideSections = new Set([
+   241→    'Fill & Gradient', 'Gradient',
+   242→    'Cell Properties',
+   243→    'Shadow',
+   244→    'Reflection',
+   245→  ]);
+   246→  const mediumSections = new Set([
+   247→    'Typography',
+   248→    'Borders', 'Table Border',
+   249→    'Corner Radius',
+   250→    'Header Row',
+   251→    'Cell Styling', 'Cell Defaults',
+   252→    'Image Filters', 'Adjustments',
+   253→    'Stroke',
+   254→    'Glow',
+   255→    'Reorder',
+   256→  ]);
+   257→  if (wideSections.has(label)) return 320;
+   258→  if (mediumSections.has(label)) return 280;
+   259→  return 260;
+   260→}
+   261→
+   262→// ── Masonry Card Layout Calculation ────────────────────────────────────────
+   263→// Places cards in a masonry-style layout with a fixed 20px gap between
+   264→// all cards (both horizontally and vertically). Cards in the same column
+   265→// are stacked vertically; each card goes into the shortest column.
+   266→// Each card is horizontally centered within its column slot so that
+   267→// narrower cards (260px, 280px) are visually centered rather than
+   268→// left-aligned within the 320px column width.
+   269→// Utilizes as much screen space as possible, ensures no card goes off-screen.
+   270→
+   271→const COLUMN_WIDTH = 320; // Column slot width (widest card) for masonry layout
+   272→const CARD_GAP = 20; // Fixed 20px gap between all cards
+   273→const EDGE_MARGIN = 20; // minimum distance from viewport edges
+   274→
+   275→interface CardPosition {
+   276→  x: number;
+   277→  y: number;
+   278→}
+   279→
+   280→function getCardHeight(sectionId: string, measuredHeights?: Map<string, number>): number {
+   281→  if (measuredHeights && measuredHeights.has(sectionId)) {
+   282→    return measuredHeights.get(sectionId)!;
+   283→  }
+   284→  return estimateCardHeight(sectionId);
+   285→}
+   286→
+   287→function calculateCardPositions(
+   288→  sectionIds: string[],
+   289→  containerWidth: number,
+   290→  containerHeight: number,
+   291→  measuredHeights?: Map<string, number>,
+   292→): { positions: CardPosition[] } {
+   293→  const count = sectionIds.length;
+   294→  if (count === 0) return { positions: [] };
+   295→
+   296→  const availableWidth = containerWidth - 2 * EDGE_MARGIN;
+   297→  const availableHeight = containerHeight - 2 * EDGE_MARGIN;
+   298→
+   299→  // Determine maximum number of columns that fit
+   300→  const maxCols = Math.floor((availableWidth + CARD_GAP) / (COLUMN_WIDTH + CARD_GAP));
+   301→
+   302→  // Try to find the optimal number of columns that fits all cards on screen
+   303→  // Start with fewer columns (for readability), increase if cards overflow vertically
+   304→  let bestLayout: { positions: CardPosition[]; totalHeight: number } | null = null;
+   305→
+   306→  for (let tryCols = Math.max(1, Math.min(3, maxCols, count)); tryCols <= maxCols && tryCols <= count; tryCols++) {
+   307→    const totalGridWidth = tryCols * COLUMN_WIDTH + (tryCols - 1) * CARD_GAP;
+   308→    const startX = EDGE_MARGIN + (availableWidth - totalGridWidth) / 2;
+   309→
+   310→    const columnY: number[] = Array(tryCols).fill(0);
+   311→    const positions: CardPosition[] = [];
+   312→
+   313→    for (let i = 0; i < count; i++) {
+   314→      let shortestCol = 0;
+   315→      let shortestY = columnY[0];
+   316→      for (let c = 1; c < tryCols; c++) {
+   317→        if (columnY[c] < shortestY) {
+   318→          shortestY = columnY[c];
+   319→          shortestCol = c;
+   320→        }
+   321→      }
+   322→
+   323→      // Center the card horizontally within its column slot
+   324→      const cardActualWidth = getCardActualWidthPx(sectionIds[i]);
+   325→      const centerOffset = (COLUMN_WIDTH - cardActualWidth) / 2;
+   326→      const x = startX + shortestCol * (COLUMN_WIDTH + CARD_GAP) + centerOffset;
+   327→      const y = columnY[shortestCol];
+   328→
+   329→      positions.push({ x, y });
+   330→
+   331→      const cardHeight = getCardHeight(sectionIds[i], measuredHeights);
+   332→      columnY[shortestCol] = y + cardHeight + CARD_GAP;
+   333→    }
+   334→
+   335→    // Calculate the total height of the grid (tallest column)
+   336→    const totalHeight = Math.max(...columnY) - CARD_GAP; // subtract trailing gap
+   337→
+   338→    // If this layout fits on screen, use it
+   339→    if (totalHeight <= availableHeight) {
+   340→      // Vertically center the grid within the available height
+   341→      const yOffset = EDGE_MARGIN + (availableHeight - totalHeight) / 2;
+   342→      const centeredPositions = positions.map(p => ({ x: p.x, y: p.y + yOffset }));
+   343→      bestLayout = { positions: centeredPositions, totalHeight };
+   344→      break; // Found a fitting layout with minimal columns
+   345→    }
+   346→
+   347→    // Track the best layout even if it overflows (in case nothing fits)
+   348→    if (!bestLayout || totalHeight < bestLayout.totalHeight) {
+   349→      const yOffset = EDGE_MARGIN;
+   350→      const adjustedPositions = positions.map(p => ({ x: p.x, y: p.y + yOffset }));
+   351→      bestLayout = { positions: adjustedPositions, totalHeight };
+   352→    }
+   353→  }
+   354→
+   355→  if (!bestLayout) {
+   356→    // Fallback: just use 1 column, cards centered within column slot
+   357→    const startX = EDGE_MARGIN;
+   358→    const columnY: number[] = [0];
+   359→    const positions: CardPosition[] = [];
+   360→    for (let i = 0; i < count; i++) {
+   361→      const cardActualWidth = getCardActualWidthPx(sectionIds[i]);
+   362→      const centerOffset = (COLUMN_WIDTH - cardActualWidth) / 2;
+   363→      positions.push({ x: startX + centerOffset, y: columnY[0] + EDGE_MARGIN });
+   364→      columnY[0] += getCardHeight(sectionIds[i], measuredHeights) + CARD_GAP;
+   365→    }
+   366→    bestLayout = { positions, totalHeight: columnY[0] };
+   367→  }
+   368→
+   369→  return { positions: bestLayout.positions };
+   370→}
+   371→
+   372→// ── Main Component ──────────────────────────────────────────────────────────
+   373→
+   374→// Sections shown when MULTIPLE elements are selected. These are the properties
+   375→// that can meaningfully apply to ALL selected elements at once: alignment on
+   376→// the canvas and opacity. Per-type properties (fill, border, typography, etc.)
+   377→// are omitted because they only make sense for a single element type.
+   378→function getMultiSelectionSections(): PropertySection[] {
+   379→  return [
+   380→    { id: 'alignment', label: 'Alignment', icon: <AlignCenterHorizontal className="h-4 w-4" /> },
+   381→    { id: 'multi-opacity', label: 'Opacity', icon: <CircleDot className="h-4 w-4" /> },
+   382→  ];
+   383→}
+   384→
+   385→export function SpotlightOverlay({ element, multiSelectIds }: { element: CanvasElement; multiSelectIds?: string[] }) {
+   386→  const spotlightOpen = useDesignerStore((s) => s.spotlightOpen);
+   387→  const closeSpotlight = useDesignerStore((s) => s.closeSpotlight);
+   388→  const addFloatingCard = useDesignerStore((s) => s.addFloatingCard);
+   389→  const floatingCards = useDesignerStore((s) => s.floatingCards);
+   390→  const propertyDisplayMode = useDesignerStore((s) => s.propertyDisplayMode);
+   391→
+   392→  // Animation states
+   393→  const [isVisible, setIsVisible] = useState(false);
+   394→  const [cardsVisible, setCardsVisible] = useState(false);
+   395→  const [hoveredCard, setHoveredCard] = useState<string | null>(null);
+   396→  const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
+   397→  const [isDismissing, setIsDismissing] = useState(false);
+   398→
+   399→  // Measured card heights — two-pass render to avoid overlap from inaccurate estimates
+   400→  const [measuredHeights, setMeasuredHeights] = useState<Map<string, number>>(new Map());
+   401→
+   402→  // Timer refs for cleanup
+   403→  const cardTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+   404→  const dismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+   405→  const selectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+   406→  const rafRef = useRef<number | null>(null);
+   407→
+   408→  const isMultiSelect = !!(multiSelectIds && multiSelectIds.length > 1);
+   409→  const sections = isMultiSelect ? getMultiSelectionSections() : getPropertySections(element.type);
+   410→
+   411→  // ── Derived layout (computed, not state) ────────────────────────────────
+   412→
+   413→  const dimensions = useMemo(() =>
+   414→    spotlightOpen ? { width: window.innerWidth, height: window.innerHeight } : { width: 0, height: 0 },
+   415→    [spotlightOpen],
+   416→  );
+   417→
+   418→  // Memoize card layout calculation — uses measured heights when available
+   419→  const sectionIds = useMemo(() => sections.map(s => s.id), [sections]);
+   420→  const cardLayout = useMemo(() => {
+   421→    if (!spotlightOpen || dimensions.width === 0) return { positions: [] as CardPosition[] };
+   422→    return calculateCardPositions(sectionIds, dimensions.width, dimensions.height, measuredHeights);
+   423→  }, [spotlightOpen, sectionIds, dimensions.width, dimensions.height, measuredHeights]);
+   424→
+   425→  // ── Open / Close lifecycle ──────────────────────────────────────────────
+   426→
+   427→  useEffect(() => {
+   428→    // Cancel any pending rAF from a previous run so we don't double-schedule.
+   429→    if (rafRef.current !== null) {
+   430→      cancelAnimationFrame(rafRef.current);
+   431→      rafRef.current = null;
+   432→    }
+   433→    if (spotlightOpen) {
+   434→      rafRef.current = requestAnimationFrame(() => {
+   435→        rafRef.current = null;
+   436→        setIsDismissing(false);
+   437→        setSelectedCardId(null);
+   438→        setIsVisible(true);
+   439→        cardTimerRef.current = setTimeout(() => setCardsVisible(true), 150);
+   440→      });
+   441→    } else {
+   442→      rafRef.current = requestAnimationFrame(() => {
+   443→        rafRef.current = null;
+   444→        setIsVisible(false);
+   445→        setCardsVisible(false);
+   446→        setSelectedCardId(null);
+   447→        setIsDismissing(false);
+   448→        setMeasuredHeights(new Map());
+   449→      });
+   450→    }
+   451→
+   452→    return () => {
+   453→      if (rafRef.current !== null) {
+   454→        cancelAnimationFrame(rafRef.current);
+   455→        rafRef.current = null;
+   456→      }
+   457→      if (cardTimerRef.current) {
+   458→        clearTimeout(cardTimerRef.current);
+   459→        cardTimerRef.current = null;
+   460→      }
+   461→    };
+   462→  }, [spotlightOpen, element]);
+   463→
+   464→  // Cleanup all timers on unmount
+   465→  useEffect(() => {
+   466→    return () => {
+   467→      if (dismissTimerRef.current) clearTimeout(dismissTimerRef.current);
+   468→      if (selectTimerRef.current) clearTimeout(selectTimerRef.current);
+   469→      if (cardTimerRef.current) clearTimeout(cardTimerRef.current);
+   470→      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+   471→    };
+   472→  }, []);
+   473→
+   474→  // ── Dismiss with exit animation ────────────────────────────────────────
+   475→
+   476→  const dismissOverlay = useCallback(() => {
+   477→    if (isDismissing) return;
+   478→    setIsDismissing(true);
+   479→    setCardsVisible(false);
+   480→
+   481→    dismissTimerRef.current = setTimeout(() => {
+   482→      closeSpotlight();
+   483→    }, 180);
+   484→  }, [isDismissing, closeSpotlight]);
+   485→
+   486→  // ── Escape key ─────────────────────────────────────────────────────────
+   487→
+   488→  useEffect(() => {
+   489→    if (!spotlightOpen || isDismissing) return;
+   490→    const handleKeyDown = (e: KeyboardEvent) => {
+   491→      if (e.key === 'Escape') {
+   492→        e.preventDefault();
+   493→        e.stopPropagation();
+   494→        dismissOverlay();
+   495→      }
+   496→    };
+   497→    window.addEventListener('keydown', handleKeyDown);
+   498→    return () => window.removeEventListener('keydown', handleKeyDown);
+   499→  }, [spotlightOpen, isDismissing, dismissOverlay]);
+   500→
+   501→  // ── Card click handler ─────────────────────────────────────────────────
+   502→
+   503→  const handleCardClick = useCallback((section: PropertySection) => {
+   504→    if (isDismissing || selectedCardId) return;
+   505→
+   506→    const cardId = `${element.id}-${section.id}`;
+   507→    const alreadyFloating = floatingCards.some(c => c.id === cardId);
+   508→
+   509→    // Don't allow clicking already-floating cards
+   510→    if (alreadyFloating) return;
+   511→
+   512→    // Trigger selection animation
+   513→    setSelectedCardId(section.id);
+   514→
+   515→    // After selection animation, create floating card and dismiss
+   516→    selectTimerRef.current = setTimeout(() => {
+   517→      const sectionIds = sections.map(s => s.id);
+   518→      const { positions: cardPositions } = calculateCardPositions(
+   519→        sectionIds,
+   520→        dimensions.width || 1200,
+   521→        dimensions.height || 800,
+   522→        measuredHeights,
+   523→      );
+   524→      const idx = sections.findIndex(s => s.id === section.id);
+   525→      const pos = cardPositions[idx] || { x: 100, y: 100 };
+   526→
+   527→      // Calculate target position for the floating card
+   528→      const CARD_WIDTH = 320; // Use widest card width for consistent positioning
+   529→      const PANEL_WIDTH = 288; // w-72 = 288px (properties panel)
+   530→      const RIGHT_MARGIN = 90; // comfortable distance from right viewport edge
+   531→      const PANEL_GAP = 24; // gap between card and properties panel
+   532→      const TOP_OFFSET = 160; // comfortable distance from top (header + toolbar + breathing room)
+   533→      const CARD_STACK_GAP = 40; // vertical gap between stacked cards
+   534→
+   535→      // In "both" or "panel" mode: card goes to the left of the properties panel
+   536→      // In "floating" mode: card goes to the right side with comfortable margin from edge
+   537→      const targetX = propertyDisplayMode !== 'floating'
+   538→        ? window.innerWidth - PANEL_WIDTH - CARD_WIDTH - PANEL_GAP
+   539→        : window.innerWidth - CARD_WIDTH - RIGHT_MARGIN;
+   540→
+   541→      // Stack cards vertically if there are already floating cards
+   542→      const existingCards = floatingCards.length;
+   543→      const targetY = TOP_OFFSET + existingCards * CARD_STACK_GAP;
+   544→
+   545→      const newCard: FloatingCardData = {
+   546→        id: cardId,
+   547→        sectionLabel: section.label,
+   548→        x: targetX,
+   549→        y: targetY,
+   550→        minimized: false,
+   551→        zIndex: Date.now(),
+   552→        initialX: pos.x, // Start from spotlight card position
+   553→        initialY: pos.y, // Start from spotlight card position
+   554→      };
+   555→      addFloatingCard(newCard);
+   556→      dismissOverlay();
+   557→    }, 280);
+   558→  }, [isDismissing, selectedCardId, element.id, floatingCards, sections, dimensions, measuredHeights, addFloatingCard, dismissOverlay, propertyDisplayMode]);
+   559→
+   560→  // ── Early return if not open ───────────────────────────────────────────
+   561→
+   562→  if (!spotlightOpen) return null;
+   563→
+   564→  const { positions } = cardLayout;
+   565→
+   566→  // Effective opacity for the dim overlay — full dim, no cutout
+   567→  const dimOpacity = isVisible && !isDismissing ? 1 : 0;
+   568→  const dimTransition = isDismissing ? 'opacity 150ms ease-in' : 'opacity 200ms ease-out';
+   569→
+   570→  return (
+   571→    <div
+   572→      className="fixed inset-0 z-[99999]"
+   573→      style={{ pointerEvents: isVisible ? 'auto' : 'none' }}
+   574→    >
+   575→      {/* ── Dim overlay — covers everything including the selected element ── */}
+   576→      <div
+   577→        className="absolute inset-0 bg-black/60 backdrop-blur-[2px]"
+   578→        style={{
+   579→          opacity: dimOpacity,
+   580→          transition: dimTransition,
+   581→        }}
+   582→        onClick={dismissOverlay}
+   583→      />
+   584→
+   585→      {/* ── Masonry property cards ───────────────────────────────────── */}
+   586→      {sections.map((section, index) => {
+   587→        const pos = positions[index];
+   588→        if (!pos) return null;
+   589→
+   590→        const isHovered = hoveredCard === section.id;
+   591→        const isSelected = selectedCardId === section.id;
+   592→        const isUnselected = selectedCardId !== null && !isSelected;
+   593→        const alreadyFloating = floatingCards.some(
+   594→          c => c.id === `${element.id}-${section.id}`,
+   595→        );
+   596→
+   597→        // Compute card opacity
+   598→        let cardOpacity: number;
+   599→        if (isUnselected) {
+   600→          cardOpacity = 0;
+   601→        } else if (isSelected) {
+   602→          cardOpacity = 1;
+   603→        } else if (cardsVisible && !isDismissing) {
+   604→          cardOpacity = 1;
+   605→        } else {
+   606→          cardOpacity = 0;
+   607→        }
+   608→
+   609→        // Compute card transform — subtle hover effect, NO size change for already-floating
+   610→        let cardTransform: string;
+   611→        if (isSelected) {
+   612→          cardTransform = 'scale(1.02)';
+   613→        } else if (alreadyFloating) {
+   614→          cardTransform = 'scale(1)'; // Same size as normal cards
+   615→        } else if (cardsVisible && !isDismissing && !isUnselected) {
+   616→          cardTransform = isHovered ? 'translateY(-2px)' : 'translateY(0)';
+   617→        } else {
+   618→          cardTransform = 'scale(0.95)';
+   619→        }
+   620→
+   621→        // Stagger delay (only for entrance, not for selection/dismiss)
+   622→        const staggerDelay = (selectedCardId || isDismissing) ? 0 : index * 40;
+   623→
+   624→        // Transition timing
+   625→        const cardTransition = isSelected
+   626→          ? `all 200ms ease-in ${staggerDelay}ms`
+   627→          : isUnselected
+   628→          ? `all 180ms ease-in ${staggerDelay}ms`
+   629→          : `all 250ms cubic-bezier(0.34, 1.56, 0.64, 1) ${staggerDelay}ms`;
+   630→
+   631→        // Section label for PropertyContent
+   632→        const sectionLabel = sectionIdToLabel(section.id);
+   633→
+   634→        return (
+   635→          <div
+   636→            key={section.id}
+   637→            ref={(el) => {
+   638→              if (el) {
+   639→                const height = el.offsetHeight;
+   640→                if (height > 0 && measuredHeights.get(section.id) !== height) {
+   641→                  setMeasuredHeights(prev => {
+   642→                    const next = new Map(prev);
+   643→                    next.set(section.id, height);
+   644→                    return next;
+   645→                  });
+   646→                }
+   647→              }
+   648→            }}
+   649→            className="absolute"
+   650→            style={{
+   651→              left: pos.x,
+   652→              top: pos.y,
+   653→              opacity: cardOpacity,
+   654→              transform: cardTransform,
+   655→              transition: cardTransition,
+   656→              pointerEvents: isDismissing || isUnselected || alreadyFloating ? 'none' : 'auto',
+   657→            }}
+   658→            onMouseEnter={() => !isDismissing && !alreadyFloating && setHoveredCard(section.id)}
+   659→            onMouseLeave={() => setHoveredCard(null)}
+   660→            onClick={(e) => {
+   661→              e.stopPropagation();
+   662→              handleCardClick(section);
+   663→            }}
+   664→          >
+   665→            <div
+   666→              className={`${getSpotlightCardWidthClass(sectionLabel)} rounded-lg border overflow-hidden transition-all duration-200 ${
+   667→                alreadyFloating
+   668→                  ? 'bg-card/60 border-border/30 cursor-default'
+   669→                  : isSelected
+   670→                  ? 'bg-card border-primary/50 shadow-xl ring-2 ring-primary/30 cursor-pointer'
+   671→                  : isHovered
+   672→                  ? 'bg-card border-primary/30 shadow-lg cursor-pointer'
+   673→                  : 'bg-card/95 border-border/50 shadow-md cursor-pointer'
+   674→              }`}
+   675→            >
+   676→              {/* Title bar */}
+   677→              <div
+   678→                className={`flex items-center gap-1.5 px-2.5 py-1.5 border-b border-border/40 ${
+   679→                  alreadyFloating
+   680→                    ? 'bg-muted/20'
+   681→                    : 'bg-muted/30'
+   682→                }`}
+   683→              >
+   684→                <div className={`p-1 rounded shrink-0 ${
+   685→                  alreadyFloating
+   686→                    ? 'bg-muted/50 text-muted-foreground/50'
+   687→                    : isSelected
+   688→                    ? 'bg-primary/15 text-primary'
+   689→                    : isHovered
+   690→                    ? 'bg-primary/10 text-primary'
+   691→                    : 'bg-muted text-muted-foreground'
+   692→                }`}>
+   693→                  {section.icon}
+   694→                </div>
+   695→                <span className={`text-[11px] font-medium truncate flex-1 ${
+   696→                  alreadyFloating ? 'text-muted-foreground/50' : 'text-foreground'
+   697→                }`}>
+   698→                  {section.label}
+   699→                </span>
+   700→                {alreadyFloating && (
+   701→                  <span className="text-[9px] text-primary/60 font-medium bg-primary/10 px-1.5 py-0.5 rounded">open</span>
+   702→                )}
+   703→              </div>
+   704→
+   705→              {/* Content — always show full content with clean padding */}
+   706→              <div className="relative pointer-events-none select-none p-3">
+   707→                <div style={{ opacity: alreadyFloating ? 0.3 : 0.5, filter: `grayscale(${alreadyFloating ? 80 : 50}%)` }}>
+   708→                  <PropertyContent sectionLabel={sectionLabel} element={element} compact multiSelectIds={isMultiSelect ? multiSelectIds : undefined} />
+   709→                </div>
+   710→                <div
+   711→                  className="absolute inset-0 pointer-events-none rounded-b-lg"
+   712→                  style={{ backgroundColor: alreadyFloating ? 'rgba(59, 130, 246, 0.12)' : 'rgba(255, 255, 255, 0.35)' }}
+   713→                />
+   714→              </div>
+   715→            </div>
+   716→          </div>
+   717→        );
+   718→      })}
+   719→
+   720→      {/* ── Bottom hint ────────────────────────────────────────────────── */}
+   721→      <div
+   722→        className="absolute bottom-6 left-1/2 text-xs text-white/60"
+   723→        style={{
+   724→          opacity: cardsVisible && !isDismissing && !selectedCardId ? 1 : 0,
+   725→          transform: `translateX(-50%) translateY(${cardsVisible && !isDismissing && !selectedCardId ? 0 : 8}px)`,
+   726→          transition: 'opacity 250ms ease-out, transform 250ms ease-out',
+   727→        }}
+   728→      >
+   729→        Press{' '}
+   730→        <kbd className="px-1.5 py-0.5 rounded bg-white/10 text-white/80 font-mono text-[10px]">
+   731→          Esc
+   732→        </kbd>{' '}
+   733→        to close · Click a card to pop it out
+   734→      </div>
+   735→    </div>
+   736→  );
+   737→}
+   738→

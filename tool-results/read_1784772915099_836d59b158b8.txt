@@ -1,0 +1,2002 @@
+     1→'use client';
+     2→
+     3→import { useDesignerStore, FloatingCardData } from '@/store/designer-store';
+     4→import { CanvasElement, TextProperties, TableProperties, ImageProperties, LineProperties, RectangleProperties, EllipseProperties, CellOverride, ShadowEffect, ReflectionEffect, RectangleEffects, GradientFill, GradientStop, ElementProperties, DEFAULT_SHADOW, DEFAULT_EFFECTS, GRADIENT_PRESETS, buildGradientCSS, computeLineBounds, normalizeRectBorderRadius, getRectRotation } from '@/lib/element-types';
+     5→import { ensureColWidths, ensureRowHeights, ensureRowNames, ensureColNames } from '@/lib/table-helpers';
+     6→import { useRef, useState, useCallback, useEffect, memo, useMemo } from 'react';
+     7→import { X, ChevronDown, ChevronUp, GripHorizontal, PanelTop, PanelLeft, PanelRight, PanelBottom, Square, Bold, Italic, Underline as UnderlineIcon, Strikethrough, AlignLeft, AlignCenter, AlignRight, AlignJustify, Type, Columns3, Rows3, RotateCcw } from 'lucide-react';
+     8→import { GradientStopBar } from '@/components/designer/gradient-stop-bar';
+     9→import { DraggableReorderList, ReorderItem } from '@/components/designer/draggable-reorder-list';
+    10→import { SliderField } from '@/components/ui/slider-field';
+    11→import { ColorInput } from '@/components/ui/color-input';
+    12→import { FormattingToolbar, LabeledSelect } from '@/components/designer/rich-text-editor';
+    13→
+    14→interface FloatingCardProps {
+    15→  card: FloatingCardData;
+    16→  element: CanvasElement;
+    17→  multiSelectIds?: string[];
+    18→  onBringToFront: (cardId: string) => void;
+    19→  boundsRef?: React.RefObject<HTMLDivElement | null>;
+    20→}
+    21→
+    22→export function FloatingCard({ card, element, multiSelectIds, onBringToFront, boundsRef }: FloatingCardProps) {
+    23→  const removeFloatingCard = useDesignerStore((s) => s.removeFloatingCard);
+    24→  const clearCardInitialPosition = useDesignerStore((s) => s.clearCardInitialPosition);
+    25→  const spotlightOpen = useDesignerStore((s) => s.spotlightOpen);
+    26→  const settingsOpen = useDesignerStore((s) => s.settingsOpen);
+    27→  // Subscribe to ALL modal states so floating cards hide behind any modal
+    28→  const newProjectOpen = useDesignerStore((s) => s.newProjectOpen);
+    29→  const exportPdfOpen = useDesignerStore((s) => s.exportPdfOpen);
+    30→  const largePreviewOpen = useDesignerStore((s) => s.largePreviewOpen);
+    31→  const welcomeModalOpen = useDesignerStore((s) => s.welcomeModalOpen);
+    32→  const predefinedBlocksOpen = useDesignerStore((s) => s.predefinedBlocksOpen);
+    33→  // Any modal open → cards go behind (z-40, below the z-50 dialogs)
+    34→  const anyModalOpen = settingsOpen || newProjectOpen || exportPdfOpen || largePreviewOpen || welcomeModalOpen || predefinedBlocksOpen;
+    35→
+    36→  // Fly-in animation: start at initialX/initialY (spotlight card position) if provided,
+    37→  // then animate to the target position (card.x/card.y)
+    38→  const hasInitialPosition = card.initialX !== undefined && card.initialY !== undefined;
+    39→  const [position, setPosition] = useState({
+    40→    x: hasInitialPosition ? card.initialX! : card.x,
+    41→    y: hasInitialPosition ? card.initialY! : card.y,
+    42→  });
+    43→  const [isAnimating, setIsAnimating] = useState(hasInitialPosition);
+    44→  const [isMinimized, setIsMinimized] = useState(card.minimized);
+    45→  const [isDragging, setIsDragging] = useState(false);
+    46→  const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
+    47→  const cardRef = useRef<HTMLDivElement>(null);
+    48→
+    49→  // Fly-in animation: after mount, animate from initial position to target position
+    50→  useEffect(() => {
+    51→    if (!hasInitialPosition) return;
+    52→    let timer: ReturnType<typeof setTimeout> | null = null;
+    53→    let raf2: number | null = null;
+    54→    // Use double-rAF to ensure the browser has painted the initial position first
+    55→    const raf1 = requestAnimationFrame(() => {
+    56→      raf2 = requestAnimationFrame(() => {
+    57→        setPosition({ x: card.x, y: card.y });
+    58→        // Clear animation state after transition completes
+    59→        timer = setTimeout(() => {
+    60→          setIsAnimating(false);
+    61→          clearCardInitialPosition(card.id);
+    62→        }, 450); // Match the CSS transition duration
+    63→      });
+    64→    });
+    65→    return () => {
+    66→      cancelAnimationFrame(raf1);
+    67→      if (raf2 !== null) cancelAnimationFrame(raf2);
+    68→      if (timer !== null) clearTimeout(timer);
+    69→    };
+    70→  }, []);
+    71→
+    72→  // Handle dragging — RAF-throttled position updates to avoid layout thrashing
+    73→  const rafRef = useRef<number | null>(null);
+    74→  const pendingPosRef = useRef<{ x: number; y: number } | null>(null);
+    75→
+    76→  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    77→    if ((e.target as HTMLElement).closest('[data-no-drag]')) return;
+    78→    e.preventDefault();
+    79→    e.stopPropagation();
+    80→    setIsDragging(true);
+    81→    setDragOffset({
+    82→      x: e.clientX - position.x,
+    83→      y: e.clientY - position.y,
+    84→    });
+    85→    onBringToFront(card.id);
+    86→  }, [position, onBringToFront, card.id]);
+    87→
+    88→  useEffect(() => {
+    89→    if (!isDragging) return;
+    90→
+    91→    const handleMouseMove = (e: MouseEvent) => {
+    92→      let newX = e.clientX - dragOffset.x;
+    93→      let newY = e.clientY - dragOffset.y;
+    94→
+    95→      // Constrain to bounds if provided
+    96→      if (boundsRef?.current) {
+    97→        const rect = boundsRef.current.getBoundingClientRect();
+    98→        newX = Math.max(rect.left, Math.min(newX, rect.right - getCardWidthPx(card.sectionLabel)));
+    99→        newY = Math.max(rect.top, Math.min(newY, rect.bottom - 40));
+   100→      }
+   101→
+   102→      // Throttle position updates via RAF
+   103→      pendingPosRef.current = { x: newX, y: newY };
+   104→      if (rafRef.current === null) {
+   105→        rafRef.current = requestAnimationFrame(() => {
+   106→          if (pendingPosRef.current) {
+   107→            setPosition(pendingPosRef.current);
+   108→            pendingPosRef.current = null;
+   109→          }
+   110→          rafRef.current = null;
+   111→        });
+   112→      }
+   113→    };
+   114→
+   115→    const handleMouseUp = () => {
+   116→      // Flush any pending position before stopping drag
+   117→      if (pendingPosRef.current) {
+   118→        setPosition(pendingPosRef.current);
+   119→        pendingPosRef.current = null;
+   120→      }
+   121→      if (rafRef.current !== null) {
+   122→        cancelAnimationFrame(rafRef.current);
+   123→        rafRef.current = null;
+   124→      }
+   125→      setIsDragging(false);
+   126→    };
+   127→
+   128→    window.addEventListener('mousemove', handleMouseMove);
+   129→    window.addEventListener('mouseup', handleMouseUp);
+   130→    return () => {
+   131→      window.removeEventListener('mousemove', handleMouseMove);
+   132→      window.removeEventListener('mouseup', handleMouseUp);
+   133→    };
+   134→  }, [isDragging, dragOffset, boundsRef]);
+   135→
+   136→  const handleClose = useCallback(() => {
+   137→    removeFloatingCard(card.id);
+   138→  }, [removeFloatingCard, card.id]);
+   139→
+   140→  const handleToggleMinimize = useCallback(() => {
+   141→    setIsMinimized(!isMinimized);
+   142→  }, [isMinimized]);
+   143→
+   144→  // Render the appropriate property content based on sectionLabel
+   145→  const renderContent = () => {
+   146→    return <PropertyContent sectionLabel={card.sectionLabel} element={element} multiSelectIds={multiSelectIds} />;
+   147→  };
+   148→
+   149→  return (
+   150→    <div
+   151→      ref={cardRef}
+   152→      className="fixed select-none"
+   153→      style={{
+   154→        left: position.x,
+   155→        top: position.y,
+   156→        // When ANY modal is open (z-50), push floating cards behind it (z-40)
+   157→        // When spotlight is open, force z-index below the spotlight overlay (z-99999)
+   158→        // Otherwise use the card's z-index for stacking among floating cards
+   159→        zIndex: anyModalOpen ? 40 : spotlightOpen ? 100 : card.zIndex,
+   160→        // Smooth transition for fly-in animation (not during drag)
+   161→        transition: isAnimating && !isDragging
+   162→          ? 'left 400ms cubic-bezier(0.34, 1.56, 0.64, 1), top 400ms cubic-bezier(0.34, 1.56, 0.64, 1)'
+   163→          : isAnimating
+   164→          ? 'none'
+   165→          : 'none',
+   166→      }}
+   167→      onMouseDown={() => onBringToFront(card.id)}
+   168→    >
+   169→      <div
+   170→        className={`${getCardWidthClass(card.sectionLabel)} rounded-lg border border-border/60 bg-card shadow-xl overflow-hidden transition-all duration-200 relative ${
+   171→          isDragging ? 'shadow-2xl cursor-grabbing' : 'cursor-grab'
+   172→        } ${spotlightOpen || anyModalOpen ? 'pointer-events-none' : ''}`}
+   173→        style={spotlightOpen || anyModalOpen ? { opacity: 0.4, filter: 'saturate(0.3) brightness(0.6)' } : undefined}
+   174→      >
+   175→        {/* Title bar */}
+   176→        <div
+   177→          className="flex items-center gap-1.5 px-2.5 py-1.5 bg-muted/30 border-b border-border/40 hover:bg-muted/50 transition-colors"
+   178→          onMouseDown={handleMouseDown}
+   179→          onDoubleClick={handleToggleMinimize}
+   180→        >
+   181→          <GripHorizontal className="h-3.5 w-3.5 text-muted-foreground/40 shrink-0" />
+   182→          <span className="text-[11px] font-medium text-foreground truncate flex-1">
+   183→            {card.sectionLabel}
+   184→          </span>
+   185→          <button
+   186→            data-no-drag
+   187→            type="button"
+   188→            className="p-0.5 rounded hover:bg-muted transition-colors"
+   189→            onClick={handleToggleMinimize}
+   190→            title={isMinimized ? 'Expand' : 'Minimize'}
+   191→          >
+   192→            {isMinimized ? (
+   193→              <ChevronDown className="h-3 w-3 text-muted-foreground" />
+   194→            ) : (
+   195→              <ChevronUp className="h-3 w-3 text-muted-foreground" />
+   196→            )}
+   197→          </button>
+   198→          <button
+   199→            data-no-drag
+   200→            type="button"
+   201→            className="p-0.5 rounded hover:bg-destructive/10 hover:text-destructive transition-colors"
+   202→            onClick={handleClose}
+   203→            title="Close"
+   204→          >
+   205→            <X className="h-3 w-3 text-muted-foreground hover:text-destructive" />
+   206→          </button>
+   207→        </div>
+   208→
+   209→        {/* Content */}
+   210→        {!isMinimized && (
+   211→          <div className="p-3 max-h-[70vh] overflow-y-auto">
+   212→            {renderContent()}
+   213→          </div>
+   214→        )}
+   215→
+   216→        {/* Blue dim overlay when spotlight or settings is open */}
+   217→        {(spotlightOpen || anyModalOpen) && (
+   218→          <div className="absolute inset-0 bg-blue-500/20 pointer-events-none rounded-lg" />
+   219→        )}
+   220→      </div>
+   221→    </div>
+   222→  );
+   223→}
+   224→
+   225→// ─── Shared input classes ──────────────────────────────────────────────
+   226→const inputCls = 'w-full min-w-0 h-7 text-xs px-2 border border-border rounded bg-background focus:outline-none focus:ring-1 focus:ring-ring';
+   227→const inputFlexCls = 'flex-1 min-w-0 h-7 text-xs px-2 border border-border rounded bg-background focus:outline-none focus:ring-1 focus:ring-ring';
+   228→const selectCls = 'w-full h-7 text-xs px-2 border border-border rounded bg-background focus:outline-none focus:ring-1 focus:ring-ring';
+   229→const labelCls = 'text-[10px] text-muted-foreground uppercase tracking-wide';
+   230→
+   231→// ─── Dynamic card width based on section content ───────────────────────
+   232→function getCardWidthClass(sectionLabel: string): string {
+   233→  // Wide sections (320px) - complex UI with grids, color pickers, presets, etc.
+   234→  const wideSections = new Set([
+   235→    'Fill & Gradient', 'Gradient',
+   236→    'Cell Properties',
+   237→    'Shadow',
+   238→    'Reflection',
+   239→    'Text Content',
+   240→    'Formatting',
+   241→  ]);
+   242→  // Medium-wide sections (280px) - multiple fields, color rows, checkbox grids
+   243→  const mediumSections = new Set([
+   244→    'Typography',
+   245→    'Borders', 'Table Border',
+   246→    'Corner Radius',
+   247→    'Header Row',
+   248→    'Cell Styling', 'Cell Defaults',
+   249→    'Image Filters', 'Adjustments',
+   250→    'Stroke',
+   251→    'Glow',
+   252→    'Reorder',
+   253→  ]);
+   254→
+   255→  if (wideSections.has(sectionLabel)) return 'w-[320px]';
+   256→  if (mediumSections.has(sectionLabel)) return 'w-[280px]';
+   257→  return 'w-[260px]';
+   258→}
+   259→
+   260→function getCardWidthPx(sectionLabel: string): number {
+   261→  const wideSections = new Set([
+   262→    'Fill & Gradient', 'Gradient',
+   263→    'Cell Properties',
+   264→    'Shadow',
+   265→    'Reflection',
+   266→    'Text Content',
+   267→    'Formatting',
+   268→  ]);
+   269→  const mediumSections = new Set([
+   270→    'Typography',
+   271→    'Borders', 'Table Border',
+   272→    'Corner Radius',
+   273→    'Header Row',
+   274→    'Cell Styling', 'Cell Defaults',
+   275→    'Image Filters', 'Adjustments',
+   276→    'Stroke',
+   277→    'Glow',
+   278→    'Reorder',
+   279→  ]);
+   280→
+   281→  if (wideSections.has(sectionLabel)) return 320;
+   282→  if (mediumSections.has(sectionLabel)) return 280;
+   283→  return 260;
+   284→}
+   285→
+   286→// ─── Inline field helper ───────────────────────────────────────────────
+   287→function Field({ label, children }: { label: string; children: React.ReactNode }) {
+   288→  return (
+   289→    <div className="space-y-0.5">
+   290→      <label className={labelCls}>{label}</label>
+   291→      {children}
+   292→    </div>
+   293→  );
+   294→}
+   295→
+   296→// ─── Checkbox row ──────────────────────────────────────────────────────
+   297→function CheckboxRow({ label, checked, onChange }: { label: string; checked: boolean; onChange: (v: boolean) => void }) {
+   298→  return (
+   299→    <label className="flex items-center gap-2 cursor-pointer" data-no-drag>
+   300→      <input
+   301→        type="checkbox"
+   302→        checked={checked}
+   303→        onChange={(e) => onChange(e.target.checked)}
+   304→        className="rounded border-border"
+   305→      />
+   306→      <span className="text-xs text-foreground">{label}</span>
+   307→    </label>
+   308→  );
+   309→}
+   310→
+   311→// ─── Cell Properties sub-component ─────────────────────────────────
+   312→function CellPropertiesEditor({ element, props, update, compact }: { element: CanvasElement; props: TableProperties; update: (updates: Partial<TableProperties>) => void; compact?: boolean }) {
+   313→  // Sync with store's Alt-key cell selection from the canvas.
+   314→  // Only reflect the store selection when it belongs to THIS table — the
+   315→  // store tracks tableCellSelectTableId so selections stay scoped per table
+   316→  // (otherwise cells at the same {row, col} in other tables would light up).
+   317→  const storeSelectedTableCells = useDesignerStore((s) => s.selectedTableCells);
+   318→  const tableCellSelectTableId = useDesignerStore((s) => s.tableCellSelectTableId);
+   319→  // Only reflect the store selection when it belongs to THIS table. Memoized
+   320→  // so the dependency identity stays stable for useCallback/useMemo below.
+   321→  const storeSelectionForThisTable = useMemo(
+   322→    () => (tableCellSelectTableId === element.id ? storeSelectedTableCells : []),
+   323→    [tableCellSelectTableId, element.id, storeSelectedTableCells]
+   324→  );
+   325→  const [localSelectedCells, setLocalSelectedCells] = useState<Set<string>>(new Set());
+   326→
+   327→  // Merge store's canvas cell selection with local selection.
+   328→  // Store selection takes priority when present (from Alt+click on canvas).
+   329→  const selectedCells = storeSelectionForThisTable.length > 0
+   330→    ? new Set(storeSelectionForThisTable.map(cell => `${cell.row}-${cell.col}`))
+   331→    : localSelectedCells;
+   332→
+   333→  // Wrapper for setSelectedCells that updates local state and clears store selection
+   334→  const setSelectedCells = useCallback((updater: Set<string> | ((prev: Set<string>) => Set<string>)) => {
+   335→    // Clear store selection when using the card mini-table to select
+   336→    if (storeSelectionForThisTable.length > 0) {
+   337→      useDesignerStore.getState().clearTableCellSelection();
+   338→    }
+   339→    setLocalSelectedCells((prev) => {
+   340→      const resolved = typeof updater === 'function' ? updater(storeSelectionForThisTable.length > 0 ? new Set(storeSelectionForThisTable.map(cell => `${cell.row}-${cell.col}`)) : prev) : updater;
+   341→      return resolved;
+   342→    });
+   343→  }, [storeSelectionForThisTable]);
+   344→
+   345→  const getCellOverride = (r: number, c: number): CellOverride => {
+   346→    return props.cellOverrides[`${r}-${c}`] || {};
+   347→  };
+   348→
+   349→  const updateCellOverride = (r: number, c: number, updates: Partial<CellOverride>) => {
+   350→    const key = `${r}-${c}`;
+   351→    const existing = props.cellOverrides[key] ?? {};
+   352→    const newOverrides = { ...props.cellOverrides, [key]: { ...existing, ...updates } };
+   353→    update({ cellOverrides: newOverrides });
+   354→  };
+   355→
+   356→  const clearCellOverride = (r: number, c: number) => {
+   357→    const key = `${r}-${c}`;
+   358→    const newOverrides = { ...props.cellOverrides };
+   359→    delete newOverrides[key];
+   360→    update({ cellOverrides: newOverrides });
+   361→  };
+   362→
+   363→  // ---- Multi-cell helpers ----
+   364→
+   365→  const toggleCellSelection = (r: number, c: number, multi: boolean) => {
+   366→    const key = `${r}-${c}`;
+   367→    setSelectedCells((prev) => {
+   368→      const next = new Set(prev);
+   369→      if (multi) {
+   370→        if (next.has(key)) {
+   371→          next.delete(key);
+   372→        } else {
+   373→          next.add(key);
+   374→        }
+   375→      } else {
+   376→        if (next.size === 1 && next.has(key)) {
+   377→          return prev;
+   378→        }
+   379→        next.clear();
+   380→        next.add(key);
+   381→      }
+   382→      return next;
+   383→    });
+   384→  };
+   385→
+   386→  const parseCellKey = (key: string): { r: number; c: number } => {
+   387→    const [r, c] = key.split('-').map(Number);
+   388→    return { r, c };
+   389→  };
+   390→
+   391→  // Update an override property for all selected cells at once
+   392→  const updateSelectedCellsOverride = (overrideUpdate: Partial<CellOverride>) => {
+   393→    const newOverrides = { ...props.cellOverrides };
+   394→    for (const key of selectedCells) {
+   395→      const existing = newOverrides[key] || {};
+   396→      const merged = { ...existing, ...overrideUpdate };
+   397→      const cleaned: CellOverride = {};
+   398→      for (const [k, v] of Object.entries(merged)) {
+   399→        if (v !== undefined) (cleaned as Record<string, unknown>)[k] = v;
+   400→      }
+   401→      if (Object.keys(cleaned).length === 0) {
+   402→        delete newOverrides[key];
+   403→      } else {
+   404→        newOverrides[key] = cleaned;
+   405→      }
+   406→    }
+   407→    update({ cellOverrides: newOverrides });
+   408→  };
+   409→
+   410→  // Clear overrides for all selected cells
+   411→  const clearSelectedCellsOverrides = () => {
+   412→    const newOverrides = { ...props.cellOverrides };
+   413→    for (const key of selectedCells) {
+   414→      delete newOverrides[key];
+   415→    }
+   416→    update({ cellOverrides: newOverrides });
+   417→  };
+   418→
+   419→  // Compute the common value of a property across all selected cells
+   420→  const getMultiCellValue = <T,>(
+   421→    getter: (r: number, c: number) => T,
+   422→    fallback: T
+   423→  ): { value: T; mixed: boolean } => {
+   424→    if (selectedCells.size === 0) return { value: fallback, mixed: false };
+   425→    const values: T[] = [];
+   426→    for (const key of selectedCells) {
+   427→      const { r, c } = parseCellKey(key);
+   428→      values.push(getter(r, c));
+   429→    }
+   430→    const first = values[0];
+   431→    const mixed = values.some((v) => v !== first);
+   432→    return { value: mixed ? fallback : first, mixed };
+   433→  };
+   434→
+   435→  // Computed override values for selected cells
+   436→  const multiAlign = getMultiCellValue(
+   437→    (r, c) => getCellOverride(r, c).textAlign ?? 'left',
+   438→    'left'
+   439→  );
+   440→  const multiVAlign = getMultiCellValue(
+   441→    (r, c) => getCellOverride(r, c).verticalAlign ?? 'middle',
+   442→    'middle'
+   443→  );
+   444→  const multiPadding = getMultiCellValue(
+   445→    (r, c) => getCellOverride(r, c).padding ?? props.cellPadding,
+   446→    props.cellPadding
+   447→  );
+   448→  const multiBgColor = getMultiCellValue(
+   449→    (r, c) => getCellOverride(r, c).bgColor || props.cellBg,
+   450→    props.cellBg
+   451→  );
+   452→  const multiTextColor = getMultiCellValue(
+   453→    (r, c) => getCellOverride(r, c).color || props.cellColor,
+   454→    props.cellColor
+   455→  );
+   456→  const multiFontWeight = getMultiCellValue(
+   457→    (r, c) => getCellOverride(r, c).fontWeight || 'normal',
+   458→    'normal'
+   459→  );
+   460→  const multiFontSize = getMultiCellValue(
+   461→    (r, c) => getCellOverride(r, c).fontSize || props.fontSize,
+   462→    props.fontSize
+   463→  );
+   464→  const multiTextTransform = getMultiCellValue(
+   465→    (r, c) => getCellOverride(r, c).textTransform || 'none',
+   466→    'none'
+   467→  );
+   468→
+   469→  // Linked cell border toggle — when toggling a side, also toggle the adjacent cell's opposite side
+   470→  const toggleCellBorderLinked = (r: number, c: number, side: 'borderTop' | 'borderRight' | 'borderBottom' | 'borderLeft') => {
+   471→    const current = props.cellOverrides[`${r}-${c}`] ?? {};
+   472→    const currentVal = current[side] ?? true;
+   473→    const newVal = !currentVal;
+   474→
+   475→    const newOverrides = { ...props.cellOverrides };
+   476→
+   477→    // Update the target cell
+   478→    const targetKey = `${r}-${c}`;
+   479→    const targetExisting = newOverrides[targetKey] || {};
+   480→    const targetMerged = { ...targetExisting, [side]: newVal };
+   481→    const targetCleaned: CellOverride = {};
+   482→    for (const [k, v] of Object.entries(targetMerged)) {
+   483→      if (v !== undefined) (targetCleaned as Record<string, unknown>)[k] = v;
+   484→    }
+   485→    if (Object.keys(targetCleaned).length === 0) {
+   486→      delete newOverrides[targetKey];
+   487→    } else {
+   488→      newOverrides[targetKey] = targetCleaned;
+   489→    }
+   490→
+   491→    // Determine adjacent cell and its opposite side
+   492→    let adjR = r;
+   493→    let adjC = c;
+   494→    let adjSide: 'borderTop' | 'borderRight' | 'borderBottom' | 'borderLeft' = side;
+   495→
+   496→    switch (side) {
+   497→      case 'borderTop':
+   498→        adjR = r - 1;
+   499→        adjSide = 'borderBottom';
+   500→        break;
+   501→      case 'borderBottom':
+   502→        adjR = r + 1;
+   503→        adjSide = 'borderTop';
+   504→        break;
+   505→      case 'borderLeft':
+   506→        adjC = c - 1;
+   507→        adjSide = 'borderRight';
+   508→        break;
+   509→      case 'borderRight':
+   510→        adjC = c + 1;
+   511→        adjSide = 'borderLeft';
+   512→        break;
+   513→    }
+   514→
+   515→    // Only update adjacent cell if it exists (not out of bounds)
+   516→    if (adjR >= 0 && adjR < props.rows && adjC >= 0 && adjC < props.cols) {
+   517→      const adjKey = `${adjR}-${adjC}`;
+   518→      const adjExisting = newOverrides[adjKey] || {};
+   519→      const adjMerged = { ...adjExisting, [adjSide]: newVal };
+   520→      const adjCleaned: CellOverride = {};
+   521→      for (const [k, v] of Object.entries(adjMerged)) {
+   522→        if (v !== undefined) (adjCleaned as Record<string, unknown>)[k] = v;
+   523→      }
+   524→      if (Object.keys(adjCleaned).length === 0) {
+   525→        delete newOverrides[adjKey];
+   526→      } else {
+   527→        newOverrides[adjKey] = adjCleaned;
+   528→      }
+   529→    }
+   530→
+   531→    update({ cellOverrides: newOverrides });
+   532→  };
+   533→
+   534→  return (
+   535→    <div className="space-y-2">
+   536→      <label className={labelCls}>Select Cell(s)</label>
+   537→      <p className="text-[9px] text-muted-foreground -mt-1">Click to select · Shift/Ctrl+Click to multi-select</p>
+   538→      <div className="max-h-32 overflow-auto border border-border rounded-md">
+   539→        <table className="w-full text-xs border-collapse">
+   540→          <tbody>
+   541→            {props.cellData.map((row, r) => (
+   542→              <tr key={r}>
+   543→                {row.map((cell, c) => {
+   544→                  const cellKey = `${r}-${c}`;
+   545→                  const isSelected = selectedCells.has(cellKey);
+   546→                  const isHeader = r === 0 && props.showHeader;
+   547→                  return (
+   548→                    <td
+   549→                      key={c}
+   550→                      className={`border border-border/30 p-0 cursor-pointer ${
+   551→                        isSelected ? 'bg-black/10 ring-1 ring-black/30' : 'hover:bg-muted/50'
+   552→                      }`}
+   553→                      onClick={(e) => toggleCellSelection(r, c, e.shiftKey || e.ctrlKey || e.metaKey)}
+   554→                    >
+   555→                      <input
+   556→                        value={cell}
+   557→                        onChange={(e) => {
+   558→                          const newCellData = props.cellData.map((r2) => [...r2]);
+   559→                          newCellData[r][c] = e.target.value;
+   560→                          update({ cellData: newCellData });
+   561→                        }}
+   562→                        className="w-full text-[10px] p-1 bg-transparent outline-none truncate"
+   563→                        style={{
+   564→                          fontWeight: isHeader ? props.headerFontWeight : 'normal',
+   565→                          color: isHeader ? props.headerColor : props.cellColor,
+   566→                          minWidth: props.cols <= 4 ? 50 : 36,
+   567→                        }}
+   568→                        onClick={(e) => { e.stopPropagation(); toggleCellSelection(r, c, e.shiftKey || e.ctrlKey || e.metaKey); }}
+   569→                        data-no-drag
+   570→                      />
+   571→                    </td>
+   572→                  );
+   573→                })}
+   574→              </tr>
+   575→            ))}
+   576→          </tbody>
+   577→        </table>
+   578→      </div>
+   579→
+   580→      {!compact && selectedCells.size > 0 && (
+   581→        <div className="space-y-2 p-2 border border-border rounded-md bg-muted/20">
+   582→          <div className="flex items-center justify-between">
+   583→            <span className="text-[10px] text-muted-foreground font-medium">
+   584→              {selectedCells.size === 1
+   585→                ? `Cell (${parseCellKey([...selectedCells][0]).r + 1}, ${parseCellKey([...selectedCells][0]).c + 1})`
+   586→                : `${selectedCells.size} cells selected`}
+   587→            </span>
+   588→            <button
+   589→              data-no-drag
+   590→              className="text-[9px] text-destructive hover:underline"
+   591→              onClick={clearSelectedCellsOverrides}
+   592→            >
+   593→              Reset
+   594→            </button>
+   595→          </div>
+   596→
+   597→          {/* Cell text — only shown for single selection */}
+   598→          {selectedCells.size === 1 && (() => {
+   599→            const { r, c } = parseCellKey([...selectedCells][0]);
+   600→            return (
+   601→              <Field label="Text">
+   602→                <input
+   603→                  data-no-drag
+   604→                  value={props.cellData[r]?.[c] ?? ''}
+   605→                  onChange={(e) => {
+   606→                    const newCellData = props.cellData.map((r2) => [...r2]);
+   607→                    newCellData[r][c] = e.target.value;
+   608→                    update({ cellData: newCellData });
+   609→                  }}
+   610→                  className={inputCls}
+   611→                />
+   612→              </Field>
+   613→            );
+   614→          })()}
+   615→
+   616→          <Field label="H-Align">
+   617→            <select
+   618→              data-no-drag
+   619→              value={multiAlign.mixed ? '__mixed__' : multiAlign.value}
+   620→              onChange={(e) => { if (e.target.value !== '__mixed__') updateSelectedCellsOverride({ textAlign: e.target.value as CellOverride['textAlign'] }); }}
+   621→              className={selectCls}
+   622→            >
+   623→              {multiAlign.mixed && <option value="__mixed__">— mixed —</option>}
+   624→              <option value="left">Left</option>
+   625→              <option value="center">Center</option>
+   626→              <option value="right">Right</option>
+   627→              <option value="justify">Justify</option>
+   628→            </select>
+   629→          </Field>
+   630→
+   631→          <Field label="V-Align">
+   632→            <select
+   633→              data-no-drag
+   634→              value={multiVAlign.mixed ? '__mixed__' : multiVAlign.value}
+   635→              onChange={(e) => { if (e.target.value !== '__mixed__') updateSelectedCellsOverride({ verticalAlign: e.target.value as 'top' | 'middle' | 'bottom' }); }}
+   636→              className={selectCls}
+   637→            >
+   638→              {multiVAlign.mixed && <option value="__mixed__">— mixed —</option>}
+   639→              <option value="top">Top</option>
+   640→              <option value="middle">Middle</option>
+   641→              <option value="bottom">Bottom</option>
+   642→            </select>
+   643→          </Field>
+   644→
+   645→          <Field label="Padding">
+   646→            <input
+   647→              data-no-drag
+   648→              type="number"
+   649→              min={0}
+   650→              max={20}
+   651→              value={multiPadding.mixed ? '' : multiPadding.value}
+   652→              placeholder={multiPadding.mixed ? 'mixed' : undefined}
+   653→              onChange={(e) => updateSelectedCellsOverride({ padding: +e.target.value })}
+   654→              className={inputCls}
+   655→            />
+   656→          </Field>
+   657→
+   658→          <Field label="BG Color">
+   659→            <div className="flex items-center gap-1.5">
+   660→              {multiBgColor.mixed && <span className="text-[9px] text-muted-foreground italic">mixed</span>}
+   661→              <ColorInput
+   662→                value={multiBgColor.value}
+   663→                onChange={(v) => updateSelectedCellsOverride({ bgColor: v })}
+   664→                noDrag
+   665→              />
+   666→            </div>
+   667→          </Field>
+   668→
+   669→          <Field label="Text Color">
+   670→            <div className="flex items-center gap-1.5">
+   671→              {multiTextColor.mixed && <span className="text-[9px] text-muted-foreground italic">mixed</span>}
+   672→              <ColorInput
+   673→                value={multiTextColor.value}
+   674→                onChange={(v) => updateSelectedCellsOverride({ color: v })}
+   675→                noDrag
+   676→              />
+   677→            </div>
+   678→          </Field>
+   679→
+   680→          <Field label="Font Weight">
+   681→            <select
+   682→              data-no-drag
+   683→              value={multiFontWeight.mixed ? '__mixed__' : multiFontWeight.value}
+   684→              onChange={(e) => { if (e.target.value !== '__mixed__') updateSelectedCellsOverride({ fontWeight: e.target.value }); }}
+   685→              className={selectCls}
+   686→            >
+   687→              {multiFontWeight.mixed && <option value="__mixed__">— mixed —</option>}
+   688→              <option value="normal">Normal</option>
+   689→              <option value="bold">Bold</option>
+   690→              <option value="lighter">Lighter</option>
+   691→              <option value="500">500</option>
+   692→              <option value="600">600</option>
+   693→              <option value="700">700</option>
+   694→            </select>
+   695→          </Field>
+   696→
+   697→          <Field label="Font Size">
+   698→            <div className="flex items-center gap-1">
+   699→              {multiFontSize.mixed && <span className="text-[9px] text-muted-foreground italic">mixed</span>}
+   700→              <input
+   701→                data-no-drag
+   702→                type="number"
+   703→                value={multiFontSize.mixed ? '' : multiFontSize.value}
+   704→                placeholder={multiFontSize.mixed ? 'mixed' : undefined}
+   705→                onChange={(e) => updateSelectedCellsOverride({ fontSize: +e.target.value })}
+   706→                className={`${inputCls} flex-1`}
+   707→              />
+   708→              <span className="text-xs text-muted-foreground">px</span>
+   709→            </div>
+   710→          </Field>
+   711→
+   712→          <Field label="Text Transform">
+   713→            <select
+   714→              data-no-drag
+   715→              value={multiTextTransform.mixed ? '__mixed__' : multiTextTransform.value}
+   716→              onChange={(e) => { if (e.target.value !== '__mixed__') updateSelectedCellsOverride({ textTransform: e.target.value as 'none' | 'uppercase' | 'lowercase' | 'capitalize' }); }}
+   717→              className={selectCls}
+   718→            >
+   719→              {multiTextTransform.mixed && <option value="__mixed__">— mixed —</option>}
+   720→              <option value="none">None</option>
+   721→              <option value="uppercase">UPPERCASE</option>
+   722→              <option value="lowercase">lowercase</option>
+   723→              <option value="capitalize">Capitalize</option>
+   724→            </select>
+   725→          </Field>
+   726→
+   727→          {/* Justify columns/rows — equally space selected columns and rows */}
+   728→          {selectedCells.size > 0 && (() => {
+   729→            // Determine which columns and rows have at least one selected cell
+   730→            const selectedCols = new Set<number>();
+   731→            const selectedRows = new Set<number>();
+   732→            for (const key of selectedCells) {
+   733→              const { r, c } = parseCellKey(key);
+   734→              selectedCols.add(c);
+   735→              selectedRows.add(r);
+   736→            }
+   737→            const hasMultipleCols = selectedCols.size >= 2;
+   738→            const hasMultipleRows = selectedRows.size >= 2;
+   739→
+   740→            const justifyColumns = () => {
+   741→              const cw = ensureColWidths(props.cols, props.colWidths);
+   742→              const cols = [...selectedCols].sort((a, b) => a - b);
+   743→              const totalWidth = cols.reduce((sum, c) => sum + (cw[c] || 1), 0);
+   744→              const equalWidth = totalWidth / cols.length;
+   745→              const newColWidths = [...cw];
+   746→              for (const c of cols) {
+   747→                newColWidths[c] = equalWidth;
+   748→              }
+   749→              update({ colWidths: newColWidths });
+   750→            };
+   751→
+   752→            const justifyRows = () => {
+   753→              const rh = ensureRowHeights(props.rows, props.rowHeights);
+   754→              const rows = [...selectedRows].sort((a, b) => a - b);
+   755→              const totalHeight = rows.reduce((sum, r) => sum + (rh[r] || 1), 0);
+   756→              const equalHeight = totalHeight / rows.length;
+   757→              const newRowHeights = [...rh];
+   758→              for (const r of rows) {
+   759→                newRowHeights[r] = equalHeight;
+   760→              }
+   761→              update({ rowHeights: newRowHeights });
+   762→            };
+   763→
+   764→            if (!hasMultipleCols && !hasMultipleRows) return null;
+   765→
+   766→            return (
+   767→              <div className="flex gap-1.5">
+   768→                {hasMultipleCols && (
+   769→                  <button
+   770→                    data-no-drag
+   771→                    className="flex-1 flex items-center justify-center gap-1 px-2 py-1 text-[9px] font-medium rounded border border-border hover:bg-accent transition-colors"
+   772→                    onClick={justifyColumns}
+   773→                    title="Equalize selected column widths"
+   774→                  >
+   775→                    <Columns3 className="w-3 h-3" />
+   776→                    Justify Cols
+   777→                  </button>
+   778→                )}
+   779→                {hasMultipleRows && (
+   780→                  <button
+   781→                    data-no-drag
+   782→                    className="flex-1 flex items-center justify-center gap-1 px-2 py-1 text-[9px] font-medium rounded border border-border hover:bg-accent transition-colors"
+   783→                    onClick={justifyRows}
+   784→                    title="Equalize selected row heights"
+   785→                  >
+   786→                    <Rows3 className="w-3 h-3" />
+   787→                    Justify Rows
+   788→                  </button>
+   789→                )}
+   790→              </div>
+   791→            );
+   792→          })()}
+   793→
+   794→          {/* Per-side cell border toggles — single cell only for simplicity */}
+   795→          {selectedCells.size === 1 && (() => {
+   796→            const { r, c } = parseCellKey([...selectedCells][0]);
+   797→            const cellOverride = getCellOverride(r, c);
+   798→            return (
+   799→              <>
+   800→                <Field label="Cell Borders">
+   801→                  <div className="flex items-center justify-center">
+   802→                    <div className="grid grid-cols-3 grid-rows-3 gap-0.5 w-fit">
+   803→                      <div />
+   804→                      <button
+   805→                        data-no-drag
+   806→                        className={`h-7 w-7 rounded flex items-center justify-center transition-colors ${
+   807→                          cellOverride.borderTop !== false ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground border border-border'
+   808→                        }`}
+   809→                        onClick={() => toggleCellBorderLinked(r, c, 'borderTop')}
+   810→                        title="Top cell border"
+   811→                      >
+   812→                        <PanelTop className="h-3.5 w-3.5" />
+   813→                      </button>
+   814→                      <div />
+   815→                      <button
+   816→                        data-no-drag
+   817→                        className={`h-7 w-7 rounded flex items-center justify-center transition-colors ${
+   818→                          cellOverride.borderLeft !== false ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground border border-border'
+   819→                        }`}
+   820→                        onClick={() => toggleCellBorderLinked(r, c, 'borderLeft')}
+   821→                        title="Left cell border"
+   822→                      >
+   823→                        <PanelLeft className="h-3.5 w-3.5" />
+   824→                      </button>
+   825→                      <div className="h-7 w-7 flex items-center justify-center">
+   826→                        <Square className="h-3.5 w-3.5 text-muted-foreground" />
+   827→                      </div>
+   828→                      <button
+   829→                        data-no-drag
+   830→                        className={`h-7 w-7 rounded flex items-center justify-center transition-colors ${
+   831→                          cellOverride.borderRight !== false ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground border border-border'
+   832→                        }`}
+   833→                        onClick={() => toggleCellBorderLinked(r, c, 'borderRight')}
+   834→                        title="Right cell border"
+   835→                      >
+   836→                        <PanelRight className="h-3.5 w-3.5" />
+   837→                      </button>
+   838→                      <div />
+   839→                      <button
+   840→                        data-no-drag
+   841→                        className={`h-7 w-7 rounded flex items-center justify-center transition-colors ${
+   842→                          cellOverride.borderBottom !== false ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground border border-border'
+   843→                        }`}
+   844→                        onClick={() => toggleCellBorderLinked(r, c, 'borderBottom')}
+   845→                        title="Bottom cell border"
+   846→                      >
+   847→                        <PanelBottom className="h-3.5 w-3.5" />
+   848→                      </button>
+   849→                      <div />
+   850→                    </div>
+   851→                  </div>
+   852→                </Field>
+   853→                <div className="grid grid-cols-2 gap-x-3 gap-y-0 text-[9px] text-muted-foreground">
+   854→                  <div className="flex items-center gap-1">
+   855→                    <span className={`inline-block w-1.5 h-1.5 rounded-full ${cellOverride.borderTop !== false ? 'bg-primary' : 'bg-muted-foreground/30'}`} />
+   856→                    Top
+   857→                  </div>
+   858→                  <div className="flex items-center gap-1">
+   859→                    <span className={`inline-block w-1.5 h-1.5 rounded-full ${cellOverride.borderRight !== false ? 'bg-primary' : 'bg-muted-foreground/30'}`} />
+   860→                    Right
+   861→                  </div>
+   862→                  <div className="flex items-center gap-1">
+   863→                    <span className={`inline-block w-1.5 h-1.5 rounded-full ${cellOverride.borderBottom !== false ? 'bg-primary' : 'bg-muted-foreground/30'}`} />
+   864→                    Bottom
+   865→                  </div>
+   866→                  <div className="flex items-center gap-1">
+   867→                    <span className={`inline-block w-1.5 h-1.5 rounded-full ${cellOverride.borderLeft !== false ? 'bg-primary' : 'bg-muted-foreground/30'}`} />
+   868→                    Left
+   869→                  </div>
+   870→                </div>
+   871→              </>
+   872→            );
+   873→          })()}
+   874→        </div>
+   875→      )}
+   876→      {compact && selectedCells.size > 0 && (
+   877→        <p className="text-[9px] text-muted-foreground italic">
+   878→          {selectedCells.size === 1
+   879→            ? `1 cell selected — click to edit`
+   880→            : `${selectedCells.size} cells selected — click to edit`}
+   881→        </p>
+   882→      )}
+   883→    </div>
+   884→  );
+   885→}
+   886→
+   887→// ─── ReorderCardContent: combined rows & columns reorder with tab toggle ─────
+   888→function ReorderCardContent({
+   889→  props,
+   890→  onRowReorder,
+   891→  onColReorder,
+   892→}: {
+   893→  props: TableProperties;
+   894→  onRowReorder: (fromIndex: number, toIndex: number) => void;
+   895→  onColReorder: (fromIndex: number, toIndex: number) => void;
+   896→}) {
+   897→  const [tab, setTab] = useState<'rows' | 'cols'>('rows');
+   898→
+   899→  const rowNames = props.rowNames ?? Array.from({ length: props.cellData.length }, (_, i) => `Row ${i + 1}`);
+   900→  const colNames = props.colNames ?? Array.from({ length: props.cols }, (_, i) => `Column ${i + 1}`);
+   901→
+   902→  const rowItems: ReorderItem[] = props.cellData.map((_, i) => ({
+   903→    id: `row-${i}`,
+   904→    label: rowNames[i],
+   905→    color: props.rowBgColors[i] || undefined,
+   906→  }));
+   907→
+   908→  const colItems: ReorderItem[] = Array.from({ length: props.cols }, (_, i) => ({
+   909→    id: `col-${i}`,
+   910→    label: colNames[i],
+   911→    color: props.colBgColors[i] || undefined,
+   912→  }));
+   913→
+   914→  return (
+   915→    <div className="space-y-2">
+   916→      {/* Tab toggle */}
+   917→      <div className="flex rounded-md bg-muted/50 p-0.5">
+   918→        <button
+   919→          data-no-drag
+   920→          className={`flex-1 text-[10px] font-medium py-1 rounded-sm transition-colors ${
+   921→            tab === 'rows'
+   922→              ? 'bg-background text-foreground shadow-sm'
+   923→              : 'text-muted-foreground hover:text-foreground'
+   924→          }`}
+   925→          onClick={() => setTab('rows')}
+   926→        >
+   927→          Rows
+   928→        </button>
+   929→        <button
+   930→          data-no-drag
+   931→          className={`flex-1 text-[10px] font-medium py-1 rounded-sm transition-colors ${
+   932→            tab === 'cols'
+   933→              ? 'bg-background text-foreground shadow-sm'
+   934→              : 'text-muted-foreground hover:text-foreground'
+   935→          }`}
+   936→          onClick={() => setTab('cols')}
+   937→        >
+   938→          Columns
+   939→        </button>
+   940→      </div>
+   941→
+   942→      {/* Draggable list */}
+   943→      <div data-no-drag className="relative">
+   944→        {tab === 'rows' ? (
+   945→          <DraggableReorderList items={rowItems} onReorder={onRowReorder} maxHeight={140} />
+   946→        ) : (
+   947→          <DraggableReorderList items={colItems} onReorder={onColReorder} maxHeight={140} />
+   948→        )}
+   949→      </div>
+   950→    </div>
+   951→  );
+   952→}
+   953→
+   954→// ─── Static Formatting Toolbar ──────────────────────────────────────────
+   955→// A compact toolbar that modifies TextProperties directly (without an active editor).
+   956→// Shown in the floating card's "Formatting" section when the text element is NOT
+   957→// being actively edited on canvas. Mirrors the look of FormattingToolbar but
+   958→// operates on the element's base/default properties.
+   959→
+   960→const FONT_FAMILIES_STATIC = [
+   961→  { value: 'Inter, sans-serif', label: 'Inter' },
+   962→  { value: 'Georgia, serif', label: 'Georgia' },
+   963→  { value: "'Courier New', monospace", label: 'Courier New' },
+   964→  { value: 'Arial, sans-serif', label: 'Arial' },
+   965→  { value: "'Times New Roman', serif", label: 'Times New Roman' },
+   966→  { value: 'Verdana, sans-serif', label: 'Verdana' },
+   967→];
+   968→
+   969→const FONT_SIZES_STATIC = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 64, 72];
+   970→
+   971→function StaticToolbarButton({ active, onClick, title, children }: {
+   972→  active?: boolean; onClick: () => void; title: string; children: React.ReactNode;
+   973→}) {
+   974→  return (
+   975→    <button
+   976→      type="button"
+   977→      onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
+   978→      onClick={(e) => { e.stopPropagation(); onClick(); }}
+   979→      className={`p-1 rounded transition-colors ${
+   980→        active ? 'bg-primary text-primary-foreground' : 'hover:bg-muted text-foreground'
+   981→      }`}
+   982→      title={title}
+   983→      data-no-drag
+   984→    >
+   985→      {children}
+   986→    </button>
+   987→  );
+   988→}
+   989→
+   990→function StaticToolbarDivider() {
+   991→  return <div className="w-px h-5 bg-border mx-0.5 shrink-0" />;
+   992→}
+   993→
+   994→export function StaticFormattingToolbar({ data, update }: {
+   995→  data: TextProperties;
+   996→  update: (updates: Partial<TextProperties>) => void;
+   997→}) {
+   998→  return (
+   999→    <div className="space-y-1.5 p-1.5 bg-popover border border-border rounded-lg select-none" data-no-drag>
+  1000→      {/* Row 1: Font Family + Font Size + Letter Spacing + Color — wraps to prevent overflow */}
+  1001→      <div className="flex items-center gap-1 flex-wrap">
+  1002→        {/* Font Family */}
+  1003→        <LabeledSelect
+  1004→          label="Font"
+  1005→          value={data.fontFamily}
+  1006→          onChange={(e) => update({ fontFamily: e.target.value })}
+  1007→          onMouseDown={(e) => e.stopPropagation()}
+  1008→          title="Font Family"
+  1009→          className="flex-1 min-w-[60px]"
+  1010→        >
+  1011→          {FONT_FAMILIES_STATIC.map((f) => (
+  1012→            <option key={f.value} value={f.value}>{f.label}</option>
+  1013→          ))}
+  1014→        </LabeledSelect>
+  1015→
+  1016→        {/* Font Size */}
+  1017→        <LabeledSelect
+  1018→          label="Size"
+  1019→          value={FONT_SIZES_STATIC.includes(data.fontSize) ? String(data.fontSize) : '__custom__'}
+  1020→          onChange={(e) => {
+  1021→            if (e.target.value !== '__custom__') {
+  1022→              update({ fontSize: Number(e.target.value) });
+  1023→            }
+  1024→          }}
+  1025→          onMouseDown={(e) => e.stopPropagation()}
+  1026→          title="Font Size"
+  1027→          className="w-[60px]"
+  1028→        >
+  1029→          {!FONT_SIZES_STATIC.includes(data.fontSize) && (
+  1030→            <option value="__custom__">{data.fontSize}px</option>
+  1031→          )}
+  1032→          {FONT_SIZES_STATIC.map((s) => (
+  1033→            <option key={s} value={s}>{s}px</option>
+  1034→          ))}
+  1035→        </LabeledSelect>
+  1036→
+  1037→        {/* Letter Spacing */}
+  1038→        <LabeledSelect
+  1039→          label="Spacing"
+  1040→          value={(() => {
+  1041→            const ls = data.letterSpacing;
+  1042→            const predefined = [-2, -1, -0.5, 0, 0.5, 1, 1.5, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20];
+  1043→            return predefined.includes(ls) ? String(ls) : '__custom__';
+  1044→          })()}
+  1045→          onChange={(e) => {
+  1046→            if (e.target.value !== '__custom__') {
+  1047→              update({ letterSpacing: Number(e.target.value) });
+  1048→            }
+  1049→          }}
+  1050→          onMouseDown={(e) => e.stopPropagation()}
+  1051→          title="Letter Spacing"
+  1052→          className="w-[72px]"
+  1053→        >
+  1054→          {(() => {
+  1055→            const predefined = [-2, -1, -0.5, 0, 0.5, 1, 1.5, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20];
+  1056→            if (!predefined.includes(data.letterSpacing)) {
+  1057→              return <option value="__custom__">{data.letterSpacing}px</option>;
+  1058→            }
+  1059→            return null;
+  1060→          })()}
+  1061→          {[-2, -1, -0.5, 0, 0.5, 1, 1.5, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20].map((s) => (
+  1062→            <option key={s} value={s}>{s}px</option>
+  1063→          ))}
+  1064→        </LabeledSelect>
+  1065→
+  1066→        {/* Text Color */}
+  1067→        <label className="relative cursor-pointer shrink-0" title="Text Color">
+  1068→          <input
+  1069→            type="color"
+  1070→            data-no-drag
+  1071→            className="absolute inset-0 opacity-0 cursor-pointer w-7 h-7"
+  1072→            defaultValue={data.color}
+  1073→            onInput={(e) => update({ color: (e.target as HTMLInputElement).value })}
+  1074→            onChange={(e) => update({ color: (e.target as HTMLInputElement).value })}
+  1075→            onMouseDown={(e) => e.stopPropagation()}
+  1076→          />
+  1077→          <div className="p-1 rounded hover:bg-muted">
+  1078→            <Type className="h-3.5 w-3.5" />
+  1079→            <div
+  1080→              className="h-0.5 mt-0.5 rounded-full"
+  1081→              style={{ backgroundColor: data.color }}
+  1082→            />
+  1083→          </div>
+  1084→        </label>
+  1085→      </div>
+  1086→
+  1087→      {/* Row 2: Bold, Italic, Underline, Strikethrough | Align Left, Center, Right, Justify — wraps to prevent overflow */}
+  1088→      <div className="flex items-center gap-0.5 flex-wrap">
+  1089→        <StaticToolbarButton
+  1090→          active={data.fontWeight === 'bold' || data.fontWeight === '700'}
+  1091→          onClick={() => update({ fontWeight: (data.fontWeight === 'bold' || data.fontWeight === '700') ? 'normal' : 'bold' })}
+  1092→          title="Bold"
+  1093→        >
+  1094→          <Bold className="h-3.5 w-3.5" />
+  1095→        </StaticToolbarButton>
+  1096→
+  1097→        <StaticToolbarButton
+  1098→          active={data.fontStyle === 'italic'}
+  1099→          onClick={() => update({ fontStyle: data.fontStyle === 'italic' ? 'normal' : 'italic' })}
+  1100→          title="Italic"
+  1101→        >
+  1102→          <Italic className="h-3.5 w-3.5" />
+  1103→        </StaticToolbarButton>
+  1104→
+  1105→        <StaticToolbarButton
+  1106→          active={data.textDecoration === 'underline'}
+  1107→          onClick={() => update({ textDecoration: data.textDecoration === 'underline' ? 'none' : 'underline' })}
+  1108→          title="Underline"
+  1109→        >
+  1110→          <UnderlineIcon className="h-3.5 w-3.5" />
+  1111→        </StaticToolbarButton>
+  1112→
+  1113→        <StaticToolbarButton
+  1114→          active={data.textDecoration === 'line-through'}
+  1115→          onClick={() => update({ textDecoration: data.textDecoration === 'line-through' ? 'none' : 'line-through' })}
+  1116→          title="Strikethrough"
+  1117→        >
+  1118→          <Strikethrough className="h-3.5 w-3.5" />
+  1119→        </StaticToolbarButton>
+  1120→
+  1121→        <StaticToolbarDivider />
+  1122→
+  1123→        <StaticToolbarButton
+  1124→          active={data.textAlign === 'left'}
+  1125→          onClick={() => update({ textAlign: 'left' })}
+  1126→          title="Align Left"
+  1127→        >
+  1128→          <AlignLeft className="h-3.5 w-3.5" />
+  1129→        </StaticToolbarButton>
+  1130→        <StaticToolbarButton
+  1131→          active={data.textAlign === 'center'}
+  1132→          onClick={() => update({ textAlign: 'center' })}
+  1133→          title="Align Center"
+  1134→        >
+  1135→          <AlignCenter className="h-3.5 w-3.5" />
+  1136→        </StaticToolbarButton>
+  1137→        <StaticToolbarButton
+  1138→          active={data.textAlign === 'right'}
+  1139→          onClick={() => update({ textAlign: 'right' })}
+  1140→          title="Align Right"
+  1141→        >
+  1142→          <AlignRight className="h-3.5 w-3.5" />
+  1143→        </StaticToolbarButton>
+  1144→        <StaticToolbarButton
+  1145→          active={data.textAlign === 'justify'}
+  1146→          onClick={() => update({ textAlign: 'justify' })}
+  1147→          title="Justify"
+  1148→        >
+  1149→          <AlignJustify className="h-3.5 w-3.5" />
+  1150→        </StaticToolbarButton>
+  1151→      </div>
+  1152→    </div>
+  1153→  );
+  1154→}
+  1155→
+  1156→// Property content renderer - renders the actual form fields for each section
+  1157→// Exported so spotlight-overlay.tsx can reuse it for preview cards
+  1158→// Wrapped in React.memo to prevent re-renders when only the card position changes
+  1159→export const PropertyContent = memo(function PropertyContent({ sectionLabel, element, compact, multiSelectIds }: { sectionLabel: string; element: CanvasElement; compact?: boolean; multiSelectIds?: string[] }) {
+  1160→  const updateElement = useDesignerStore((s) => s.updateElement);
+  1161→  const updateElementProperties = useDesignerStore((s) => s.updateElementProperties);
+  1162→  const alignElementHorizontalCenter = useDesignerStore((s) => s.alignElementHorizontalCenter);
+  1163→  const alignElementVerticalCenter = useDesignerStore((s) => s.alignElementVerticalCenter);
+  1164→  // Multi-select block alignment — shifts all selected elements as a group,
+  1165→  // preserving their relative positions (mirrors grouped-element alignment).
+  1166→  const alignElementsHorizontalCenter = useDesignerStore((s) => s.alignElementsHorizontalCenter);
+  1167→  const alignElementsVerticalCenter = useDesignerStore((s) => s.alignElementsVerticalCenter);
+  1168→  // Multi-select & group opacity setter — subscribed (not getState()) so the
+  1169→  // callback identity is stable and the slider's onValueChange fires correctly.
+  1170→  const setElementsOpacity = useDesignerStore((s) => s.setElementsOpacity);
+  1171→  // Subscribe to editing state so the Formatting section re-renders
+  1172→  // when the user starts/stops editing a text element
+  1173→  const editingTextElementId = useDesignerStore((s) => s.editingTextElementId);
+  1174→  const activeTextEditor = useDesignerStore((s) => s.activeTextEditor);
+  1175→  // Rectangle rotation setter — used by the 'Transform' card section.
+  1176→  const setRectRotation = useDesignerStore((s) => s.setRectRotation);
+  1177→
+  1178→  // Helper to get props data based on element type
+  1179→  const getProps = () => {
+  1180→    return element.properties as { type: string; data: Record<string, unknown> };
+  1181→  };
+  1182→
+  1183→  const updateProps = (updates: Record<string, unknown>) => {
+  1184→    const props = getProps();
+  1185→    updateElementProperties(element.id, {
+  1186→      type: props.type as 'text' | 'table' | 'image' | 'line' | 'rectangle' | 'ellipse',
+  1187→      data: { ...props.data, ...updates },
+  1188→    } as unknown as ElementProperties);
+  1189→  };
+  1190→
+  1191→  // Render based on section label
+  1192→  switch (sectionLabel) {
+  1193→    // ─── COMMON: Position ──────────────────────────────────────────
+  1194→    case 'Position': {
+  1195→      if (element.type === 'line') return <div className="text-xs text-muted-foreground italic">Use Endpoints section</div>;
+  1196→      return (
+  1197→        <div className="grid grid-cols-2 gap-2">
+  1198→          <div>
+  1199→            <label className={labelCls}>X</label>
+  1200→            <input data-no-drag type="number" value={Math.round(element.x)} onChange={(e) => updateElement(element.id, { x: +e.target.value })} className={inputCls} />
+  1201→          </div>
+  1202→          <div>
+  1203→            <label className={labelCls}>Y</label>
+  1204→            <input data-no-drag type="number" value={Math.round(element.y)} onChange={(e) => updateElement(element.id, { y: +e.target.value })} className={inputCls} />
+  1205→          </div>
+  1206→        </div>
+  1207→      );
+  1208→    }
+  1209→
+  1210→    // ─── COMMON: Size ──────────────────────────────────────────────
+  1211→    case 'Size': {
+  1212→      return (
+  1213→        <div className="grid grid-cols-2 gap-2">
+  1214→          <div>
+  1215→            <label className={labelCls}>Width</label>
+  1216→            <input data-no-drag type="number" value={Math.round(element.width)} onChange={(e) => updateElement(element.id, { width: Math.max(10, +e.target.value) })} className={inputCls} />
+  1217→          </div>
+  1218→          <div>
+  1219→            <label className={labelCls}>Height</label>
+  1220→            <input data-no-drag type="number" value={Math.round(element.height)} onChange={(e) => updateElement(element.id, { height: Math.max(10, +e.target.value) })} className={inputCls} />
+  1221→          </div>
+  1222→        </div>
+  1223→      );
+  1224→    }
+  1225→
+  1226→    // ─── COMMON: Alignment ─────────────────────────────────────────
+  1227→    case 'Alignment': {
+  1228→      // When multiple elements are selected, align them as a BLOCK (preserving
+  1229→      // their relative positions) via the multi-select actions. Single element
+  1230→      // uses the standard single-element align.
+  1231→      const isMulti = !!(multiSelectIds && multiSelectIds.length > 1);
+  1232→      const ids = isMulti ? multiSelectIds! : [element.id];
+  1233→      const onHCenter = isMulti
+  1234→        ? () => alignElementsHorizontalCenter(ids)
+  1235→        : () => alignElementHorizontalCenter(element.id);
+  1236→      const onVCenter = isMulti
+  1237→        ? () => alignElementsVerticalCenter(ids)
+  1238→        : () => alignElementVerticalCenter(element.id);
+  1239→      return (
+  1240→        <div className="flex gap-1.5">
+  1241→          <button data-no-drag className="flex-1 h-7 text-[10px] border border-border rounded hover:bg-accent transition-colors" onClick={onHCenter}>H-Center</button>
+  1242→          <button data-no-drag className="flex-1 h-7 text-[10px] border border-border rounded hover:bg-accent transition-colors" onClick={onVCenter}>V-Center</button>
+  1243→        </div>
+  1244→      );
+  1245→    }
+  1246→
+  1247→    // ─── TEXT: Formatting ────────────────────────────────────────
+  1248→    case 'Formatting': {
+  1249→      if (element.type === 'text') {
+  1250→        const data = (element.properties as { type: 'text'; data: TextProperties }).data;
+  1251→        // Update function that handles textAlign changes in HTML content
+  1252→        // (same logic as the properties panel)
+  1253→        const update = (updates: Partial<TextProperties>) => {
+  1254→          let finalUpdates = updates;
+  1255→          if (updates.textAlign) {
+  1256→            if (activeTextEditor && editingTextElementId === element.id) {
+  1257→              // While editing: use TipTap's setTextAlign to update all paragraphs
+  1258→              activeTextEditor.chain().focus().setTextAlign(updates.textAlign).run();
+  1259→            } else {
+  1260→              // While not editing: update the HTML content directly to change/add
+  1261→              // text-align on all block-level elements
+  1262→              const align = updates.textAlign;
+  1263→              let updatedContent = data.content;
+  1264→              updatedContent = updatedContent.replace(
+  1265→                /(<(?:p|h[1-6]|li|div|blockquote)[^>]*?style=")([^"]*)(")/gi,
+  1266→                (_match: string, styleStart: string, styleContent: string, styleEnd: string) => {
+  1267→                  if (styleContent.includes('text-align')) {
+  1268→                    return `${styleStart}${styleContent.replace(/text-align:\s*[^;"]+/gi, `text-align: ${align}`)}${styleEnd}`;
+  1269→                  }
+  1270→                  const sep = styleContent && !styleContent.endsWith(';') ? ';' : '';
+  1271→                  return `${styleStart}${styleContent}${sep}text-align: ${align}${styleEnd}`;
+  1272→                }
+  1273→              );
+  1274→              updatedContent = updatedContent.replace(
+  1275→                /<(p|h[1-6]|li|div|blockquote)(\s[^>]*?)?>/gi,
+  1276→                (match: string, tag: string, attrs: string | undefined) => {
+  1277→                  if (attrs && attrs.includes('style=')) return match;
+  1278→                  return `<${tag}${attrs || ''} style="text-align: ${align}">`;
+  1279→                }
+  1280→              );
+  1281→              finalUpdates = { ...updates, content: updatedContent };
+  1282→            }
+  1283→          }
+  1284→          updateElementProperties(element.id, { type: 'text', data: { ...data, ...finalUpdates } });
+  1285→        };
+  1286→
+  1287→        if (activeTextEditor && editingTextElementId === element.id) {
+  1288→          // When actively editing: use the rich TipTap-connected toolbar
+  1289→          // for per-character/per-selection formatting
+  1290→          return <FormattingToolbar editor={activeTextEditor} baseProps={data} />;
+  1291→        }
+  1292→        // When NOT editing: show a static toolbar that modifies the
+  1293→        // element's base/default text properties directly
+  1294→        return <StaticFormattingToolbar data={data} update={update} />;
+  1295→      }
+  1296→      return (
+  1297→        <div className="text-xs text-muted-foreground italic">
+  1298→          Select a text element to apply formatting.
+  1299→        </div>
+  1300→      );
+  1301→    }
+  1302→
+  1303→    // ─── TEXT: Typography ──────────────────────────────────────────
+  1304→    case 'Typography': {
+  1305→      const data = (element.properties as { type: 'text'; data: TextProperties }).data;
+  1306→      const update = (updates: Partial<TextProperties>) => {
+  1307→        updateElementProperties(element.id, { type: 'text', data: { ...data, ...updates } });
+  1308→      };
+  1309→      return (
+  1310→        <div className="space-y-2">
+  1311→          <p className="text-[9px] text-muted-foreground">Base styles for all text. Use inline editor for per-character formatting.</p>
+  1312→          <Field label="Font Size">
+  1313→            <SliderField value={[data.fontSize]} min={6} max={100} step={1} unit="px" colorTheme="purple" onValueChange={([v]) => update({ fontSize: v })} compact />
+  1314→          </Field>
+  1315→          <Field label="Font Family">
+  1316→            <select data-no-drag value={data.fontFamily} onChange={(e) => update({ fontFamily: e.target.value })} className={selectCls}>
+  1317→              <option value="Inter, sans-serif">Inter</option>
+  1318→              <option value="Georgia, serif">Georgia</option>
+  1319→              <option value="'Courier New', monospace">Courier New</option>
+  1320→              <option value="Arial, sans-serif">Arial</option>
+  1321→              <option value="'Times New Roman', serif">Times New Roman</option>
+  1322→              <option value="Verdana, sans-serif">Verdana</option>
+  1323→            </select>
+  1324→          </Field>
+  1325→          <Field label="Weight">
+  1326→            <select data-no-drag value={data.fontWeight} onChange={(e) => update({ fontWeight: e.target.value })} className={selectCls}>
+  1327→              <option value="normal">Normal</option>
+  1328→              <option value="bold">Bold</option>
+  1329→              <option value="lighter">Lighter</option>
+  1330→              <option value="100">100</option>
+  1331→              <option value="300">300</option>
+  1332→              <option value="500">500</option>
+  1333→              <option value="700">700</option>
+  1334→              <option value="900">900</option>
+  1335→            </select>
+  1336→          </Field>
+  1337→          <Field label="Style">
+  1338→            <select data-no-drag value={data.fontStyle} onChange={(e) => update({ fontStyle: e.target.value })} className={selectCls}>
+  1339→              <option value="normal">Normal</option>
+  1340→              <option value="italic">Italic</option>
+  1341→            </select>
+  1342→          </Field>
+  1343→          <Field label="Decoration">
+  1344→            <select data-no-drag value={data.textDecoration} onChange={(e) => update({ textDecoration: e.target.value })} className={selectCls}>
+  1345→              <option value="none">None</option>
+  1346→              <option value="underline">Underline</option>
+  1347→              <option value="line-through">Strikethrough</option>
+  1348→              <option value="overline">Overline</option>
+  1349→            </select>
+  1350→          </Field>
+  1351→          <Field label="Transform">
+  1352→            <select data-no-drag value={data.textTransform} onChange={(e) => update({ textTransform: e.target.value as 'none' | 'uppercase' | 'lowercase' | 'capitalize' })} className={selectCls}>
+  1353→              <option value="none">None</option>
+  1354→              <option value="uppercase">UPPERCASE</option>
+  1355→              <option value="lowercase">lowercase</option>
+  1356→              <option value="capitalize">Capitalize</option>
+  1357→            </select>
+  1358→          </Field>
+  1359→        </div>
+  1360→      );
+  1361→    }
+  1362→
+  1363→    // ─── TEXT: Alignment & Spacing ─────────────────────────────────
+  1364→    case 'Alignment & Spacing': {
+  1365→      const data = (element.properties as { type: 'text'; data: TextProperties }).data;
+  1366→      const update = (updates: Partial<TextProperties>) => {
+  1367→        let finalUpdates = updates;
+  1368→        // When textAlign is changed, apply it to the entire content
+  1369→        if (updates.textAlign) {
+  1370→          if (activeTextEditor && editingTextElementId === element.id) {
+  1371→            // While editing: use TipTap's setTextAlign to update all paragraphs
+  1372→            activeTextEditor.chain().focus().setTextAlign(updates.textAlign).run();
+  1373→          } else {
+  1374→            // While not editing: update the HTML content directly to change/add
+  1375→            // text-align on all block-level elements (p, h1-h6, li, etc.)
+  1376→            const align = updates.textAlign;
+  1377→            let updatedContent = data.content;
+  1378→            // Step 1: For tags with style="..." — replace or add text-align
+  1379→            updatedContent = updatedContent.replace(
+  1380→              /(<(?:p|h[1-6]|li|div|blockquote)[^>]*?style=")([^"]*)(")/gi,
+  1381→              (_match: string, styleStart: string, styleContent: string, styleEnd: string) => {
+  1382→                if (styleContent.includes('text-align')) {
+  1383→                  return `${styleStart}${styleContent.replace(/text-align:\s*[^;"]+/gi, `text-align: ${align}`)}${styleEnd}`;
+  1384→                }
+  1385→                const sep = styleContent && !styleContent.endsWith(';') ? ';' : '';
+  1386→                return `${styleStart}${styleContent}${sep}text-align: ${align}${styleEnd}`;
+  1387→              }
+  1388→            );
+  1389→            // Step 2: For tags without any style attribute — add style="text-align: X"
+  1390→            updatedContent = updatedContent.replace(
+  1391→              /<(p|h[1-6]|li|div|blockquote)(\s[^>]*?)?>/gi,
+  1392→              (match: string, tag: string, attrs: string | undefined) => {
+  1393→                if (attrs && attrs.includes('style=')) return match;
+  1394→                return `<${tag}${attrs || ''} style="text-align: ${align}">`;
+  1395→              }
+  1396→            );
+  1397→            finalUpdates = { ...updates, content: updatedContent };
+  1398→          }
+  1399→        }
+  1400→        updateElementProperties(element.id, { type: 'text', data: { ...data, ...finalUpdates } });
+  1401→      };
+  1402→      return (
+  1403→        <div className="space-y-2">
+  1404→          <Field label="Align">
+  1405→            <select data-no-drag value={data.textAlign} onChange={(e) => update({ textAlign: e.target.value as 'left' | 'center' | 'right' | 'justify' })} className={selectCls}>
+  1406→              <option value="left">Left</option>
+  1407→              <option value="center">Center</option>
+  1408→              <option value="right">Right</option>
+  1409→              <option value="justify">Justify</option>
+  1410→            </select>
+  1411→          </Field>
+  1412→          <Field label="Line Height">
+  1413→            <SliderField value={[Math.round(data.lineHeight * 100)]} min={80} max={300} step={10} unit="%" colorTheme="green" onValueChange={([v]) => update({ lineHeight: v / 100 })} compact />
+  1414→          </Field>
+  1415→          <Field label="Letter Spacing">
+  1416→            <SliderField value={[data.letterSpacing]} min={-5} max={20} step={0.5} unit="px" colorTheme="teal" onValueChange={([v]) => update({ letterSpacing: v })} compact />
+  1417→          </Field>
+  1418→        </div>
+  1419→      );
+  1420→    }
+  1421→
+  1422→    // ─── TEXT: Color ───────────────────────────────────────────────
+  1423→    case 'Color': {
+  1424→      const data = (element.properties as { type: 'text'; data: TextProperties }).data;
+  1425→      const update = (updates: Partial<TextProperties>) => {
+  1426→        updateElementProperties(element.id, { type: 'text', data: { ...data, ...updates } });
+  1427→      };
+  1428→      return (
+  1429→        <div className="space-y-2">
+  1430→          <Field label="Color">
+  1431→            <ColorInput value={data.color} onChange={(v) => update({ color: v })} noDrag />
+  1432→          </Field>
+  1433→          <Field label="Opacity">
+  1434→            <SliderField value={[Math.round(data.opacity * 100)]} min={0} max={100} step={1} unit="%" colorTheme="gray" onValueChange={([v]) => update({ opacity: v / 100 })} compact />
+  1435→          </Field>
+  1436→        </div>
+  1437→      );
+  1438→    }
+  1439→
+  1440→    // ─── TABLE: Structure ──────────────────────────────────────────
+  1441→    case 'Structure': {
+  1442→      const rawProps = (element.properties as { type: 'table'; data: TableProperties }).data;
+  1443→      const props: TableProperties = {
+  1444→        rows: rawProps.rows ?? 4,
+  1445→        cols: rawProps.cols ?? 3,
+  1446→        cellData: rawProps.cellData ?? [['', '', ''], ['', '', ''], ['', '', ''], ['', '', '']],
+  1447→        cellOverrides: rawProps.cellOverrides ?? {},
+  1448→        showHeader: rawProps.showHeader ?? true,
+  1449→        headerBg: rawProps.headerBg ?? '#f3f4f6',
+  1450→        headerColor: rawProps.headerColor ?? '#111827',
+  1451→        headerFontWeight: rawProps.headerFontWeight ?? 'bold',
+  1452→        cellBg: rawProps.cellBg ?? '#ffffff',
+  1453→        cellColor: rawProps.cellColor ?? '#374151',
+  1454→        cellPadding: rawProps.cellPadding ?? 8,
+  1455→        fontSize: rawProps.fontSize ?? 13,
+  1456→        rowBgColors: rawProps.rowBgColors ?? {},
+  1457→        colBgColors: rawProps.colBgColors ?? {},
+  1458→        borderWidth: rawProps.borderWidth ?? 1,
+  1459→        borderStyle: rawProps.borderStyle ?? 'solid',
+  1460→        borderColor: rawProps.borderColor ?? '#d1d5db',
+  1461→        showBorderTop: rawProps.showBorderTop ?? true,
+  1462→        showBorderRight: rawProps.showBorderRight ?? true,
+  1463→        showBorderBottom: rawProps.showBorderBottom ?? true,
+  1464→        showBorderLeft: rawProps.showBorderLeft ?? true,
+  1465→        showInnerBorders: rawProps.showInnerBorders ?? true,
+  1466→        cornerRadius: rawProps.cornerRadius ?? { mode: 'linked', all: 0, topLeft: 0, topRight: 0, bottomRight: 0, bottomLeft: 0 },
+  1467→        colWidths: rawProps.colWidths ?? Array(rawProps.cols ?? 3).fill(1),
+  1468→        rowHeights: rawProps.rowHeights ?? Array(rawProps.rows ?? 4).fill(1),
+  1469→        rowNames: rawProps.rowNames ?? Array.from({ length: rawProps.rows ?? 4 }, (_, i) => `Row ${i + 1}`),
+  1470→        colNames: rawProps.colNames ?? Array.from({ length: rawProps.cols ?? 3 }, (_, i) => `Column ${i + 1}`),
+  1471→        opacity: rawProps.opacity ?? 1,
+  1472→      };
+  1473→      const update = (updates: Partial<TableProperties>) => {
+  1474→        // Read latest data from store to avoid stale closure (e.g. after col/row resize)
+  1475→        const currentEl = useDesignerStore.getState().elements.find((el) => el.id === element.id);
+  1476→        const currentData = currentEl ? (currentEl.properties as { type: 'table'; data: TableProperties }).data : props;
+  1477→        updateElementProperties(element.id, { type: 'table', data: { ...currentData, ...updates } });
+  1478→      };
+  1479→
+  1480→      const addRow = () => {
+  1481→        // Read latest data from store to avoid stale closure issues
+  1482→        const currentEl = useDesignerStore.getState().elements.find((el) => el.id === element.id);
+  1483→        const currentData = currentEl ? (currentEl.properties as { type: 'table'; data: TableProperties }).data : props;
+  1484→        const newRow = Array(currentData.cols).fill('');
+  1485→        const newCellData = [...currentData.cellData.map((r) => [...r]), newRow];
+  1486→        const newRowHeights = [...(currentData.rowHeights ?? Array(currentData.rows).fill(1)), 1];
+  1487→        const newRowNames = [...(currentData.rowNames ?? Array.from({ length: currentData.rows }, (_, i) => `Row ${i + 1}`)), `Row ${currentData.rows + 1}`];
+  1488→        update({ rows: currentData.rows + 1, cellData: newCellData, rowHeights: newRowHeights, rowNames: newRowNames });
+  1489→      };
+  1490→
+  1491→      const addColumn = () => {
+  1492→        // Read latest data from store to avoid stale closure issues
+  1493→        const currentEl = useDesignerStore.getState().elements.find((el) => el.id === element.id);
+  1494→        const currentData = currentEl ? (currentEl.properties as { type: 'table'; data: TableProperties }).data : props;
+  1495→        const newCellData = currentData.cellData.map((row) => [...row, '']);
+  1496→        const newColWidths = [...(currentData.colWidths ?? Array(currentData.cols).fill(1)), 1];
+  1497→        const newColNames = [...(currentData.colNames ?? Array.from({ length: currentData.cols }, (_, i) => `Column ${i + 1}`)), `Column ${currentData.cols + 1}`];
+  1498→        update({ cols: currentData.cols + 1, cellData: newCellData, colWidths: newColWidths, colNames: newColNames });
+  1499→      };
+  1500→
+  1501→      return (
+  1502→        <div className="space-y-2">
+  1503→          <div className="grid grid-cols-2 gap-2">
+  1504→            <div>
+  1505→              <label className={labelCls}>Rows</label>
+  1506→              <input
+  1507→                data-no-drag
+  1508→                type="number"
+  1509→                min={1}
+  1510→                max={50}
+  1511→                value={props.rows}
+  1512→                onChange={(e) => {
+  1513→                  const newRows = Math.max(1, +e.target.value);
+  1514→                  const newCellData: string[][] = [];
+  1515→                  const newRowHeights: number[] = [];
+  1516→                  const newRowNames: string[] = [];
+  1517→                  const currentRowNames = props.rowNames ?? Array.from({ length: props.rows }, (_, i) => `Row ${i + 1}`);
+  1518→                  for (let r = 0; r < newRows; r++) {
+  1519→                    newCellData[r] = [];
+  1520→                    for (let c = 0; c < props.cols; c++) {
+  1521→                      newCellData[r][c] = props.cellData[r]?.[c] || '';
+  1522→                    }
+  1523→                    newRowHeights[r] = (props.rowHeights ?? Array(props.rows).fill(1))[r] ?? 1;
+  1524→                    newRowNames[r] = currentRowNames[r] ?? `Row ${r + 1}`;
+  1525→                  }
+  1526→                  update({ rows: newRows, cellData: newCellData, rowHeights: newRowHeights, rowNames: newRowNames });
+  1527→                }}
+  1528→                className={inputCls}
+  1529→              />
+  1530→            </div>
+  1531→            <div>
+  1532→              <label className={labelCls}>Columns</label>
+  1533→              <input
+  1534→                data-no-drag
+  1535→                type="number"
+  1536→                min={1}
+  1537→                max={20}
+  1538→                value={props.cols}
+  1539→                onChange={(e) => {
+  1540→                  const newCols = Math.max(1, +e.target.value);
+  1541→                  const newCellData = props.cellData.map((row) => {
+  1542→                    const newRow: string[] = [];
+  1543→                    for (let c = 0; c < newCols; c++) {
+  1544→                      newRow[c] = row[c] || '';
+  1545→                    }
+  1546→                    return newRow;
+  1547→                  });
+  1548→                  const newColWidths: number[] = [];
+  1549→                  const newColNames: string[] = [];
+  1550→                  const currentColNames = props.colNames ?? Array.from({ length: props.cols }, (_, i) => `Column ${i + 1}`);
+  1551→                  for (let c = 0; c < newCols; c++) {
+  1552→                    newColWidths[c] = (props.colWidths ?? Array(props.cols).fill(1))[c] ?? 1;
+  1553→                    newColNames[c] = currentColNames[c] ?? `Column ${c + 1}`;
+  1554→                  }
+  1555→                  update({ cols: newCols, cellData: newCellData, colWidths: newColWidths, colNames: newColNames });
+  1556→                }}
+  1557→                className={inputCls}
+  1558→              />
+  1559→            </div>
+  1560→          </div>
+  1561→          <div className="flex gap-1.5">
+  1562→            <button data-no-drag className="flex-1 h-7 text-[10px] border border-border rounded hover:bg-accent transition-colors" onClick={addRow}>+ Row</button>
+  1563→            <button data-no-drag className="flex-1 h-7 text-[10px] border border-border rounded hover:bg-accent transition-colors" onClick={addColumn}>+ Col</button>
+  1564→          </div>
+  1565→        </div>
+  1566→      );
+  1567→    }
+  1568→
+  1569→    // ─── TABLE: Header Row ─────────────────────────────────────────
+  1570→    case 'Header Row': {
+  1571→      const rawProps = (element.properties as { type: 'table'; data: TableProperties }).data;
+  1572→      const props: TableProperties = {
+  1573→        rows: rawProps.rows ?? 4,
+  1574→        cols: rawProps.cols ?? 3,
+  1575→        cellData: rawProps.cellData ?? [['', '', ''], ['', '', ''], ['', '', ''], ['', '', '']],
+  1576→        cellOverrides: rawProps.cellOverrides ?? {},
+  1577→        showHeader: rawProps.showHeader ?? true,
+  1578→        headerBg: rawProps.headerBg ?? '#f3f4f6',
+  1579→        headerColor: rawProps.headerColor ?? '#111827',
+  1580→        headerFontWeight: rawProps.headerFontWeight ?? 'bold',
+  1581→        cellBg: rawProps.cellBg ?? '#ffffff',
+  1582→        cellColor: rawProps.cellColor ?? '#374151',
+  1583→        cellPadding: rawProps.cellPadding ?? 8,
+  1584→        fontSize: rawProps.fontSize ?? 13,
+  1585→        rowBgColors: rawProps.rowBgColors ?? {},
+  1586→        colBgColors: rawProps.colBgColors ?? {},
+  1587→        borderWidth: rawProps.borderWidth ?? 1,
+  1588→        borderStyle: rawProps.borderStyle ?? 'solid',
+  1589→        borderColor: rawProps.borderColor ?? '#d1d5db',
+  1590→        showBorderTop: rawProps.showBorderTop ?? true,
+  1591→        showBorderRight: rawProps.showBorderRight ?? true,
+  1592→        showBorderBottom: rawProps.showBorderBottom ?? true,
+  1593→        showBorderLeft: rawProps.showBorderLeft ?? true,
+  1594→        showInnerBorders: rawProps.showInnerBorders ?? true,
+  1595→        cornerRadius: rawProps.cornerRadius ?? { mode: 'linked', all: 0, topLeft: 0, topRight: 0, bottomRight: 0, bottomLeft: 0 },
+  1596→        colWidths: rawProps.colWidths ?? Array(rawProps.cols ?? 3).fill(1),
+  1597→        rowHeights: rawProps.rowHeights ?? Array(rawProps.rows ?? 4).fill(1),
+  1598→        rowNames: rawProps.rowNames ?? Array.from({ length: rawProps.rows ?? 4 }, (_, i) => `Row ${i + 1}`),
+  1599→        colNames: rawProps.colNames ?? Array.from({ length: rawProps.cols ?? 3 }, (_, i) => `Column ${i + 1}`),
+  1600→        opacity: rawProps.opacity ?? 1,
+  1601→      };
+  1602→      const update = (updates: Partial<TableProperties>) => {
+  1603→        // Read latest data from store to avoid stale closure (e.g. after col/row resize)
+  1604→        const currentEl = useDesignerStore.getState().elements.find((el) => el.id === element.id);
+  1605→        const currentData = currentEl ? (currentEl.properties as { type: 'table'; data: TableProperties }).data : props;
+  1606→        updateElementProperties(element.id, { type: 'table', data: { ...currentData, ...updates } });
+  1607→      };
+  1608→      return (
+  1609→        <div className="space-y-2">
+  1610→          <CheckboxRow label="Show Header" checked={props.showHeader} onChange={(v) => update({ showHeader: v })} />
+  1611→          {props.showHeader && (
+  1612→            <>
+  1613→              <Field label="Header BG">
+  1614→                <ColorInput value={props.headerBg} onChange={(v) => update({ headerBg: v })} noDrag />
+  1615→              </Field>
+  1616→              <Field label="Header Color">
+  1617→                <ColorInput value={props.headerColor} onChange={(v) => update({ headerColor: v })} noDrag />
+  1618→              </Field>
+  1619→              <Field label="Header Weight">
+  1620→                <select data-no-drag value={props.headerFontWeight} onChange={(e) => update({ headerFontWeight: e.target.value })} className={selectCls}>
+  1621→                  <option value="normal">Normal</option>
+  1622→                  <option value="bold">Bold</option>
+  1623→                  <option value="lighter">Lighter</option>
+  1624→                  <option value="500">500</option>
+  1625→                  <option value="600">600</option>
+  1626→                  <option value="700">700</option>
+  1627→                </select>
+  1628→              </Field>
+  1629→            </>
+  1630→          )}
+  1631→        </div>
+  1632→      );
+  1633→    }
+  1634→
+  1635→    // ─── TABLE: Cell Defaults / Cell Styling ────────────────────
+  1636→    case 'Cell Defaults':
+  1637→    case 'Cell Styling': {
+  1638→      const rawProps = (element.properties as { type: 'table'; data: TableProperties }).data;
+  1639→      const props: TableProperties = {
+  1640→        rows: rawProps.rows ?? 4,
+  1641→        cols: rawProps.cols ?? 3,
+  1642→        cellData: rawProps.cellData ?? [['', '', ''], ['', '', ''], ['', '', ''], ['', '', '']],
+  1643→        cellOverrides: rawProps.cellOverrides ?? {},
+  1644→        showHeader: rawProps.showHeader ?? true,
+  1645→        headerBg: rawProps.headerBg ?? '#f3f4f6',
+  1646→        headerColor: rawProps.headerColor ?? '#111827',
+  1647→        headerFontWeight: rawProps.headerFontWeight ?? 'bold',
+  1648→        cellBg: rawProps.cellBg ?? '#ffffff',
+  1649→        cellColor: rawProps.cellColor ?? '#374151',
+  1650→        cellPadding: rawProps.cellPadding ?? 8,
+  1651→        fontSize: rawProps.fontSize ?? 13,
+  1652→        rowBgColors: rawProps.rowBgColors ?? {},
+  1653→        colBgColors: rawProps.colBgColors ?? {},
+  1654→        borderWidth: rawProps.borderWidth ?? 1,
+  1655→        borderStyle: rawProps.borderStyle ?? 'solid',
+  1656→        borderColor: rawProps.borderColor ?? '#d1d5db',
+  1657→        showBorderTop: rawProps.showBorderTop ?? true,
+  1658→        showBorderRight: rawProps.showBorderRight ?? true,
+  1659→        showBorderBottom: rawProps.showBorderBottom ?? true,
+  1660→        showBorderLeft: rawProps.showBorderLeft ?? true,
+  1661→        showInnerBorders: rawProps.showInnerBorders ?? true,
+  1662→        cornerRadius: rawProps.cornerRadius ?? { mode: 'linked', all: 0, topLeft: 0, topRight: 0, bottomRight: 0, bottomLeft: 0 },
+  1663→        colWidths: rawProps.colWidths ?? Array(rawProps.cols ?? 3).fill(1),
+  1664→        rowHeights: rawProps.rowHeights ?? Array(rawProps.rows ?? 4).fill(1),
+  1665→        rowNames: rawProps.rowNames ?? Array.from({ length: rawProps.rows ?? 4 }, (_, i) => `Row ${i + 1}`),
+  1666→        colNames: rawProps.colNames ?? Array.from({ length: rawProps.cols ?? 3 }, (_, i) => `Column ${i + 1}`),
+  1667→        opacity: rawProps.opacity ?? 1,
+  1668→      };
+  1669→      const update = (updates: Partial<TableProperties>) => {
+  1670→        // Read latest data from store to avoid stale closure (e.g. after col/row resize)
+  1671→        const currentEl = useDesignerStore.getState().elements.find((el) => el.id === element.id);
+  1672→        const currentData = currentEl ? (currentEl.properties as { type: 'table'; data: TableProperties }).data : props;
+  1673→        updateElementProperties(element.id, { type: 'table', data: { ...currentData, ...updates } });
+  1674→      };
+  1675→      return (
+  1676→        <div className="space-y-2">
+  1677→          <Field label="Cell BG">
+  1678→            <ColorInput value={props.cellBg} onChange={(v) => update({ cellBg: v })} noDrag />
+  1679→          </Field>
+  1680→          <Field label="Cell Color">
+  1681→            <ColorInput value={props.cellColor} onChange={(v) => update({ cellColor: v })} noDrag />
+  1682→          </Field>
+  1683→          <Field label="Cell Padding">
+  1684→            <input data-no-drag type="number" value={props.cellPadding} onChange={(e) => update({ cellPadding: +e.target.value })} min={0} max={20} className={inputCls} />
+  1685→          </Field>
+  1686→          <Field label="Font Size">
+  1687→            <SliderField value={[props.fontSize]} min={6} max={72} step={1} unit="px" colorTheme="purple" onValueChange={([v]) => update({ fontSize: v })} compact />
+  1688→          </Field>
+  1689→        </div>
+  1690→      );
+  1691→    }
+  1692→
+  1693→    // ─── TABLE: Remove Row ────────────────────────────────────────
+  1694→    case 'Remove Row': {
+  1695→      const rawProps = (element.properties as { type: 'table'; data: TableProperties }).data;
+  1696→      const props: TableProperties = {
+  1697→        rows: rawProps.rows ?? 4,
+  1698→        cols: rawProps.cols ?? 3,
+  1699→        cellData: rawProps.cellData ?? [['', '', ''], ['', '', ''], ['', '', ''], ['', '', '']],
+  1700→        cellOverrides: rawProps.cellOverrides ?? {},
+  1701→        showHeader: rawProps.showHeader ?? true,
+  1702→        headerBg: rawProps.headerBg ?? '#f3f4f6',
+  1703→        headerColor: rawProps.headerColor ?? '#111827',
+  1704→        headerFontWeight: rawProps.headerFontWeight ?? 'bold',
+  1705→        cellBg: rawProps.cellBg ?? '#ffffff',
+  1706→        cellColor: rawProps.cellColor ?? '#374151',
+  1707→        cellPadding: rawProps.cellPadding ?? 8,
+  1708→        fontSize: rawProps.fontSize ?? 13,
+  1709→        rowBgColors: rawProps.rowBgColors ?? {},
+  1710→        colBgColors: rawProps.colBgColors ?? {},
+  1711→        borderWidth: rawProps.borderWidth ?? 1,
+  1712→        borderStyle: rawProps.borderStyle ?? 'solid',
+  1713→        borderColor: rawProps.borderColor ?? '#d1d5db',
+  1714→        showBorderTop: rawProps.showBorderTop ?? true,
+  1715→        showBorderRight: rawProps.showBorderRight ?? true,
+  1716→        showBorderBottom: rawProps.showBorderBottom ?? true,
+  1717→        showBorderLeft: rawProps.showBorderLeft ?? true,
+  1718→        showInnerBorders: rawProps.showInnerBorders ?? true,
+  1719→        cornerRadius: rawProps.cornerRadius ?? { mode: 'linked', all: 0, topLeft: 0, topRight: 0, bottomRight: 0, bottomLeft: 0 },
+  1720→        colWidths: rawProps.colWidths ?? Array(rawProps.cols ?? 3).fill(1),
+  1721→        rowHeights: rawProps.rowHeights ?? Array(rawProps.rows ?? 4).fill(1),
+  1722→        rowNames: rawProps.rowNames ?? Array.from({ length: rawProps.rows ?? 4 }, (_, i) => `Row ${i + 1}`),
+  1723→        colNames: rawProps.colNames ?? Array.from({ length: rawProps.cols ?? 3 }, (_, i) => `Column ${i + 1}`),
+  1724→        opacity: rawProps.opacity ?? 1,
+  1725→      };
+  1726→      const update = (updates: Partial<TableProperties>) => {
+  1727→        // Read latest data from store to avoid stale closure (e.g. after col/row resize)
+  1728→        const currentEl = useDesignerStore.getState().elements.find((el) => el.id === element.id);
+  1729→        const currentData = currentEl ? (currentEl.properties as { type: 'table'; data: TableProperties }).data : props;
+  1730→        updateElementProperties(element.id, { type: 'table', data: { ...currentData, ...updates } });
+  1731→      };
+  1732→      const removeRow = (idx: number) => {
+  1733→        if (props.rows <= 1) return;
+  1734→        const newCellData = props.cellData.filter((_, i) => i !== idx);
+  1735→        const newRowHeights = (props.rowHeights ?? Array(props.rows).fill(1)).filter((_, i) => i !== idx);
+  1736→        const newRowNames = (props.rowNames ?? Array.from({ length: props.rows }, (_, i) => `Row ${i + 1}`)).filter((_, i) => i !== idx);
+  1737→        const newOverrides: Record<string, CellOverride> = {};
+  1738→        for (const [key, val] of Object.entries(props.cellOverrides)) {
+  1739→          const [r, c] = key.split('-').map(Number);
+  1740→          if (r === idx) continue;
+  1741→          const newR = r > idx ? r - 1 : r;
+  1742→          newOverrides[`${newR}-${c}`] = val;
+  1743→        }
+  1744→        const newRowBg: Record<number, string> = {};
+  1745→        for (const [k, v] of Object.entries(props.rowBgColors)) {
+  1746→          const r = Number(k);
+  1747→          if (r === idx) continue;
+  1748→          const newR = r > idx ? r - 1 : r;
+  1749→          newRowBg[newR] = v;
+  1750→        }
+  1751→        update({ rows: props.rows - 1, cellData: newCellData, cellOverrides: newOverrides, rowBgColors: newRowBg, rowHeights: newRowHeights, rowNames: newRowNames });
+  1752→      };
+  1753→      return (
+  1754→        <div className="space-y-2">
+  1755→          <Field label="Row Index">
+  1756→            <select data-no-drag defaultValue="0" id={`remove-row-sel-${element.id}`} className={selectCls}>
+  1757→              {Array.from({ length: props.rows }, (_, i) => (
+  1758→                <option key={i} value={i}>{(props.rowNames ?? Array.from({ length: props.rows }, (_, j) => `Row ${j + 1}`))[i]}</option>
+  1759→              ))}
+  1760→            </select>
+  1761→          </Field>
+  1762→          <button
+  1763→            data-no-drag
+  1764→            className="w-full h-7 text-[10px] border border-destructive/50 text-destructive rounded hover:bg-destructive/10 transition-colors"
+  1765→            onClick={() => {
+  1766→              const sel = document.getElementById(`remove-row-sel-${element.id}`) as HTMLSelectElement;
+  1767→              if (sel) removeRow(+sel.value);
+  1768→            }}
+  1769→          >
+  1770→            Remove Row
+  1771→          </button>
+  1772→        </div>
+  1773→      );
+  1774→    }
+  1775→
+  1776→    // ─── TABLE: Remove Column ─────────────────────────────────────
+  1777→    case 'Remove Column': {
+  1778→      const rawProps = (element.properties as { type: 'table'; data: TableProperties }).data;
+  1779→      const props: TableProperties = {
+  1780→        rows: rawProps.rows ?? 4,
+  1781→        cols: rawProps.cols ?? 3,
+  1782→        cellData: rawProps.cellData ?? [['', '', ''], ['', '', ''], ['', '', ''], ['', '', '']],
+  1783→        cellOverrides: rawProps.cellOverrides ?? {},
+  1784→        showHeader: rawProps.showHeader ?? true,
+  1785→        headerBg: rawProps.headerBg ?? '#f3f4f6',
+  1786→        headerColor: rawProps.headerColor ?? '#111827',
+  1787→        headerFontWeight: rawProps.headerFontWeight ?? 'bold',
+  1788→        cellBg: rawProps.cellBg ?? '#ffffff',
+  1789→        cellColor: rawProps.cellColor ?? '#374151',
+  1790→        cellPadding: rawProps.cellPadding ?? 8,
+  1791→        fontSize: rawProps.fontSize ?? 13,
+  1792→        rowBgColors: rawProps.rowBgColors ?? {},
+  1793→        colBgColors: rawProps.colBgColors ?? {},
+  1794→        borderWidth: rawProps.borderWidth ?? 1,
+  1795→        borderStyle: rawProps.borderStyle ?? 'solid',
+  1796→        borderColor: rawProps.borderColor ?? '#d1d5db',
+  1797→        showBorderTop: rawProps.showBorderTop ?? true,
+  1798→        showBorderRight: rawProps.showBorderRight ?? true,
+  1799→        showBorderBottom: rawProps.showBorderBottom ?? true,
+  1800→        showBorderLeft: rawProps.showBorderLeft ?? true,
+  1801→        showInnerBorders: rawProps.showInnerBorders ?? true,
+  1802→        cornerRadius: rawProps.cornerRadius ?? { mode: 'linked', all: 0, topLeft: 0, topRight: 0, bottomRight: 0, bottomLeft: 0 },
+  1803→        colWidths: rawProps.colWidths ?? Array(rawProps.cols ?? 3).fill(1),
+  1804→        rowHeights: rawProps.rowHeights ?? Array(rawProps.rows ?? 4).fill(1),
+  1805→        rowNames: rawProps.rowNames ?? Array.from({ length: rawProps.rows ?? 4 }, (_, i) => `Row ${i + 1}`),
+  1806→        colNames: rawProps.colNames ?? Array.from({ length: rawProps.cols ?? 3 }, (_, i) => `Column ${i + 1}`),
+  1807→        opacity: rawProps.opacity ?? 1,
+  1808→      };
+  1809→      const update = (updates: Partial<TableProperties>) => {
+  1810→        // Read latest data from store to avoid stale closure (e.g. after col/row resize)
+  1811→        const currentEl = useDesignerStore.getState().elements.find((el) => el.id === element.id);
+  1812→        const currentData = currentEl ? (currentEl.properties as { type: 'table'; data: TableProperties }).data : props;
+  1813→        updateElementProperties(element.id, { type: 'table', data: { ...currentData, ...updates } });
+  1814→      };
+  1815→      const removeColumn = (idx: number) => {
+  1816→        if (props.cols <= 1) return;
+  1817→        const newCellData = props.cellData.map((row) => row.filter((_, i) => i !== idx));
+  1818→        const newColWidths = (props.colWidths ?? Array(props.cols).fill(1)).filter((_, i) => i !== idx);
+  1819→        const newColNames = (props.colNames ?? Array.from({ length: props.cols }, (_, i) => `Column ${i + 1}`)).filter((_, i) => i !== idx);
+  1820→        const newOverrides: Record<string, CellOverride> = {};
+  1821→        for (const [key, val] of Object.entries(props.cellOverrides)) {
+  1822→          const [r, c] = key.split('-').map(Number);
+  1823→          if (c === idx) continue;
+  1824→          const newC = c > idx ? c - 1 : c;
+  1825→          newOverrides[`${r}-${newC}`] = val;
+  1826→        }
+  1827→        const newColBg: Record<number, string> = {};
+  1828→        for (const [k, v] of Object.entries(props.colBgColors)) {
+  1829→          const c = Number(k);
+  1830→          if (c === idx) continue;
+  1831→          const newC = c > idx ? c - 1 : c;
+  1832→          newColBg[newC] = v;
+  1833→        }
+  1834→        update({ cols: props.cols - 1, cellData: newCellData, cellOverrides: newOverrides, colBgColors: newColBg, colWidths: newColWidths, colNames: newColNames });
+  1835→      };
+  1836→      return (
+  1837→        <div className="space-y-2">
+  1838→          <Field label="Column Index">
+  1839→            <select data-no-drag defaultValue="0" id={`remove-col-sel-${element.id}`} className={selectCls}>
+  1840→              {Array.from({ length: props.cols }, (_, i) => (
+  1841→                <option key={i} value={i}>{(props.colNames ?? Array.from({ length: props.cols }, (_, j) => `Column ${j + 1}`))[i]}</option>
+  1842→              ))}
+  1843→            </select>
+  1844→          </Field>
+  1845→          <button
+  1846→            data-no-drag
+  1847→            className="w-full h-7 text-[10px] border border-destructive/50 text-destructive rounded hover:bg-destructive/10 transition-colors"
+  1848→            onClick={() => {
+  1849→              const sel = document.getElementById(`remove-col-sel-${element.id}`) as HTMLSelectElement;
+  1850→              if (sel) removeColumn(+sel.value);
+  1851→            }}
+  1852→          >
+  1853→            Remove Column
+  1854→          </button>
+  1855→        </div>
+  1856→      );
+  1857→    }
+  1858→
+  1859→    // ─── TABLE: Reorder (combined rows & columns) ────────────────
+  1860→    case 'Reorder': {
+  1861→      const rawProps = (element.properties as { type: 'table'; data: TableProperties }).data;
+  1862→      const props: TableProperties = {
+  1863→        rows: rawProps.rows ?? 4,
+  1864→        cols: rawProps.cols ?? 3,
+  1865→        cellData: rawProps.cellData ?? [['', '', ''], ['', '', ''], ['', '', ''], ['', '', '']],
+  1866→        cellOverrides: rawProps.cellOverrides ?? {},
+  1867→        showHeader: rawProps.showHeader ?? true,
+  1868→        headerBg: rawProps.headerBg ?? '#f3f4f6',
+  1869→        headerColor: rawProps.headerColor ?? '#111827',
+  1870→        headerFontWeight: rawProps.headerFontWeight ?? 'bold',
+  1871→        cellBg: rawProps.cellBg ?? '#ffffff',
+  1872→        cellColor: rawProps.cellColor ?? '#374151',
+  1873→        cellPadding: rawProps.cellPadding ?? 8,
+  1874→        fontSize: rawProps.fontSize ?? 13,
+  1875→        rowBgColors: rawProps.rowBgColors ?? {},
+  1876→        colBgColors: rawProps.colBgColors ?? {},
+  1877→        borderWidth: rawProps.borderWidth ?? 1,
+  1878→        borderStyle: rawProps.borderStyle ?? 'solid',
+  1879→        borderColor: rawProps.borderColor ?? '#d1d5db',
+  1880→        showBorderTop: rawProps.showBorderTop ?? true,
+  1881→        showBorderRight: rawProps.showBorderRight ?? true,
+  1882→        showBorderBottom: rawProps.showBorderBottom ?? true,
+  1883→        showBorderLeft: rawProps.showBorderLeft ?? true,
+  1884→        showInnerBorders: rawProps.showInnerBorders ?? true,
+  1885→        cornerRadius: rawProps.cornerRadius ?? { mode: 'linked', all: 0, topLeft: 0, topRight: 0, bottomRight: 0, bottomLeft: 0 },
+  1886→        colWidths: rawProps.colWidths ?? Array(rawProps.cols ?? 3).fill(1),
+  1887→        rowHeights: rawProps.rowHeights ?? Array(rawProps.rows ?? 4).fill(1),
+  1888→        rowNames: rawProps.rowNames ?? Array.from({ length: rawProps.rows ?? 4 }, (_, i) => `Row ${i + 1}`),
+  1889→        colNames: rawProps.colNames ?? Array.from({ length: rawProps.cols ?? 3 }, (_, i) => `Column ${i + 1}`),
+  1890→        opacity: rawProps.opacity ?? 1,
+  1891→      };
+  1892→      const update = (updates: Partial<TableProperties>) => {
+  1893→        // Read latest data from store to avoid stale closure (e.g. after col/row resize)
+  1894→        const currentEl = useDesignerStore.getState().elements.find((el) => el.id === element.id);
+  1895→        const currentData = currentEl ? (currentEl.properties as { type: 'table'; data: TableProperties }).data : props;
+  1896→        updateElementProperties(element.id, { type: 'table', data: { ...currentData, ...updates } });
+  1897→      };
+  1898→
+  1899→      // Reorder handlers using insertion-style remapping (arbitrary from→to)
+  1900→      const handleRowReorder = (fromIndex: number, toIndex: number) => {
+  1901→        if (fromIndex === toIndex) return;
+  1902→        const newCellData = props.cellData.map((r) => [...r]);
+  1903→        const [moved] = newCellData.splice(fromIndex, 1);
+  1904→        newCellData.splice(toIndex, 0, moved);
+  1905→        const newOverrides: Record<string, CellOverride> = {};
+  1906→        for (const [key, val] of Object.entries(props.cellOverrides)) {
+  1907→          const [r, c] = key.split('-').map(Number);
+  1908→          let newR = r;
+  1909→          if (r === fromIndex) {
+  1910→            newR = toIndex;
+  1911→          } else if (fromIndex < toIndex) {
+  1912→            if (r > fromIndex && r <= toIndex) newR = r - 1;
+  1913→          } else {
+  1914→            if (r >= toIndex && r < fromIndex) newR = r + 1;
+  1915→          }
+  1916→          newOverrides[`${newR}-${c}`] = val;
+  1917→        }
+  1918→        const newRowBg: Record<number, string> = {};
+  1919→        for (const [k, v] of Object.entries(props.rowBgColors)) {
+  1920→          const r = Number(k);
+  1921→          let newR = r;
+  1922→          if (r === fromIndex) {
+  1923→            newR = toIndex;
+  1924→          } else if (fromIndex < toIndex) {
+  1925→            if (r > fromIndex && r <= toIndex) newR = r - 1;
+  1926→          } else {
+  1927→            if (r >= toIndex && r < fromIndex) newR = r + 1;
+  1928→          }
+  1929→          newRowBg[newR] = v;
+  1930→        }
+  1931→        const rowNames = [...(props.rowNames ?? Array.from({ length: props.rows }, (_, i) => `Row ${i + 1}`))];
+  1932→        const [movedRowName] = rowNames.splice(fromIndex, 1);
+  1933→        rowNames.splice(toIndex, 0, movedRowName);
+  1934→        update({ cellData: newCellData, cellOverrides: newOverrides, rowBgColors: newRowBg, rowNames });
+  1935→      };
+  1936→
+  1937→      const handleColReorder = (fromIndex: number, toIndex: number) => {
+  1938→        if (fromIndex === toIndex) return;
+  1939→        const newCellData = props.cellData.map((row) => {
+  1940→          const newRow = [...row];
+  1941→          const [moved] = newRow.splice(fromIndex, 1);
+  1942→          newRow.splice(toIndex, 0, moved);
+  1943→          return newRow;
+  1944→        });
+  1945→        const newOverrides: Record<string, CellOverride> = {};
+  1946→        for (const [key, val] of Object.entries(props.cellOverrides)) {
+  1947→          const [r, c] = key.split('-').map(Number);
+  1948→          let newC = c;
+  1949→          if (c === fromIndex) {
+  1950→            newC = toIndex;
+  1951→          } else if (fromIndex < toIndex) {
+  1952→            if (c > fromIndex && c <= toIndex) newC = c - 1;
+  1953→          } else {
+  1954→            if (c >= toIndex && c < fromIndex) newC = c + 1;
+  1955→          }
+  1956→          newOverrides[`${r}-${newC}`] = val;
+  1957→        }
+  1958→        const newColBg: Record<number, string> = {};
+  1959→        for (const [k, v] of Object.entries(props.colBgColors)) {
+  1960→          const c = Number(k);
+  1961→          let newC = c;
+  1962→          if (c === fromIndex) {
+  1963→            newC = toIndex;
+  1964→          } else if (fromIndex < toIndex) {
+  1965→            if (c > fromIndex && c <= toIndex) newC = c - 1;
+  1966→          } else {
+  1967→            if (c >= toIndex && c < fromIndex) newC = c + 1;
+  1968→          }
+  1969→          newColBg[newC] = v;
+  1970→        }
+  1971→        const colNames = [...(props.colNames ?? Array.from({ length: props.cols }, (_, i) => `Column ${i + 1}`))];
+  1972→        const [movedColName] = colNames.splice(fromIndex, 1);
+  1973→        colNames.splice(toIndex, 0, movedColName);
+  1974→        update({ cellData: newCellData, cellOverrides: newOverrides, colBgColors: newColBg, colNames });
+  1975→      };
+  1976→
+  1977→      return <ReorderCardContent props={props} onRowReorder={handleRowReorder} onColReorder={handleColReorder} />;
+  1978→    }
+  1979→
+  1980→    // ─── TABLE: Cell Properties ────────────────────────────────────
+  1981→    case 'Cell Properties': {
+  1982→      const rawProps = (element.properties as { type: 'table'; data: TableProperties }).data;
+  1983→      const props: TableProperties = {
+  1984→        rows: rawProps.rows ?? 4,
+  1985→        cols: rawProps.cols ?? 3,
+  1986→        cellData: rawProps.cellData ?? [['', '', ''], ['', '', ''], ['', '', ''], ['', '', '']],
+  1987→        cellOverrides: rawProps.cellOverrides ?? {},
+  1988→        showHeader: rawProps.showHeader ?? true,
+  1989→        headerBg: rawProps.headerBg ?? '#f3f4f6',
+  1990→        headerColor: rawProps.headerColor ?? '#111827',
+  1991→        headerFontWeight: rawProps.headerFontWeight ?? 'bold',
+  1992→        cellBg: rawProps.cellBg ?? '#ffffff',
+  1993→        cellColor: rawProps.cellColor ?? '#374151',
+  1994→        cellPadding: rawProps.cellPadding ?? 8,
+  1995→        fontSize: rawProps.fontSize ?? 13,
+  1996→        rowBgColors: rawProps.rowBgColors ?? {},
+  1997→        colBgColors: rawProps.colBgColors ?? {},
+  1998→        borderWidth: rawProps.borderWidth ?? 1,
+  1999→        borderStyle: rawProps.borderStyle ?? 'solid',
+  2000→        borderColor: rawProps.borderColor ?? '#d1d5db',
+
+[showing lines 1-2000 of 3222; use offset=2001 with limit to continue reading]

@@ -2,7 +2,7 @@
 
 import { useDesignerStore, FloatingCardData } from '@/store/designer-store';
 import { CanvasElement } from '@/lib/element-types';
-import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
+import { useEffect, useState, useCallback, useRef, useMemo, useSyncExternalStore } from 'react';
 import { PropertyContent } from './floating-card';
 import {
   Type, Minus, Square, Circle, Move, Maximize2,
@@ -12,6 +12,29 @@ import {
   RotateCw,
   Image as ImageIcon,
 } from 'lucide-react';
+
+// ── Viewport dimensions (responsive to window resize) ───────────────────────
+// Subscribes to the browser window so the spotlight card layout recomputes
+// when the viewport changes size while the overlay is open. Uses
+// useSyncExternalStore to read the current size synchronously during render
+// (no flash on open) and re-render on resize, without calling setState inside
+// an effect.
+function useViewportDimensions(active: boolean): { width: number; height: number } {
+  const subscribe = useCallback((onStoreChange: () => void) => {
+    if (!active) return () => {};
+    window.addEventListener('resize', onStoreChange);
+    return () => window.removeEventListener('resize', onStoreChange);
+  }, [active]);
+
+  const getSnapshot = useCallback(() => {
+    if (!active) return '0x0';
+    return `${window.innerWidth}x${window.innerHeight}`;
+  }, [active]);
+
+  const snapshot = useSyncExternalStore(subscribe, getSnapshot, () => '0x0');
+  const parts = snapshot.split('x');
+  return { width: Number(parts[0]) || 0, height: Number(parts[1]) || 0 };
+}
 
 // ── Property Section Definition ─────────────────────────────────────────────
 
@@ -289,9 +312,9 @@ function calculateCardPositions(
   containerWidth: number,
   containerHeight: number,
   measuredHeights?: Map<string, number>,
-): { positions: CardPosition[] } {
+): { positions: CardPosition[]; scale: number } {
   const count = sectionIds.length;
-  if (count === 0) return { positions: [] };
+  if (count === 0) return { positions: [], scale: 1 };
 
   const availableWidth = containerWidth - 2 * EDGE_MARGIN;
   const availableHeight = containerHeight - 2 * EDGE_MARGIN;
@@ -366,7 +389,37 @@ function calculateCardPositions(
     bestLayout = { positions, totalHeight: columnY[0] };
   }
 
-  return { positions: bestLayout.positions };
+  // ── Responsive fit-to-viewport scaling ──────────────────────────────────
+  // On smaller screens the natural masonry layout (fixed 320px columns + gaps)
+  // can exceed the viewport, pushing cards off-screen. Rather than adding a
+  // scrollbar, compute a uniform scale factor from the natural bounding box of
+  // the layout vs. the available viewport space, then shrink every card (and
+  // the spacing between them) by that factor so ALL cards stay fully visible
+  // with no clipping. Cards only ever shrink (scale capped at 1) — large
+  // screens keep the natural, readable card size.
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (let i = 0; i < bestLayout.positions.length; i++) {
+    const p = bestLayout.positions[i];
+    const w = getCardActualWidthPx(sectionIds[i]);
+    const h = getCardHeight(sectionIds[i], measuredHeights);
+    if (p.x < minX) minX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.x + w > maxX) maxX = p.x + w;
+    if (p.y + h > maxY) maxY = p.y + h;
+  }
+  const naturalWidth = Math.max(0, maxX - minX);
+  const naturalHeight = Math.max(0, maxY - minY);
+  const scaleX = naturalWidth > 0 ? availableWidth / naturalWidth : 1;
+  const scaleY = naturalHeight > 0 ? availableHeight / naturalHeight : 1;
+  // Guard against degenerate 0/negative scale on pathological viewports.
+  const scale = Math.max(0.1, Math.min(1, scaleX, scaleY));
+
+  const scaledPositions = bestLayout.positions.map(p => ({
+    x: p.x * scale,
+    y: p.y * scale,
+  }));
+
+  return { positions: scaledPositions, scale };
 }
 
 // ── Main Component ──────────────────────────────────────────────────────────
@@ -410,15 +463,16 @@ export function SpotlightOverlay({ element, multiSelectIds }: { element: CanvasE
 
   // ── Derived layout (computed, not state) ────────────────────────────────
 
-  const dimensions = useMemo(() =>
-    spotlightOpen ? { width: window.innerWidth, height: window.innerHeight } : { width: 0, height: 0 },
-    [spotlightOpen],
-  );
+  // Track viewport dimensions via useSyncExternalStore so the card layout
+  // recomputes when the window is resized while the spotlight is open (keeps
+  // the Shift+S cards responsive to screen-size changes instead of only
+  // measuring once on open).
+  const dimensions = useViewportDimensions(spotlightOpen);
 
   // Memoize card layout calculation — uses measured heights when available
   const sectionIds = useMemo(() => sections.map(s => s.id), [sections]);
   const cardLayout = useMemo(() => {
-    if (!spotlightOpen || dimensions.width === 0) return { positions: [] as CardPosition[] };
+    if (!spotlightOpen || dimensions.width === 0) return { positions: [] as CardPosition[], scale: 1 };
     return calculateCardPositions(sectionIds, dimensions.width, dimensions.height, measuredHeights);
   }, [spotlightOpen, sectionIds, dimensions.width, dimensions.height, measuredHeights]);
 
@@ -561,7 +615,7 @@ export function SpotlightOverlay({ element, multiSelectIds }: { element: CanvasE
 
   if (!spotlightOpen) return null;
 
-  const { positions } = cardLayout;
+  const { positions, scale } = cardLayout;
 
   // Effective opacity for the dim overlay — full dim, no cutout
   const dimOpacity = isVisible && !isDismissing ? 1 : 0;
@@ -663,6 +717,9 @@ export function SpotlightOverlay({ element, multiSelectIds }: { element: CanvasE
             }}
           >
             <div
+              style={{ transform: `scale(${scale})`, transformOrigin: 'top left' }}
+            >
+            <div
               className={`${getSpotlightCardWidthClass(sectionLabel)} rounded-lg border overflow-hidden transition-all duration-200 ${
                 alreadyFloating
                   ? 'bg-card/60 border-border/30 cursor-default'
@@ -712,6 +769,7 @@ export function SpotlightOverlay({ element, multiSelectIds }: { element: CanvasE
                   style={{ backgroundColor: alreadyFloating ? 'rgba(59, 130, 246, 0.12)' : 'rgba(255, 255, 255, 0.35)' }}
                 />
               </div>
+            </div>
             </div>
           </div>
         );
