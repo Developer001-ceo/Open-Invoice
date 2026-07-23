@@ -44,6 +44,12 @@ export function getCellFontSize(r: number, c: number, props: TableProperties): n
   return props.fontSize;
 }
 
+export function getCellFontFamily(r: number, c: number, props: TableProperties): string {
+  const override = getOverride(props, r, c);
+  if (override?.fontFamily) return override.fontFamily;
+  return props.fontFamily || 'Inter, sans-serif';
+}
+
 export function getCellPadding(r: number, c: number, props: TableProperties): number {
   const override = getOverride(props, r, c);
   if (override?.padding !== undefined) return override.padding;
@@ -152,6 +158,7 @@ export function normalizeTableProps(raw: TableProperties): TableProperties {
     cellBg: raw.cellBg ?? '#ffffff',
     cellColor: raw.cellColor ?? '#374151',
     cellPadding: raw.cellPadding ?? 8,
+    fontFamily: raw.fontFamily ?? 'Inter, sans-serif',
     fontSize: raw.fontSize ?? 13,
     rowBgColors: raw.rowBgColors ?? {},
     colBgColors: raw.colBgColors ?? {},

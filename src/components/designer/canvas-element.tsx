@@ -1,7 +1,7 @@
 'use client';
 
 import { CanvasElement, TextProperties, TableProperties, ImageProperties, LineProperties, RectangleProperties, EllipseProperties, RectangleEffects, DEFAULT_EFFECTS, buildGradientCSS, buildShadowCSS, buildGlowCSS, buildPictureFillCSS, resolveCornerRadius, resolveRectBorderRadius, getRectRotation } from '@/lib/element-types';
-import { getCellBg, getCellColor, getCellFontWeight, getCellFontSize, getCellPadding, getCellTextAlign, getCellVerticalAlign, getCellTextTransform, getCellRotation, getCellBorderTop, getCellBorderBottom, getCellBorderLeft, getCellBorderRight, normalizeTableProps, ensureColWidths, ensureRowHeights } from '@/lib/table-helpers';
+import { getCellBg, getCellColor, getCellFontWeight, getCellFontFamily, getCellFontSize, getCellPadding, getCellTextAlign, getCellVerticalAlign, getCellTextTransform, getCellRotation, getCellBorderTop, getCellBorderBottom, getCellBorderLeft, getCellBorderRight, normalizeTableProps, ensureColWidths, ensureRowHeights } from '@/lib/table-helpers';
 import {
   hasCustomCorners,
   getRectCornerPoints,
@@ -481,6 +481,7 @@ const TableElementRenderer = memo(function TableElementRenderer({ element }: { e
         const padding = getCellPadding(r, c, props);
         const bgColor = getCellBg(r, c, props);
         const textColor = getCellColor(r, c, props);
+        const fontFamily = getCellFontFamily(r, c, props);
         const fontWeight = getCellFontWeight(r, c, props);
         const fontSize = getCellFontSize(r, c, props);
         const textAlign = getCellTextAlign(r, c, props);
@@ -534,6 +535,7 @@ const TableElementRenderer = memo(function TableElementRenderer({ element }: { e
               padding: `${padding}px`,
               backgroundColor: bgColor,
               color: textColor,
+              fontFamily,
               fontWeight,
               fontSize: `${fontSize}px`,
               textAlign: textAlign as 'left' | 'center' | 'right' | 'justify',

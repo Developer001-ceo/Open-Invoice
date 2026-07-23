@@ -10,6 +10,7 @@ import { DraggableReorderList, ReorderItem } from '@/components/designer/draggab
 import { SliderField } from '@/components/ui/slider-field';
 import { ColorInput } from '@/components/ui/color-input';
 import { FormattingToolbar, LabeledSelect } from '@/components/designer/rich-text-editor';
+import { FONT_FAMILIES, FONT_FAMILIES_GROUPED, DEFAULT_FONT_FAMILY } from '@/lib/fonts';
 
 interface FloatingCardProps {
   card: FloatingCardData;
@@ -457,6 +458,10 @@ function CellPropertiesEditor({ element, props, update, compact }: { element: Ca
     (r, c) => getCellOverride(r, c).fontWeight || 'normal',
     'normal'
   );
+  const multiFontFamily = getMultiCellValue(
+    (r, c) => getCellOverride(r, c).fontFamily || props.fontFamily || 'Inter, sans-serif',
+    props.fontFamily || 'Inter, sans-serif'
+  );
   const multiFontSize = getMultiCellValue(
     (r, c) => getCellOverride(r, c).fontSize || props.fontSize,
     props.fontSize
@@ -691,6 +696,24 @@ function CellPropertiesEditor({ element, props, update, compact }: { element: Ca
               <option value="500">500</option>
               <option value="600">600</option>
               <option value="700">700</option>
+            </select>
+          </Field>
+
+          <Field label="Font Family">
+            <select
+              data-no-drag
+              value={multiFontFamily.mixed ? '__mixed__' : multiFontFamily.value}
+              onChange={(e) => { if (e.target.value !== '__mixed__') updateSelectedCellsOverride({ fontFamily: e.target.value }); }}
+              className={selectCls}
+            >
+              {multiFontFamily.mixed && <option value="__mixed__">— mixed —</option>}
+              {FONT_FAMILIES_GROUPED.map((group) => (
+                <optgroup key={group.label} label={group.label}>
+                  {group.options.map((f) => (
+                    <option key={f.value} value={f.value} style={{ fontFamily: f.value }}>{f.label}</option>
+                  ))}
+                </optgroup>
+              ))}
             </select>
           </Field>
 
@@ -957,14 +980,9 @@ function ReorderCardContent({
 // being actively edited on canvas. Mirrors the look of FormattingToolbar but
 // operates on the element's base/default properties.
 
-const FONT_FAMILIES_STATIC = [
-  { value: 'Inter, sans-serif', label: 'Inter' },
-  { value: 'Georgia, serif', label: 'Georgia' },
-  { value: "'Courier New', monospace", label: 'Courier New' },
-  { value: 'Arial, sans-serif', label: 'Arial' },
-  { value: "'Times New Roman', serif", label: 'Times New Roman' },
-  { value: 'Verdana, sans-serif', label: 'Verdana' },
-];
+// Reuse the shared catalog (src/lib/fonts.ts) so the static formatting toolbar
+// offers the same font list as the inline editor, cards, and panel.
+const FONT_FAMILIES_STATIC = FONT_FAMILIES;
 
 const FONT_SIZES_STATIC = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 64, 72];
 
@@ -1008,8 +1026,12 @@ export function StaticFormattingToolbar({ data, update }: {
           title="Font Family"
           className="flex-1 min-w-[60px]"
         >
-          {FONT_FAMILIES_STATIC.map((f) => (
-            <option key={f.value} value={f.value}>{f.label}</option>
+          {FONT_FAMILIES_GROUPED.map((group) => (
+            <optgroup key={group.label} label={group.label}>
+              {group.options.map((f) => (
+                <option key={f.value} value={f.value} style={{ fontFamily: f.value }}>{f.label}</option>
+              ))}
+            </optgroup>
           ))}
         </LabeledSelect>
 
@@ -1314,12 +1336,13 @@ export const PropertyContent = memo(function PropertyContent({ sectionLabel, ele
           </Field>
           <Field label="Font Family">
             <select data-no-drag value={data.fontFamily} onChange={(e) => update({ fontFamily: e.target.value })} className={selectCls}>
-              <option value="Inter, sans-serif">Inter</option>
-              <option value="Georgia, serif">Georgia</option>
-              <option value="'Courier New', monospace">Courier New</option>
-              <option value="Arial, sans-serif">Arial</option>
-              <option value="'Times New Roman', serif">Times New Roman</option>
-              <option value="Verdana, sans-serif">Verdana</option>
+              {FONT_FAMILIES_GROUPED.map((group) => (
+                <optgroup key={group.label} label={group.label}>
+                  {group.options.map((f) => (
+                    <option key={f.value} value={f.value} style={{ fontFamily: f.value }}>{f.label}</option>
+                  ))}
+                </optgroup>
+              ))}
             </select>
           </Field>
           <Field label="Weight">
@@ -1452,6 +1475,7 @@ export const PropertyContent = memo(function PropertyContent({ sectionLabel, ele
         cellBg: rawProps.cellBg ?? '#ffffff',
         cellColor: rawProps.cellColor ?? '#374151',
         cellPadding: rawProps.cellPadding ?? 8,
+        fontFamily: rawProps.fontFamily ?? 'Inter, sans-serif',
         fontSize: rawProps.fontSize ?? 13,
         rowBgColors: rawProps.rowBgColors ?? {},
         colBgColors: rawProps.colBgColors ?? {},
@@ -1581,6 +1605,7 @@ export const PropertyContent = memo(function PropertyContent({ sectionLabel, ele
         cellBg: rawProps.cellBg ?? '#ffffff',
         cellColor: rawProps.cellColor ?? '#374151',
         cellPadding: rawProps.cellPadding ?? 8,
+        fontFamily: rawProps.fontFamily ?? 'Inter, sans-serif',
         fontSize: rawProps.fontSize ?? 13,
         rowBgColors: rawProps.rowBgColors ?? {},
         colBgColors: rawProps.colBgColors ?? {},
@@ -1648,6 +1673,7 @@ export const PropertyContent = memo(function PropertyContent({ sectionLabel, ele
         cellBg: rawProps.cellBg ?? '#ffffff',
         cellColor: rawProps.cellColor ?? '#374151',
         cellPadding: rawProps.cellPadding ?? 8,
+        fontFamily: rawProps.fontFamily ?? 'Inter, sans-serif',
         fontSize: rawProps.fontSize ?? 13,
         rowBgColors: rawProps.rowBgColors ?? {},
         colBgColors: rawProps.colBgColors ?? {},
@@ -1686,6 +1712,17 @@ export const PropertyContent = memo(function PropertyContent({ sectionLabel, ele
           <Field label="Font Size">
             <SliderField value={[props.fontSize]} min={6} max={72} step={1} unit="px" colorTheme="purple" onValueChange={([v]) => update({ fontSize: v })} compact />
           </Field>
+          <Field label="Font Family">
+            <select data-no-drag value={props.fontFamily} onChange={(e) => update({ fontFamily: e.target.value })} className={selectCls}>
+              {FONT_FAMILIES_GROUPED.map((group) => (
+                <optgroup key={group.label} label={group.label}>
+                  {group.options.map((f) => (
+                    <option key={f.value} value={f.value} style={{ fontFamily: f.value }}>{f.label}</option>
+                  ))}
+                </optgroup>
+              ))}
+            </select>
+          </Field>
         </div>
       );
     }
@@ -1705,6 +1742,7 @@ export const PropertyContent = memo(function PropertyContent({ sectionLabel, ele
         cellBg: rawProps.cellBg ?? '#ffffff',
         cellColor: rawProps.cellColor ?? '#374151',
         cellPadding: rawProps.cellPadding ?? 8,
+        fontFamily: rawProps.fontFamily ?? 'Inter, sans-serif',
         fontSize: rawProps.fontSize ?? 13,
         rowBgColors: rawProps.rowBgColors ?? {},
         colBgColors: rawProps.colBgColors ?? {},
@@ -1788,6 +1826,7 @@ export const PropertyContent = memo(function PropertyContent({ sectionLabel, ele
         cellBg: rawProps.cellBg ?? '#ffffff',
         cellColor: rawProps.cellColor ?? '#374151',
         cellPadding: rawProps.cellPadding ?? 8,
+        fontFamily: rawProps.fontFamily ?? 'Inter, sans-serif',
         fontSize: rawProps.fontSize ?? 13,
         rowBgColors: rawProps.rowBgColors ?? {},
         colBgColors: rawProps.colBgColors ?? {},
@@ -1871,6 +1910,7 @@ export const PropertyContent = memo(function PropertyContent({ sectionLabel, ele
         cellBg: rawProps.cellBg ?? '#ffffff',
         cellColor: rawProps.cellColor ?? '#374151',
         cellPadding: rawProps.cellPadding ?? 8,
+        fontFamily: rawProps.fontFamily ?? 'Inter, sans-serif',
         fontSize: rawProps.fontSize ?? 13,
         rowBgColors: rawProps.rowBgColors ?? {},
         colBgColors: rawProps.colBgColors ?? {},
@@ -1992,6 +2032,7 @@ export const PropertyContent = memo(function PropertyContent({ sectionLabel, ele
         cellBg: rawProps.cellBg ?? '#ffffff',
         cellColor: rawProps.cellColor ?? '#374151',
         cellPadding: rawProps.cellPadding ?? 8,
+        fontFamily: rawProps.fontFamily ?? 'Inter, sans-serif',
         fontSize: rawProps.fontSize ?? 13,
         rowBgColors: rawProps.rowBgColors ?? {},
         colBgColors: rawProps.colBgColors ?? {},
@@ -2037,6 +2078,7 @@ export const PropertyContent = memo(function PropertyContent({ sectionLabel, ele
         cellBg: rawProps.cellBg ?? '#ffffff',
         cellColor: rawProps.cellColor ?? '#374151',
         cellPadding: rawProps.cellPadding ?? 8,
+        fontFamily: rawProps.fontFamily ?? 'Inter, sans-serif',
         fontSize: rawProps.fontSize ?? 13,
         rowBgColors: rawProps.rowBgColors ?? {},
         colBgColors: rawProps.colBgColors ?? {},
@@ -2160,6 +2202,7 @@ export const PropertyContent = memo(function PropertyContent({ sectionLabel, ele
         cellBg: rawProps.cellBg ?? '#ffffff',
         cellColor: rawProps.cellColor ?? '#374151',
         cellPadding: rawProps.cellPadding ?? 8,
+        fontFamily: rawProps.fontFamily ?? 'Inter, sans-serif',
         fontSize: rawProps.fontSize ?? 13,
         rowBgColors: rawProps.rowBgColors ?? {},
         colBgColors: rawProps.colBgColors ?? {},

@@ -48,6 +48,7 @@ import {
   getCellBg,
   getCellColor,
   getCellFontWeight,
+  getCellFontFamily,
   getCellFontSize,
   getCellPadding,
   getCellTextAlign,
@@ -268,6 +269,7 @@ function renderTableElement(element: CanvasElement): HTMLElement {
       const padding = getCellPadding(r, c, props);
       const bgColor = getCellBg(r, c, props);
       const textColor = getCellColor(r, c, props);
+      const fontFamily = getCellFontFamily(r, c, props);
       const fontWeight = getCellFontWeight(r, c, props);
       const fontSize = getCellFontSize(r, c, props);
       const textAlign = getCellTextAlign(r, c, props);
@@ -301,6 +303,7 @@ function renderTableElement(element: CanvasElement): HTMLElement {
         `padding: ${padding}px`,
         `background-color: ${bgColor}`,
         `color: ${textColor}`,
+        `font-family: ${fontFamily}`,
         `font-weight: ${fontWeight}`,
         `font-size: ${fontSize}px`,
         `text-align: ${textAlign}`,

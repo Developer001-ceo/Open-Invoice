@@ -24,6 +24,7 @@ export interface CellOverride {
   padding?: number;
   bgColor?: string;
   color?: string;
+  fontFamily?: string;
   fontWeight?: string;
   fontSize?: number;
   textTransform?: 'none' | 'uppercase' | 'lowercase' | 'capitalize';
@@ -50,6 +51,7 @@ export interface TableProperties {
   cellBg: string;
   cellColor: string;
   cellPadding: number;
+  fontFamily: string;       // Default/base font family for all cells
   fontSize: number;
   // Row/col background overrides
   rowBgColors: Record<number, string>; // key: row index (0-based)
@@ -439,6 +441,7 @@ export function getDefaultProperties(type: ElementType): ElementProperties {
           cellBg: '#ffffff',
           cellColor: '#374151',
           cellPadding: 8,
+          fontFamily: 'Inter, sans-serif',
           fontSize: 13,
           rowBgColors: {},
           colBgColors: {},

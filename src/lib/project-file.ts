@@ -536,6 +536,8 @@ export function migrateProject(file: ProjectFile): ProjectFile {
           if (!props.cellOverrides) props.cellOverrides = {};
           if (!props.rowBgColors) props.rowBgColors = {};
           if (!props.colBgColors) props.colBgColors = {};
+          // Ensure default table-level font family (added after initial release)
+          if (!props.fontFamily) props.fontFamily = 'Inter, sans-serif';
           if (!props.cellData) {
             props.cellData = [];
             for (let r = 0; r < (props.rows || 4); r++) {

@@ -31,14 +31,9 @@ import { TextProperties } from '@/lib/element-types';
 import { useDesignerStore } from '@/store/designer-store';
 
 // ─── Font family options ────────────────────────────────────────────────
-const FONT_FAMILIES = [
-  { value: 'Inter, sans-serif', label: 'Inter' },
-  { value: 'Georgia, serif', label: 'Georgia' },
-  { value: "'Courier New', monospace", label: 'Courier New' },
-  { value: 'Arial, sans-serif', label: 'Arial' },
-  { value: "'Times New Roman', serif", label: 'Times New Roman' },
-  { value: 'Verdana, sans-serif', label: 'Verdana' },
-];
+// Imported from the shared catalog (src/lib/fonts.ts) so the Text tool,
+// Table Cell Properties, and all card/panel dropdowns share one list.
+import { FONT_FAMILIES, FONT_FAMILIES_GROUPED, DEFAULT_FONT_FAMILY } from '@/lib/fonts';
 
 // ─── Font size options ──────────────────────────────────────────────────
 const FONT_SIZES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 64, 72];
@@ -293,10 +288,14 @@ export const FormattingToolbar = memo(function FormattingToolbar({ editor, baseP
           className="max-w-[90px] min-w-[60px]"
         >
           <option value="__default__">{baseProps ? (FONT_FAMILIES.find(f => f.value === baseProps.fontFamily)?.label || baseProps.fontFamily) : 'Default'}</option>
-          {FONT_FAMILIES.map((f) => (
-            <option key={f.value} value={f.value}>
-              {f.label}
-            </option>
+          {FONT_FAMILIES_GROUPED.map((group) => (
+            <optgroup key={group.label} label={group.label}>
+              {group.options.map((f) => (
+                <option key={f.value} value={f.value} style={{ fontFamily: f.value }}>
+                  {f.label}
+                </option>
+              ))}
+            </optgroup>
           ))}
         </LabeledSelect>
 

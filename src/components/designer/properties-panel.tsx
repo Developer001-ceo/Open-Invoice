@@ -6,7 +6,7 @@ import { hasCustomCorners } from '@/lib/rectangle-corners';
 import { ensureColWidths, ensureRowHeights, ensureRowNames, ensureColNames } from '@/lib/table-helpers';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue, SelectGroup, SelectLabel } from '@/components/ui/select';
 import { Button } from '@/components/ui/button';
 import { NumericField } from '@/components/ui/numeric-field';
 import { SliderField } from '@/components/ui/slider-field';
@@ -16,6 +16,7 @@ import { DraggableReorderList, ReorderItem } from '@/components/designer/draggab
 import { Switch } from '@/components/ui/switch';
 import { ColorInput } from '@/components/ui/color-input';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
+import { FONT_FAMILIES, FONT_FAMILIES_GROUPED, DEFAULT_FONT_FAMILY } from '@/lib/fonts';
 import {
   Trash2,
   Copy,
@@ -631,12 +632,16 @@ function TextPropertiesPanel({ element }: { element: CanvasElement }) {
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="Inter, sans-serif">Inter</SelectItem>
-              <SelectItem value="Georgia, serif">Georgia</SelectItem>
-              <SelectItem value="'Courier New', monospace">Courier New</SelectItem>
-              <SelectItem value="Arial, sans-serif">Arial</SelectItem>
-              <SelectItem value="'Times New Roman', serif">Times New Roman</SelectItem>
-              <SelectItem value="Verdana, sans-serif">Verdana</SelectItem>
+              {FONT_FAMILIES_GROUPED.map((group) => (
+                <SelectGroup key={group.label}>
+                  <SelectLabel className="text-[10px] text-muted-foreground px-2 py-1">{group.label}</SelectLabel>
+                  {group.options.map((f) => (
+                    <SelectItem key={f.value} value={f.value} style={{ fontFamily: f.value }}>
+                      {f.label}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              ))}
             </SelectContent>
           </Select>
         </PropertyField>
@@ -764,6 +769,7 @@ function TablePropertiesPanel({ element }: { element: CanvasElement }) {
     cellBg: rawProps.cellBg ?? '#ffffff',
     cellColor: rawProps.cellColor ?? '#374151',
     cellPadding: rawProps.cellPadding ?? 8,
+    fontFamily: rawProps.fontFamily ?? 'Inter, sans-serif',
     fontSize: rawProps.fontSize ?? 13,
     rowBgColors: rawProps.rowBgColors ?? {},
     colBgColors: rawProps.colBgColors ?? {},
@@ -1117,6 +1123,10 @@ function TablePropertiesPanel({ element }: { element: CanvasElement }) {
     (r, c) => getCellOverride(r, c).fontWeight || 'normal',
     'normal'
   );
+  const multiFontFamily = getMultiCellValue(
+    (r, c) => getCellOverride(r, c).fontFamily || props.fontFamily || 'Inter, sans-serif',
+    props.fontFamily || 'Inter, sans-serif'
+  );
   const multiFontSize = getMultiCellValue(
     (r, c) => getCellOverride(r, c).fontSize || props.fontSize,
     props.fontSize
@@ -1172,9 +1182,26 @@ function TablePropertiesPanel({ element }: { element: CanvasElement }) {
           className="flex-1"
         />
       </PropertyField>
+      <PropertyField label="Font Family">
+        <Select value={props.fontFamily} onValueChange={(v) => update({ fontFamily: v })}>
+          <SelectTrigger className="h-7 text-xs">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {FONT_FAMILIES_GROUPED.map((group) => (
+              <SelectGroup key={group.label}>
+                <SelectLabel className="text-[10px] text-muted-foreground px-2 py-1">{group.label}</SelectLabel>
+                {group.options.map((f) => (
+                  <SelectItem key={f.value} value={f.value} style={{ fontFamily: f.value }}>
+                    {f.label}
+                  </SelectItem>
+                ))}
+              </SelectGroup>
+            ))}
+          </SelectContent>
+        </Select>
+      </PropertyField>
       </AccordionSection>
-
-      {/* ===== ROW COLORS ===== */}
       <AccordionSection label="Cell Properties" keywords="cell override align padding background border multi select" defaultOpen={false}>
       <p className="text-[9px] text-muted-foreground mb-1">Click to select · Shift/Ctrl+Click to multi-select</p>
       <div className="max-h-52 overflow-auto border border-border rounded-md">
@@ -1332,6 +1359,29 @@ function TablePropertiesPanel({ element }: { element: CanvasElement }) {
                 <SelectItem value="500">500</SelectItem>
                 <SelectItem value="600">600</SelectItem>
                 <SelectItem value="700">700</SelectItem>
+              </SelectContent>
+            </Select>
+          </PropertyField>
+          <PropertyField label="Font Family">
+            <Select
+              value={multiFontFamily.mixed ? '__mixed__' : multiFontFamily.value}
+              onValueChange={(v) => { if (v !== '__mixed__') updateSelectedCellsOverride({ fontFamily: v }); }}
+            >
+              <SelectTrigger className="h-7 text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {multiFontFamily.mixed && <SelectItem value="__mixed__">— mixed —</SelectItem>}
+                {FONT_FAMILIES_GROUPED.map((group) => (
+                  <SelectGroup key={group.label}>
+                    <SelectLabel className="text-[10px] text-muted-foreground px-2 py-1">{group.label}</SelectLabel>
+                    {group.options.map((f) => (
+                      <SelectItem key={f.value} value={f.value} style={{ fontFamily: f.value }}>
+                        {f.label}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                ))}
               </SelectContent>
             </Select>
           </PropertyField>
@@ -3458,6 +3508,7 @@ function TableStructurePanel({ element }: { element: CanvasElement }) {
     cellBg: rawProps.cellBg ?? '#ffffff',
     cellColor: rawProps.cellColor ?? '#374151',
     cellPadding: rawProps.cellPadding ?? 8,
+    fontFamily: rawProps.fontFamily ?? 'Inter, sans-serif',
     fontSize: rawProps.fontSize ?? 13,
     rowBgColors: rawProps.rowBgColors ?? {},
     colBgColors: rawProps.colBgColors ?? {},
