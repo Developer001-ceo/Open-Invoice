@@ -1,0 +1,1081 @@
+     1→/**
+     2→ * Project file format for Invoice Designer (.mjc)
+     3→ *
+     4→ * Handles serialization, deserialization, version migration,
+     5→ * and browser file save/load operations.
+     6→ *
+     7→ * Optimizations:
+     8→ * - structuredClone replaces JSON.parse(JSON.stringify()) for deep cloning
+     9→ * - Single-pass recursive element traversal for image extraction & migration
+    10→ * - Async FileReader.readAsArrayBuffer for better file reading performance
+    11→ * - pako gzip compression for large project files
+    12→ * - Combined migration passes (single element iteration for all field additions)
+    13→ * - Memory-efficient validation (minimal temporary allocations)
+    14→ */
+    15→
+    16→import {
+    17→  CanvasElement,
+    18→  ElementType,
+    19→  ElementProperties,
+    20→  TextProperties,
+    21→  TableProperties,
+    22→  ImageProperties,
+    23→  LineProperties,
+    24→  RectangleProperties,
+    25→  EllipseProperties,
+    26→  RectangleEffects,
+    27→  getDefaultProperties,
+    28→  DEFAULT_EFFECTS,
+    29→} from './element-types';
+    30→import {
+    31→  CanvasSettings,
+    32→  MarginGuidelineSettings,
+    33→  MarginPreset,
+    34→} from '@/store/designer-store';
+    35→import pako from 'pako';
+    36→import { sanitizeHtmlContent, sanitizeColor, sanitizeOpacity, sanitizePictureSrc } from './sanitize';
+    37→
+    38→// ─── Version ────────────────────────────────────────────────────────────────
+    39→export const APP_VERSION = '1.0.0';
+    40→
+    41→// ─── Compression Threshold ──────────────────────────────────────────────────
+    42→/** Files larger than this (in bytes) will be compressed with gzip */
+    43→const COMPRESSION_THRESHOLD = 100_000;
+    44→/** Magic bytes prepended to compressed .mjc files so we can detect them on load. */
+    45→const MJC_COMPRESSED_MAGIC = 'MJCGZ01';
+    46→/** Legacy magic used by older .isha files — still recognized on load so existing
+    47→ *  projects keep opening after the .isha -> .mjc rename. */
+    48→const LEGACY_ISHA_COMPRESSED_MAGIC = 'ISHAGZ01';
+    49→
+    50→// ─── Project File Interfaces ────────────────────────────────────────────────
+    51→
+    52→export interface ProjectAsset {
+    53→  id: string;
+    54→  name: string;
+    55→  data: string; // base64-encoded
+    56→}
+    57→
+    58→export interface ProjectSettings {
+    59→  snapEnabled: boolean;
+    60→  snapToGrid: boolean;
+    61→  snapToElements: boolean;
+    62→  snapUnit: number;
+    63→  zoomStep: number;
+    64→}
+    65→
+    66→export interface ProjectFile {
+    67→  appVersion: string;
+    68→  projectName: string;
+    69→  canvas: CanvasSettings;
+    70→  elements: CanvasElement[];
+    71→  elementCounter: Record<ElementType, number>;
+    72→  settings: ProjectSettings;
+    73→  assets: {
+    74→    images: ProjectAsset[];
+    75→  };
+    76→  /** Optional base64 thumbnail used by the recent-projects list. */
+    77→  previewThumbnail?: string;
+    78→}
+    79→
+    80→// ─── Single-Pass Recursive Element Traversal ────────────────────────────────
+    81→
+    82→/**
+    83→ * Callback invoked for each element in the tree (including children of groups).
+    84→ * Receives the element and its depth in the tree (0 for top-level).
+    85→ */
+    86→type ElementVisitor = (el: CanvasElement, depth: number) => void;
+    87→
+    88→/**
+    89→ * Recursively walk all elements, visiting each element exactly once.
+    90→ * This is the single shared traversal used for both image extraction
+    91→ * and migration, avoiding duplicate recursive walks.
+    92→ */
+    93→function walkElements(elements: CanvasElement[], visitor: ElementVisitor, depth = 0): void {
+    94→  for (const el of elements) {
+    95→    visitor(el, depth);
+    96→    if (el.children && el.children.length > 0) {
+    97→      walkElements(el.children, visitor, depth + 1);
+    98→    }
+    99→  }
+   100→}
+   101→
+   102→// ─── Serialization ──────────────────────────────────────────────────────────
+   103→
+   104→/**
+   105→ * Serialize the full project state into a ProjectFile object.
+   106→ * Extracts image data from elements into the assets array for
+   107→ * clean separation and deduplication.
+   108→ */
+   109→export function serializeProject(params: {
+   110→  elements: CanvasElement[];
+   111→  elementCounter: Record<ElementType, number>;
+   112→  canvasSettings: CanvasSettings;
+   113→  snapEnabled: boolean;
+   114→  snapToGrid: boolean;
+   115→  snapToElements: boolean;
+   116→  snapUnit: number;
+   117→  zoomStep: number;
+   118→  projectName?: string;
+   119→}): ProjectFile {
+   120→  const {
+   121→    elements,
+   122→    elementCounter,
+   123→    canvasSettings,
+   124→    snapEnabled,
+   125→    snapToGrid,
+   126→    snapToElements,
+   127→    snapUnit,
+   128→    zoomStep,
+   129→    projectName = 'Untitled Project',
+   130→  } = params;
+   131→
+   132→  // Deep clone elements using structuredClone (faster & more correct than JSON round-trip)
+   133→  const clonedElements: CanvasElement[] = structuredClone(elements);
+   134→
+   135→  // Collect image assets and replace inline base64 with asset references
+   136→  const imageAssets: ProjectAsset[] = [];
+   137→  const assetMap = new Map<string, string>(); // src -> assetId
+   138→
+   139→  // Single-pass traversal for image extraction (no separate recursive function)
+   140→  walkElements(clonedElements, (el) => {
+   141→    if (el.type === 'image') {
+   142→      const props = (el.properties as { type: 'image'; data: ImageProperties }).data;
+   143→      if (props.src && props.src.startsWith('data:')) {
+   144→        if (assetMap.has(props.src)) {
+   145→          props.src = `asset://${assetMap.get(props.src)}`;
+   146→        } else {
+   147→          const assetId = `img_${imageAssets.length.toString().padStart(3, '0')}`;
+   148→          assetMap.set(props.src, assetId);
+   149→          imageAssets.push({
+   150→            id: assetId,
+   151→            name: el.name || assetId,
+   152→            data: props.src,
+   153→          });
+   154→          props.src = `asset://${assetId}`;
+   155→        }
+   156→      }
+   157→    }
+   158→  });
+   159→
+   160→  return {
+   161→    appVersion: APP_VERSION,
+   162→    projectName,
+   163→    canvas: structuredClone(canvasSettings),
+   164→    elements: clonedElements,
+   165→    elementCounter: { ...elementCounter },
+   166→    settings: {
+   167→      snapEnabled,
+   168→      snapToGrid,
+   169→      snapToElements,
+   170→      snapUnit,
+   171→      zoomStep,
+   172→    },
+   173→    assets: {
+   174→      images: imageAssets,
+   175→    },
+   176→  };
+   177→}
+   178→
+   179→// ─── Deserialization ────────────────────────────────────────────────────────
+   180→
+   181→/**
+   182→ * Deserialize a ProjectFile object back into store-compatible state.
+   183→ * Restores image data from assets and runs version migrations.
+   184→ */
+   185→export function deserializeProject(file: ProjectFile): {
+   186→  elements: CanvasElement[];
+   187→  elementCounter: Record<ElementType, number>;
+   188→  canvasSettings: CanvasSettings;
+   189→  snapEnabled: boolean;
+   190→  snapToGrid: boolean;
+   191→  snapToElements: boolean;
+   192→  snapUnit: number;
+   193→  zoomStep: number;
+   194→  projectName: string;
+   195→} {
+   196→  // Run version migration first
+   197→  const migrated = migrateProject(file);
+   198→
+   199→  // Build asset lookup map
+   200→  const assetLookup = new Map<string, string>();
+   201→  for (const asset of migrated.assets.images) {
+   202→    assetLookup.set(asset.id, asset.data);
+   203→  }
+   204→
+   205→  // Deep clone using structuredClone
+   206→  const elements: CanvasElement[] = structuredClone(migrated.elements);
+   207→
+   208→  // Single-pass traversal to restore image assets
+   209→  walkElements(elements, (el) => {
+   210→    if (el.type === 'image') {
+   211→      const props = (el.properties as { type: 'image'; data: ImageProperties }).data;
+   212→      if (props.src && props.src.startsWith('asset://')) {
+   213→        const assetId = props.src.replace('asset://', '');
+   214→        const assetData = assetLookup.get(assetId);
+   215→        props.src = assetData ?? '';
+   216→      }
+   217→    }
+   218→  });
+   219→
+   220→  // Validate and provide defaults for canvas settings
+   221→  const canvasSettings: CanvasSettings = {
+   222→    pageWidth: migrated.canvas.pageWidth ?? 794,
+   223→    pageHeight: migrated.canvas.pageHeight ?? 1123,
+   224→    pageBackgroundColor: migrated.canvas.pageBackgroundColor ?? '#ffffff',
+   225→    marginPreset: migrated.canvas.marginPreset ?? 'normal',
+   226→    marginTop: migrated.canvas.marginTop ?? 50,
+   227→    marginBottom: migrated.canvas.marginBottom ?? 50,
+   228→    marginLeft: migrated.canvas.marginLeft ?? 50,
+   229→    marginRight: migrated.canvas.marginRight ?? 50,
+   230→    marginGuideline: {
+   231→      show: migrated.canvas.marginGuideline?.show ?? true,
+   232→      color: migrated.canvas.marginGuideline?.color ?? '#ec4899',
+   233→      thickness: migrated.canvas.marginGuideline?.thickness ?? 1,
+   234→      style: migrated.canvas.marginGuideline?.style ?? 'dashed',
+   235→      opacity: migrated.canvas.marginGuideline?.opacity ?? 40,
+   236→    },
+   237→  };
+   238→
+   239→  // Validate and provide defaults for settings
+   240→  const settings = migrated.settings ?? {};
+   241→
+   242→  return {
+   243→    elements,
+   244→    elementCounter: migrated.elementCounter ?? { text: 0, table: 0, image: 0, line: 0, rectangle: 0, ellipse: 0 },
+   245→    canvasSettings,
+   246→    snapEnabled: settings.snapEnabled ?? true,
+   247→    snapToGrid: settings.snapToGrid ?? false,
+   248→    snapToElements: settings.snapToElements ?? true,
+   249→    snapUnit: settings.snapUnit ?? 10,
+   250→    zoomStep: settings.zoomStep ?? 5,
+   251→    projectName: migrated.projectName ?? 'Untitled Project',
+   252→  };
+   253→}
+   254→
+   255→// ─── Version Migration ──────────────────────────────────────────────────────
+   256→
+   257→function parseVersion(v: string): [number, number, number] {
+   258→  const parts = v.split('.').map(Number);
+   259→  return [parts[0] || 0, parts[1] || 0, parts[2] || 0];
+   260→}
+   261→
+   262→function compareVersions(a: string, b: string): number {
+   263→  const [aMaj, aMin, aPatch] = parseVersion(a);
+   264→  const [bMaj, bMin, bPatch] = parseVersion(b);
+   265→  if (aMaj !== bMaj) return aMaj - bMaj;
+   266→  if (aMin !== bMin) return aMin - bMin;
+   267→  return aPatch - bPatch;
+   268→}
+   269→
+   270→/**
+   271→ * Ensure an effects object has all required sub-objects.
+   272→ * Shared by both rectangle and ellipse migration.
+   273→ */
+   274→function ensureEffects(props: { effects?: typeof DEFAULT_EFFECTS }): void {
+   275→  if (!props.effects) {
+   276→    props.effects = { ...DEFAULT_EFFECTS };
+   277→  } else {
+   278→    if (!props.effects.gradient) props.effects.gradient = { ...DEFAULT_EFFECTS.gradient };
+   279→    if (!props.effects.shadow) props.effects.shadow = { ...DEFAULT_EFFECTS.shadow };
+   280→    if (!props.effects.reflection) props.effects.reflection = { ...DEFAULT_EFFECTS.reflection };
+   281→    if (!props.effects.glow) props.effects.glow = { ...DEFAULT_EFFECTS.glow };
+   282→  }
+   283→}
+   284→
+   285→/**
+   286→ * Migrate a project file from its saved version to the current app version.
+   287→ * Returns a deep-cloned, migrated project file.
+   288→ *
+   289→ * Uses a single-pass element traversal for all per-element migrations,
+   290→ * combining what was previously multiple separate iterations.
+   291→ */
+   292→
+   293→/**
+   294→ * Sanitize untrusted element data from a loaded project file. This is the
+   295→ * trust boundary — it runs during migration (before any element reaches the
+   296→ * store or a renderer) and strips XSS payloads from:
+   297→ *  - text element `content` (rendered via dangerouslySetInnerHTML / innerHTML)
+   298→ *  - gradient `stops[].color` / `pictureSrc` (interpolated into SVG markup)
+   299→ *  - shadow / glow `color` (used in CSS, defense-in-depth)
+   300→ *  - table cell text content (rendered as cell innerHTML)
+   301→ *
+   302→ * See src/lib/sanitize.ts for the per-field sanitizers.
+   303→ */
+   304→function sanitizeElement(el: CanvasElement): void {
+   305→  if (!el.properties) return;
+   306→
+   307→  if (el.type === 'text') {
+   308→    const props = (el.properties as { type: 'text'; data: TextProperties }).data;
+   309→    if (props) {
+   310→      props.content = sanitizeHtmlContent(props.content);
+   311→      props.color = sanitizeColor(props.color, '#1a1a1a');
+   312→    }
+   313→  } else if (el.type === 'table') {
+   314→    const props = (el.properties as { type: 'table'; data: TableProperties }).data;
+   315→    if (props) {
+   316→      // Sanitize cell text content — table cells are rendered as innerHTML.
+   317→      if (Array.isArray(props.cellData)) {
+   318→        props.cellData = props.cellData.map((row: unknown): string[] => {
+   319→          if (!Array.isArray(row)) return [];
+   320→          return row.map((cell: unknown) => sanitizeHtmlContent(String(cell ?? '')));
+   321→        });
+   322→      }
+   323→      // Sanitize cell override colors.
+   324→      if (props.cellOverrides && typeof props.cellOverrides === 'object') {
+   325→        for (const key of Object.keys(props.cellOverrides)) {
+   326→          const ov = (props.cellOverrides as Record<string, Record<string, unknown>>)[key];
+   327→          if (ov && typeof ov === 'object') {
+   328→            if ('bgColor' in ov) ov.bgColor = sanitizeColor(ov.bgColor, '#ffffff');
+   329→            if ('color' in ov) ov.color = sanitizeColor(ov.color, '#1a1a1a');
+   330→          }
+   331→        }
+   332→      }
+   333→      if (props.rowBgColors && typeof props.rowBgColors === 'object') {
+   334→        for (const key of Object.keys(props.rowBgColors)) {
+   335→          (props.rowBgColors as Record<string, string>)[key] = sanitizeColor(
+   336→            (props.rowBgColors as Record<string, string>)[key], '#ffffff'
+   337→          );
+   338→        }
+   339→      }
+   340→      if (props.colBgColors && typeof props.colBgColors === 'object') {
+   341→        for (const key of Object.keys(props.colBgColors)) {
+   342→          (props.colBgColors as Record<string, string>)[key] = sanitizeColor(
+   343→            (props.colBgColors as Record<string, string>)[key], '#ffffff'
+   344→          );
+   345→        }
+   346→      }
+   347→    }
+   348→  } else if (el.type === 'image') {
+   349→    const props = (el.properties as { type: 'image'; data: ImageProperties }).data;
+   350→    if (props) {
+   351→      // Image src must be a safe data/blob/http URL — sanitize to reject
+   352→      // javascript: / vbscript: and anything that could break out of an attr.
+   353→      props.src = sanitizePictureSrc(props.src);
+   354→      props.borderColor = sanitizeColor(props.borderColor, '#d1d5db');
+   355→      sanitizeEffects(props.effects);
+   356→    }
+   357→  } else if (el.type === 'rectangle') {
+   358→    const props = (el.properties as { type: 'rectangle'; data: RectangleProperties }).data;
+   359→    if (props) {
+   360→      props.fill = sanitizeColor(props.fill, 'transparent');
+   361→      props.borderColor = sanitizeColor(props.borderColor, '#1a1a1a');
+   362→      sanitizeEffects(props.effects);
+   363→    }
+   364→  } else if (el.type === 'ellipse') {
+   365→    const props = (el.properties as { type: 'ellipse'; data: EllipseProperties }).data;
+   366→    if (props) {
+   367→      props.fill = sanitizeColor(props.fill, 'transparent');
+   368→      props.borderColor = sanitizeColor(props.borderColor, '#1a1a1a');
+   369→      sanitizeEffects(props.effects);
+   370→    }
+   371→  } else if (el.type === 'line') {
+   372→    const props = (el.properties as { type: 'line'; data: LineProperties }).data;
+   373→    if (props) {
+   374→      props.strokeColor = sanitizeColor(props.strokeColor, '#1a1a1a');
+   375→    }
+   376→  }
+   377→}
+   378→
+   379→/** Sanitize the color/pictureSrc fields inside a RectangleEffects object. */
+   380→function sanitizeEffects(effects: RectangleEffects | undefined): void {
+   381→  if (!effects) return;
+   382→  if (effects.gradient) {
+   383→    const g = effects.gradient;
+   384→    if (g.type === 'picture') {
+   385→      g.pictureSrc = sanitizePictureSrc(g.pictureSrc);
+   386→    }
+   387→    if (Array.isArray(g.stops)) {
+   388→      g.stops = g.stops.map((s) => ({
+   389→        color: sanitizeColor(s.color, '#3b82f6'),
+   390→        position: typeof s.position === 'number' ? Math.max(0, Math.min(100, s.position)) : 0,
+   391→        opacity: sanitizeOpacity(s.opacity, 1),
+   392→      }));
+   393→    }
+   394→  }
+   395→  if (effects.shadow) {
+   396→    effects.shadow.color = sanitizeColor(effects.shadow.color, '#000000');
+   397→    effects.shadow.opacity = sanitizeOpacity(effects.shadow.opacity, 0.3);
+   398→  }
+   399→  if (effects.glow) {
+   400→    effects.glow.color = sanitizeColor(effects.glow.color, '#3b82f6');
+   401→    effects.glow.opacity = sanitizeOpacity(effects.glow.opacity, 0.5);
+   402→  }
+   403→}
+   404→
+   405→export function migrateProject(file: ProjectFile): ProjectFile {
+   406→  // Deep clone using structuredClone
+   407→  const result: ProjectFile = structuredClone(file);
+   408→
+   409→  const fileVersion = result.appVersion || '0.0.0';
+   410→
+   411→  // If file version is newer than current, we still try to load it
+   412→  // but no migrations are needed (forward compat best-effort)
+   413→  if (compareVersions(fileVersion, APP_VERSION) > 0) {
+   414→    console.warn(
+   415→      `Project file version ${fileVersion} is newer than app version ${APP_VERSION}. Loading with best-effort compatibility.`
+   416→    );
+   417→    // Security: version-specific migrations are skipped, but sanitization is
+   418→    // NOT a migration — it's the trust boundary for every innerHTML sink
+   419→    // downstream (canvas, preview, PDF export). A file claiming a newer
+   420→    // appVersion is still untrusted input and must never bypass it.
+   421→    if (result.elements) {
+   422→      walkElements(result.elements, (el) => sanitizeElement(el));
+   423→    }
+   424→    return result;
+   425→  }
+   426→
+   427→  // --- Top-level structure migrations ---
+   428→
+   429→  // Migration: ensure elementCounter has all required keys
+   430→  if (!result.elementCounter) {
+   431→    result.elementCounter = { text: 0, table: 0, image: 0, line: 0, rectangle: 0, ellipse: 0, group: 0 };
+   432→  }
+   433→  const counter = result.elementCounter;
+   434→  if (counter.text === undefined) counter.text = 0;
+   435→  if (counter.table === undefined) counter.table = 0;
+   436→  if (counter.image === undefined) counter.image = 0;
+   437→  if (counter.line === undefined) counter.line = 0;
+   438→  if (counter.rectangle === undefined) counter.rectangle = 0;
+   439→  if (counter.ellipse === undefined) counter.ellipse = 0;
+   440→  if (counter.group === undefined) counter.group = 0;
+   441→
+   442→  // Migration: ensure settings object exists
+   443→  if (!result.settings) {
+   444→    result.settings = {
+   445→      snapEnabled: true,
+   446→      snapToGrid: false,
+   447→      snapToElements: true,
+   448→      snapUnit: 10,
+   449→      zoomStep: 5,
+   450→    };
+   451→  }
+   452→
+   453→  // Migration: ensure assets object exists
+   454→  if (!result.assets) {
+   455→    result.assets = { images: [] };
+   456→  }
+   457→  if (!result.assets.images) {
+   458→    result.assets.images = [];
+   459→  }
+   460→
+   461→  // Migration: ensure canvas settings has all fields
+   462→  if (!result.canvas) {
+   463→    result.canvas = {
+   464→      pageWidth: 794,
+   465→      pageHeight: 1123,
+   466→      pageBackgroundColor: '#ffffff',
+   467→      marginPreset: 'normal',
+   468→      marginTop: 50,
+   469→      marginBottom: 50,
+   470→      marginLeft: 50,
+   471→      marginRight: 50,
+   472→      marginGuideline: {
+   473→        show: true,
+   474→        color: '#ec4899',
+   475→        thickness: 1,
+   476→        style: 'dashed',
+   477→        opacity: 40,
+   478→      },
+   479→    };
+   480→  }
+   481→  if (!result.canvas.marginGuideline) {
+   482→    result.canvas.marginGuideline = {
+   483→      show: true,
+   484→      color: '#ec4899',
+   485→      thickness: 1,
+   486→      style: 'dashed',
+   487→      opacity: 40,
+   488→    };
+   489→  }
+   490→
+   491→  // --- Combined single-pass element migration ---
+   492→  // Previously this was done with a top-level loop + a separate recursive
+   493→  // migrateChildren function. Now we use walkElements for a single traversal.
+   494→
+   495→  if (result.elements) {
+   496→    walkElements(result.elements, (el) => {
+   497→      // Ensure visible and locked fields
+   498→      if (el.visible === undefined) el.visible = true;
+   499→      if (el.locked === undefined) el.locked = false;
+   500→      if (!el.name) el.name = `${el.type} element`;
+   501→
+   502→      // Ensure group elements have children array
+   503→      if (el.type === 'group' && !el.children) {
+   504→        el.children = [];
+   505→      }
+   506→
+   507→      // Migrate table properties: old showOuterBorder -> new per-side borders + all defaults
+   508→      if (el.type === 'table') {
+   509→        const props = (el.properties as { type: 'table'; data: TableProperties }).data;
+   510→        if (props) {
+   511→          const legacyOuter = (props as unknown as Record<string, unknown>).showOuterBorder;
+   512→          const legacyInner = (props as unknown as Record<string, unknown>).showInnerBorder;
+   513→
+   514→          if (props.showBorderTop === undefined && legacyOuter !== undefined) {
+   515→            props.showBorderTop = !!legacyOuter;
+   516→          }
+   517→          if (props.showBorderRight === undefined && legacyOuter !== undefined) {
+   518→            props.showBorderRight = !!legacyOuter;
+   519→          }
+   520→          if (props.showBorderBottom === undefined && legacyOuter !== undefined) {
+   521→            props.showBorderBottom = !!legacyOuter;
+   522→          }
+   523→          if (props.showBorderLeft === undefined && legacyOuter !== undefined) {
+   524→            props.showBorderLeft = !!legacyOuter;
+   525→          }
+   526→          if (props.showInnerBorders === undefined && legacyInner !== undefined) {
+   527→            props.showInnerBorders = !!legacyInner;
+   528→          }
+   529→
+   530→          // Ensure defaults for new per-side fields
+   531→          if (props.showBorderTop === undefined) props.showBorderTop = true;
+   532→          if (props.showBorderRight === undefined) props.showBorderRight = true;
+   533→          if (props.showBorderBottom === undefined) props.showBorderBottom = true;
+   534→          if (props.showBorderLeft === undefined) props.showBorderLeft = true;
+   535→          if (props.showInnerBorders === undefined) props.showInnerBorders = true;
+   536→
+   537→          // Ensure cornerRadius exists
+   538→          if (!props.cornerRadius) {
+   539→            props.cornerRadius = { mode: 'linked', all: 0, topLeft: 0, topRight: 0, bottomRight: 0, bottomLeft: 0 };
+   540→          }
+   541→
+   542→          // Ensure cellOverrides exists
+   543→          if (!props.cellOverrides) props.cellOverrides = {};
+   544→          if (!props.rowBgColors) props.rowBgColors = {};
+   545→          if (!props.colBgColors) props.colBgColors = {};
+   546→          // Ensure default table-level font family (added after initial release)
+   547→          if (!props.fontFamily) props.fontFamily = 'Inter, sans-serif';
+   548→          if (!props.cellData) {
+   549→            props.cellData = [];
+   550→            for (let r = 0; r < (props.rows || 4); r++) {
+   551→              props.cellData.push(Array(props.cols || 3).fill(''));
+   552→            }
+   553→          }
+   554→        }
+   555→      }
+   556→
+   557→      // Ensure image properties have all fields
+   558→      if (el.type === 'image') {
+   559→        const props = (el.properties as { type: 'image'; data: ImageProperties }).data;
+   560→        if (props) {
+   561→          if (props.src === undefined) props.src = '';
+   562→          if (!props.objectFit) props.objectFit = 'contain';
+   563→          if (props.borderRadius === undefined) props.borderRadius = 0;
+   564→          if (props.opacity === undefined) props.opacity = 1;
+   565→          if (props.borderWidth === undefined) props.borderWidth = 0;
+   566→          if (!props.borderColor) props.borderColor = '#d1d5db';
+   567→        }
+   568→      }
+   569→
+   570→      // Ensure text properties have all fields
+   571→      if (el.type === 'text') {
+   572→        const props = (el.properties as { type: 'text'; data: TextProperties }).data;
+   573→        if (props) {
+   574→          if (props.content === undefined) props.content = '';
+   575→          if (props.contentJson === undefined) props.contentJson = null;
+   576→          if (props.fontSize === undefined) props.fontSize = 16;
+   577→          if (!props.fontFamily) props.fontFamily = 'Inter, sans-serif';
+   578→          if (!props.fontWeight) props.fontWeight = 'normal';
+   579→          if (!props.fontStyle) props.fontStyle = 'normal';
+   580→          if (!props.textDecoration) props.textDecoration = 'none';
+   581→          if (!props.color) props.color = '#1a1a1a';
+   582→          if (!props.textAlign) props.textAlign = 'left';
+   583→          if (props.lineHeight === undefined) props.lineHeight = 1.5;
+   584→          if (props.letterSpacing === undefined) props.letterSpacing = 0;
+   585→          if (props.opacity === undefined) props.opacity = 1;
+   586→        }
+   587→      }
+   588→
+   589→      // Ensure line properties have all fields
+   590→      if (el.type === 'line') {
+   591→        const props = (el.properties as { type: 'line'; data: LineProperties }).data;
+   592→        if (props) {
+   593→          if (props.strokeWidth === undefined) props.strokeWidth = 2;
+   594→          if (!props.strokeColor) props.strokeColor = '#1a1a1a';
+   595→          if (!props.strokeStyle) props.strokeStyle = 'solid';
+   596→          if (props.opacity === undefined) props.opacity = 1;
+   597→          if (!props.lineCap) props.lineCap = 'butt';
+   598→        }
+   599→      }
+   600→
+   601→      // Ensure rectangle properties have all fields
+   602→      if (el.type === 'rectangle') {
+   603→        const props = (el.properties as { type: 'rectangle'; data: RectangleProperties }).data;
+   604→        if (props) {
+   605→          if (props.fill === undefined) props.fill = 'transparent';
+   606→          if (props.borderWidth === undefined) props.borderWidth = 2;
+   607→          if (!props.borderColor) props.borderColor = '#1a1a1a';
+   608→          if (!props.borderStyle) props.borderStyle = 'solid';
+   609→          if (props.borderRadius === undefined) props.borderRadius = 0;
+   610→          if (props.opacity === undefined) props.opacity = 1;
+   611→          ensureEffects(props);
+   612→        }
+   613→      }
+   614→
+   615→      // Ensure ellipse properties have all fields
+   616→      if (el.type === 'ellipse') {
+   617→        const props = (el.properties as { type: 'ellipse'; data: EllipseProperties }).data;
+   618→        if (props) {
+   619→          if (props.fill === undefined) props.fill = 'transparent';
+   620→          if (props.borderWidth === undefined) props.borderWidth = 2;
+   621→          if (!props.borderColor) props.borderColor = '#1a1a1a';
+   622→          if (!props.borderStyle) props.borderStyle = 'solid';
+   623→          if (props.opacity === undefined) props.opacity = 1;
+   624→          ensureEffects(props);
+   625→        }
+   626→      }
+   627→
+   628→      // ── Security: sanitize untrusted content from the file ───────────────
+   629→      // Runs AFTER all migrations so it operates on the final, defaulted
+   630→      // property values. This is the trust boundary — everything downstream
+   631→      // (store, renderers, dangerouslySetInnerHTML) receives safe data.
+   632→      sanitizeElement(el);
+   633→    });
+   634→  }
+   635→
+   636→  // Update to current version after all migrations
+   637→  result.appVersion = APP_VERSION;
+   638→
+   639→  return result;
+   640→}
+   641→
+   642→// ─── Validation ─────────────────────────────────────────────────────────────
+   643→
+   644→export interface ValidationResult {
+   645→  valid: boolean;
+   646→  errors: string[];
+   647→  warnings: string[];
+   648→}
+   649→
+   650→/**
+   651→ * Validate a parsed project file structure.
+   652→ * Optimized to minimize temporary allocations — errors/warnings are
+   653→ * pushed directly to pre-allocated arrays with no intermediate objects.
+   654→ */
+   655→export function validateProjectFile(data: unknown): ValidationResult {
+   656→  const errors: string[] = [];
+   657→  const warnings: string[] = [];
+   658→
+   659→  if (!data || typeof data !== 'object') {
+   660→    return { valid: false, errors: ['File does not contain valid JSON object'], warnings: [] };
+   661→  }
+   662→
+   663→  const file = data as Record<string, unknown>;
+   664→
+   665→  // Check required top-level fields — use direct typeof checks, no temp vars
+   666→  if (!file.appVersion || typeof file.appVersion !== 'string') {
+   667→    errors.push('Missing or invalid appVersion field');
+   668→  }
+   669→
+   670→  if (!file.projectName || typeof file.projectName !== 'string') {
+   671→    warnings.push('Missing projectName, will use default');
+   672→  }
+   673→
+   674→  if (!Array.isArray(file.elements)) {
+   675→    errors.push('Missing or invalid elements array');
+   676→  }
+   677→
+   678→  if (!file.canvas || typeof file.canvas !== 'object') {
+   679→    errors.push('Missing or invalid canvas settings');
+   680→  }
+   681→
+   682→  // Check element structure — inline validation, no intermediate element objects
+   683→  if (Array.isArray(file.elements)) {
+   684→    const len = file.elements.length;
+   685→    for (let i = 0; i < len; i++) {
+   686→      const el = file.elements[i] as Record<string, unknown> | undefined;
+   687→      if (!el) {
+   688→        errors.push(`Element ${i}: null or undefined`);
+   689→        continue;
+   690→      }
+   691→      if (!el.id) errors.push(`Element ${i}: missing id`);
+   692→      if (!el.type) errors.push(`Element ${i}: missing type`);
+   693→      if (!el.properties) errors.push(`Element ${i}: missing properties`);
+   694→      if (typeof el.x !== 'number') errors.push(`Element ${i}: missing or invalid x`);
+   695→      if (typeof el.y !== 'number') errors.push(`Element ${i}: missing or invalid y`);
+   696→    }
+   697→  }
+   698→
+   699→  // Version compatibility warning
+   700→  if (file.appVersion && typeof file.appVersion === 'string') {
+   701→    if (compareVersions(file.appVersion, APP_VERSION) > 0) {
+   702→      warnings.push(
+   703→        `File version ${file.appVersion} is newer than app version ${APP_VERSION}. Some features may not work correctly.`
+   704→      );
+   705→    }
+   706→  }
+   707→
+   708→  return {
+   709→    valid: errors.length === 0,
+   710→    errors,
+   711→    warnings,
+   712→  };
+   713→}
+   714→
+   715→// ─── Compression Helpers ─────────────────────────────────────────────────────
+   716→
+   717→/**
+   718→ * Compress a string with gzip (pako) and wrap with a magic header
+   719→ * so we can detect compressed files on load.
+   720→ */
+   721→function compressProject(json: string): Uint8Array {
+   722→  const encoded = new TextEncoder().encode(json);
+   723→  const compressed = pako.gzip(encoded);
+   724→  const magic = new TextEncoder().encode(MJC_COMPRESSED_MAGIC);
+   725→  const result = new Uint8Array(magic.length + compressed.length);
+   726→  result.set(magic, 0);
+   727→  result.set(compressed, magic.length);
+   728→  return result;
+   729→}
+   730→
+   731→/**
+   732→ * Sanitize a project name into a safe download filename.
+   733→ * Replaces the previously copy-pasted character-strip regex at every save
+   734→ * call site, so user/file-supplied names can't inject odd characters into
+   735→ * download filenames.
+   736→ */
+   737→function sanitizeFilename(name: string): string {
+   738→  return `${name.replace(/[^a-zA-Z0-9_-]/g, '_')}.mjc`;
+   739→}
+   740→
+   741→/**
+   742→ * Upper bound on decompressed project size (64 MB). A tiny crafted `.mjc`
+   743→ * can be a decompression bomb — without a cap, pako.ungzip happily expands
+   744→ * it to gigabytes and OOM-kills the tab before JSON.parse ever runs.
+   745→ */
+   746→const MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024;
+   747→
+   748→/**
+   749→ * Decompress a project file. Detects the magic header; if present,
+   750→ * decompresses with pako. Otherwise returns the raw string as-is
+   751→ * (backwards compatible with uncompressed .mjc files).
+   752→ *
+   753→ * Recognizes both the current MJCGZ01 magic and the legacy ISHAGZ01 magic
+   754→ * from older .isha files, so existing projects keep opening after the rename.
+   755→ */
+   756→function decompressProject(buffer: ArrayBuffer): string {
+   757→  const bytes = new Uint8Array(buffer);
+   758→  // Reject absurdly large compressed inputs up front.
+   759→  if (bytes.length > MAX_DECOMPRESSED_BYTES) {
+   760→    throw new Error('Project file is too large to open (over 64 MB).');
+   761→  }
+   762→  // Try each known magic header (current + legacy).
+   763→  for (const magicStr of [MJC_COMPRESSED_MAGIC, LEGACY_ISHA_COMPRESSED_MAGIC]) {
+   764→    const magicLen = magicStr.length;
+   765→    if (bytes.length <= magicLen) continue;
+   766→    let matches = true;
+   767→    for (let i = 0; i < magicLen; i++) {
+   768→      if (bytes[i] !== magicStr.charCodeAt(i)) {
+   769→        matches = false;
+   770→        break;
+   771→      }
+   772→    }
+   773→    if (matches) {
+   774→      const payload = bytes.slice(magicLen);
+   775→      // Inflate incrementally so a bomb aborts at the cap instead of
+   776→      // allocating gigabytes in one pako.ungzip call.
+   777→      const inflator = new pako.Inflate();
+   778→      let inflatedBytes = 0;
+   779→      inflator.onData = (chunk: Uint8Array) => {
+   780→        inflatedBytes += chunk.length;
+   781→        if (inflatedBytes > MAX_DECOMPRESSED_BYTES) {
+   782→          throw new Error('Decompressed project exceeds the 64 MB size limit.');
+   783→        }
+   784→      };
+   785→      const chunkSize = 1024 * 1024;
+   786→      for (let offset = 0; offset < payload.length; offset += chunkSize) {
+   787→        inflator.push(payload.subarray(offset, Math.min(offset + chunkSize, payload.length)));
+   788→      }
+   789→      inflator.push(new Uint8Array(0), true); // signal end of stream
+   790→      const decompressed = inflator.result as Uint8Array;
+   791→      if (decompressed.length > MAX_DECOMPRESSED_BYTES) {
+   792→        throw new Error('Decompressed project exceeds the 64 MB size limit.');
+   793→      }
+   794→      return new TextDecoder().decode(decompressed);
+   795→    }
+   796→  }
+   797→
+   798→  // Not compressed — treat as plain UTF-8 JSON
+   799→  return new TextDecoder().decode(bytes);
+   800→}
+   801→
+   802→// ─── Browser File Operations ────────────────────────────────────────────────
+   803→
+   804→/**
+   805→ * Save a project file by triggering a browser download.
+   806→ * Uses gzip compression for large projects to reduce file size.
+   807→ */
+   808→export function saveProjectToFile(project: ProjectFile, filename?: string): void {
+   809→  const json = JSON.stringify(project, null, 2);
+   810→  const rawBytes = new TextEncoder().encode(json);
+   811→  const fname = filename || sanitizeFilename(project.projectName);
+   812→
+   813→  let blob: Blob;
+   814→  if (rawBytes.length > COMPRESSION_THRESHOLD) {
+   815→    // Compress large files
+   816→    const compressed = compressProject(json);
+   817→    blob = new Blob([compressed as unknown as BlobPart], { type: 'application/octet-stream' });
+   818→  } else {
+   819→    // Small files — no compression
+   820→    blob = new Blob([json], { type: 'application/json' });
+   821→  }
+   822→
+   823→  const url = URL.createObjectURL(blob);
+   824→  const link = document.createElement('a');
+   825→  link.href = url;
+   826→  link.download = fname;
+   827→  document.body.appendChild(link);
+   828→  link.click();
+   829→  document.body.removeChild(link);
+   830→  URL.revokeObjectURL(url);
+   831→}
+   832→
+   833→/**
+   834→ * Open a file picker to load a .mjc project file.
+   835→ * Returns a Promise that resolves with the parsed ProjectFile.
+   836→ *
+   837→ * Uses async FileReader.readAsArrayBuffer for better performance
+   838→ * with large files, and auto-detects compressed files.
+   839→ */
+   840→export function loadProjectFromFile(): Promise<{
+   841→  project: ProjectFile;
+   842→  validation: ValidationResult;
+   843→  rawFilename: string;
+   844→}> {
+   845→  return new Promise((resolve, reject) => {
+   846→    const input = document.createElement('input');
+   847→    input.type = 'file';
+   848→    input.accept = '.mjc';
+   849→
+   850→    input.onchange = () => {
+   851→      const file = input.files?.[0];
+   852→      if (!file) {
+   853→        reject(new Error('No file selected'));
+   854→        return;
+   855→      }
+   856→
+   857→      // Use async FileReader.readAsArrayBuffer for better performance
+   858→      const reader = new FileReader();
+   859→
+   860→      reader.onload = () => {
+   861→        try {
+   862→          const buffer = reader.result as ArrayBuffer;
+   863→          const text = decompressProject(buffer);
+   864→          const parsed = JSON.parse(text);
+   865→
+   866→          // Validate the structure
+   867→          const validation = validateProjectFile(parsed);
+   868→
+   869→          if (!validation.valid) {
+   870→            reject(new Error(`Invalid project file:\n${validation.errors.join('\n')}`));
+   871→            return;
+   872→          }
+   873→
+   874→          // Ensure it has the right shape for a ProjectFile
+   875→          const project = parsed as ProjectFile;
+   876→
+   877→          resolve({
+   878→            project,
+   879→            validation,
+   880→            rawFilename: file.name,
+   881→          });
+   882→        } catch (err) {
+   883→          reject(new Error(`Failed to read project file: ${err instanceof Error ? err.message : String(err)}`));
+   884→        }
+   885→      };
+   886→
+   887→      reader.onerror = () => {
+   888→        reject(new Error('Failed to read file'));
+   889→      };
+   890→
+   891→      reader.readAsArrayBuffer(file);
+   892→    };
+   893→
+   894→    input.oncancel = () => {
+   895→      reject(new Error('File selection cancelled'));
+   896→    };
+   897→
+   898→    // Trigger the file picker
+   899→    input.click();
+   900→  });
+   901→}
+   902→
+   903→// ─── File System Access API (Save As dialog) ────────────────────────────────
+   904→
+   905→/**
+   906→ * Check if the File System Access API is supported.
+   907→ */
+   908→export function isFileSystemAccessSupported(): boolean {
+   909→  return typeof window !== 'undefined' && 'showSaveFilePicker' in window;
+   910→}
+   911→
+   912→/**
+   913→ * Serialize and optionally compress a project for saving.
+   914→ * Shared by both File System Access and fallback save paths.
+   915→ */
+   916→function serializeForSave(project: ProjectFile): { data: string | Uint8Array; type: string } {
+   917→  const json = JSON.stringify(project, null, 2);
+   918→  const rawBytes = new TextEncoder().encode(json);
+   919→
+   920→  if (rawBytes.length > COMPRESSION_THRESHOLD) {
+   921→    return { data: compressProject(json), type: 'application/octet-stream' };
+   922→  }
+   923→  return { data: json, type: 'application/json' };
+   924→}
+   925→
+   926→/**
+   927→ * Save a project file using the native OS Save As dialog (File System Access API).
+   928→ * Returns the FileSystemFileHandle for future Save operations.
+   929→ * Falls back to blob download if the API is not supported.
+   930→ * Uses gzip compression for large projects.
+   931→ */
+   932→export async function saveProjectAsWithDialog(
+   933→  project: ProjectFile,
+   934→  suggestedName?: string
+   935→): Promise<{ fileHandle: FileSystemFileHandle | null; filename: string; savedToHandle: boolean } | null> {
+   936→  const defaultName = suggestedName || sanitizeFilename(project.projectName);
+   937→
+   938→  if (isFileSystemAccessSupported()) {
+   939→    try {
+   940→      const handle = await (window as unknown as { showSaveFilePicker: (opts: unknown) => Promise<FileSystemFileHandle> }).showSaveFilePicker({
+   941→        suggestedName: defaultName,
+   942→        types: [
+   943→          {
+   944→            description: 'MJC Invoice Project',
+   945→            accept: {
+   946→              'application/json': ['.mjc'],
+   947→            },
+   948→          },
+   949→        ],
+   950→      });
+   951→
+   952→      const { data } = serializeForSave(project);
+   953→      const writable = await handle.createWritable();
+   954→      await writable.write(data as unknown as FileSystemWriteChunkType);
+   955→      await writable.close();
+   956→
+   957→      return { fileHandle: handle, filename: handle.name, savedToHandle: true };
+   958→    } catch (err: unknown) {
+   959→      // User cancelled the dialog
+   960→      if (err instanceof Error && err.name === 'AbortError') {
+   961→        return null;
+   962→      }
+   963→      // Other errors — fall through to fallback
+   964→      console.warn('File System Access API failed, falling back to download:', err);
+   965→    }
+   966→  }
+   967→
+   968→  // Fallback: prompt for filename then use blob download. For Save As this is
+   969→  // a legitimate new-file save (the user chose the name), just without a
+   970→  // persistent handle for future Ctrl+S. Sanitize the prompt result the same
+   971→  // way as the default name — previously it was used raw.
+   972→  const name = prompt('Enter file name:', defaultName.replace(/\.mjc$/, ''));
+   973→  if (!name) return null;
+   974→
+   975→  const filename = sanitizeFilename(name);
+   976→  saveProjectToFile(project, filename);
+   977→
+   978→  return { fileHandle: null, filename, savedToHandle: false };
+   979→}
+   980→
+   981→/**
+   982→ * Save to an existing file handle (for Ctrl+S after Save As).
+   983→ * Falls back to blob download if no handle is available.
+   984→ * Uses gzip compression for large projects.
+   985→ *
+   986→ * Returns `savedToHandle: true` only when the file on disk was actually
+   987→ * written. When it falls back to a download (write failed or no handle),
+   988→ * `savedToHandle` is false so the caller can avoid clearing isDirty /
+   989→ * fileHandle and warn the user that their disk file is unchanged.
+   990→ */
+   991→export async function saveProjectToHandle(
+   992→  project: ProjectFile,
+   993→  fileHandle: FileSystemFileHandle | null,
+   994→  fallbackFilename?: string
+   995→): Promise<{ fileHandle: FileSystemFileHandle | null; filename: string; savedToHandle: boolean }> {
+   996→  // If we have a file handle, write directly to it
+   997→  if (fileHandle) {
+   998→    try {
+   999→      const { data } = serializeForSave(project);
+  1000→      const writable = await fileHandle.createWritable();
+  1001→      await writable.write(data as unknown as FileSystemWriteChunkType);
+  1002→      await writable.close();
+  1003→      return { fileHandle, filename: fileHandle.name, savedToHandle: true };
+  1004→    } catch (err) {
+  1005→      console.warn('Failed to write to file handle, falling back to download:', err);
+  1006→    }
+  1007→  }
+  1008→
+  1009→  // Fallback: blob download. The file on disk was NOT updated.
+  1010→  const filename = fallbackFilename || sanitizeFilename(project.projectName);
+  1011→  saveProjectToFile(project, filename);
+  1012→  return { fileHandle: null, filename, savedToHandle: false };
+  1013→}
+  1014→
+  1015→/**
+  1016→ * Open a file using the File System Access API (Open dialog).
+  1017→ * Falls back to input element if not supported.
+  1018→ * Auto-detects and decompresses gzip-compressed files.
+  1019→ */
+  1020→export async function openProjectWithDialog(): Promise<{
+  1021→  project: ProjectFile;
+  1022→  validation: ValidationResult;
+  1023→  rawFilename: string;
+  1024→  fileHandle: FileSystemFileHandle | null;
+  1025→}> {
+  1026→  if (isFileSystemAccessSupported()) {
+  1027→    try {
+  1028→      const [handle] = await (window as unknown as { showOpenFilePicker: (opts: unknown) => Promise<[FileSystemFileHandle]> }).showOpenFilePicker({
+  1029→        types: [
+  1030→          {
+  1031→            description: 'MJC Invoice Project',
+  1032→            accept: {
+  1033→              'application/json': ['.mjc'],
+  1034→            },
+  1035→          },
+  1036→        ],
+  1037→        multiple: false,
+  1038→      });
+  1039→
+  1040→      const file = await handle.getFile();
+  1041→      // Use arrayBuffer for consistent handling of compressed files
+  1042→      const buffer = await file.arrayBuffer();
+  1043→      const text = decompressProject(buffer);
+  1044→      const parsed = JSON.parse(text);
+  1045→      const validation = validateProjectFile(parsed);
+  1046→
+  1047→      if (!validation.valid) {
+  1048→        throw new Error(`Invalid project file:\n${validation.errors.join('\n')}`);
+  1049→      }
+  1050→
+  1051→      return {
+  1052→        project: parsed as ProjectFile,
+  1053→        validation,
+  1054→        rawFilename: handle.name,
+  1055→        fileHandle: handle,
+  1056→      };
+  1057→    } catch (err: unknown) {
+  1058→      if (err instanceof Error && err.name === 'AbortError') {
+  1059→        throw new Error('File selection cancelled');
+  1060→      }
+  1061→      // Permission/security errors mean the dialog itself failed — fall
+  1062→      // through to the legacy input picker. Any other error (invalid file,
+  1063→      // bad JSON, validation failure, decompression limit) must propagate:
+  1064→      // silently reopening a second picker with no error shown just swallows
+  1065→      // the problem.
+  1066→      const fallbackErrNames = ['NotAllowedError', 'SecurityError', 'NotSupportedError', 'TypeError'];
+  1067→      if (!(err instanceof Error) || !fallbackErrNames.includes(err.name)) {
+  1068→        throw err;
+  1069→      }
+  1070→      console.warn('File System Access API open failed, falling back to input:', err);
+  1071→    }
+  1072→  }
+  1073→
+  1074→  // Fallback: use the legacy input element approach
+  1075→  const result = await loadProjectFromFile();
+  1076→  return {
+  1077→    ...result,
+  1078→    fileHandle: null,
+  1079→  };
+  1080→}
+  1081→

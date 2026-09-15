@@ -1,0 +1,902 @@
+     1→import { CanvasElement, TableProperties, RectangleProperties, EllipseProperties, ImageProperties, LineProperties, getRectRotation } from '@/lib/element-types';
+     2→import { hasCustomCorners, getRectCornerPoints } from '@/lib/rectangle-corners';
+     3→
+     4→export interface AlignmentGuide {
+     5→  orientation: 'horizontal' | 'vertical';
+     6→  position: number; // canvas coordinate where the guide line sits (border center)
+     7→  start: number; // extent start (perpendicular axis)
+     8→  end: number; // extent end (perpendicular axis)
+     9→}
+    10→
+    11→export interface SnapResult {
+    12→  snappedX: number;
+    13→  snappedY: number;
+    14→  guidelines: AlignmentGuide[];
+    15→}
+    16→
+    17→export interface ResizeSnapResult {
+    18→  snappedX: number;
+    19→  snappedY: number;
+    20→  snappedW: number;
+    21→  snappedH: number;
+    22→  guidelines: AlignmentGuide[];
+    23→}
+    24→
+    25→const SNAP_THRESHOLD = 5; // pixels
+    26→const VIEWPORT_CULLING_DISTANCE = 2000;
+    27→
+    28→// ── Snap cache for performance optimization ──────────────────────────────────
+    29→let snapCacheVersion = 0;
+    30→let lastProcessedVersion = -1;
+    31→let cachedFlattenedElements: CanvasElement[] = [];
+    32→let cachedOtherElementsRef: CanvasElement[] | null = null;
+    33→
+    34→/** Invalidate the snap cache. Call this when elements are added, removed, or restructured. */
+    35→export function invalidateSnapCache() {
+    36→  snapCacheVersion++;
+    37→  elementPositionsCache.clear();
+    38→  tableGridCache.clear();
+    39→}
+    40→
+    41→/**
+    42→ * Get flattened elements from cache if available, or compute and cache them.
+    43→ * Uses both version-based and reference-based invalidation.
+    44→ */
+    45→function getCachedFlattenedElements(otherElements: CanvasElement[]): CanvasElement[] {
+    46→  if (snapCacheVersion !== lastProcessedVersion || cachedOtherElementsRef !== otherElements) {
+    47→    cachedFlattenedElements = flattenElementsForSnap(otherElements);
+    48→    lastProcessedVersion = snapCacheVersion;
+    49→    cachedOtherElementsRef = otherElements;
+    50→  }
+    51→  return cachedFlattenedElements;
+    52→}
+    53→
+    54→// ── Position caches ──────────────────────────────────────────────────────────
+    55→const MAX_POSITIONS_CACHE = 500;
+    56→const elementPositionsCache = new Map<string, { left: number; right: number; top: number; bottom: number; centerX: number; centerY: number }>();
+    57→const tableGridCache = new Map<string, { colEdges: number[]; rowEdges: number[] }>();
+    58→
+    59→/**
+    60→ * Check if an element is within culling range of a reference bounding box.
+    61→ * Returns true if the element is close enough in at least one axis to potentially
+    62→ * provide snap targets.
+    63→ */
+    64→function isWithinCullingRange(
+    65→  el: CanvasElement,
+    66→  refX: number,
+    67→  refY: number,
+    68→  refW: number,
+    69→  refH: number
+    70→): boolean {
+    71→  const elRight = el.x + el.width;
+    72→  const elBottom = el.y + el.height;
+    73→  const refRight = refX + refW;
+    74→  const refBottom = refY + refH;
+    75→
+    76→  const dx = Math.max(0, Math.max(el.x, refX) - Math.min(elRight, refRight));
+    77→  const dy = Math.max(0, Math.max(el.y, refY) - Math.min(elBottom, refBottom));
+    78→
+    79→  // Keep if close in at least one axis (can provide snap targets in that axis)
+    80→  return dx <= VIEWPORT_CULLING_DISTANCE || dy <= VIEWPORT_CULLING_DISTANCE;
+    81→}
+    82→
+    83→/**
+    84→ * Flatten a list of elements so that group containers are expanded into
+    85→ * their individual children. Children are returned with ABSOLUTE canvas
+    86→ * positions (group.x + child.x, group.y + child.y).
+    87→ * Non-group elements are returned as-is.
+    88→ *
+    89→ * This ensures snap lines align with actual element edges, not group bounding boxes.
+    90→ */
+    91→export function flattenElementsForSnap(elements: CanvasElement[]): CanvasElement[] {
+    92→  const result: CanvasElement[] = [];
+    93→  for (const el of elements) {
+    94→    if (el.type === 'group' && el.children && el.children.length > 0) {
+    95→      // Expand group into its children with absolute positions
+    96→      for (const child of el.children) {
+    97→        if (!child.visible) continue;
+    98→        const absChild: CanvasElement = {
+    99→          ...child,
+   100→          x: el.x + child.x,
+   101→          y: el.y + child.y,
+   102→          // For line elements, also adjust endpoints to absolute coordinates
+   103→          ...(child.type === 'line' && child.lineStartX !== undefined ? {
+   104→            lineStartX: el.x + child.lineStartX,
+   105→            lineStartY: el.y + child.lineStartY!,
+   106→            lineEndX: el.x + child.lineEndX!,
+   107→            lineEndY: el.y + child.lineEndY!,
+   108→          } : {}),
+   109→        };
+   110→        // Recursively flatten if a child is also a group
+   111→        if (absChild.type === 'group' && absChild.children) {
+   112→          result.push(...flattenElementsForSnap([absChild]));
+   113→        } else {
+   114→          result.push(absChild);
+   115→        }
+   116→      }
+   117→    } else {
+   118→      result.push(el);
+   119→    }
+   120→  }
+   121→  return result;
+   122→}
+   123→
+   124→/**
+   125→ * Extract the internal column and row border positions of a table element.
+   126→ * These positions are in canvas coordinates and can be used as snap targets
+   127→ * so that other elements can align with table grid lines.
+   128→ */
+   129→function getTableGridPositions(el: CanvasElement): {
+   130→  colEdges: number[];  // vertical line X positions (canvas coords)
+   131→  rowEdges: number[];  // horizontal line Y positions (canvas coords)
+   132→} {
+   133→  if (el.type !== 'table') return { colEdges: [], rowEdges: [] };
+   134→
+   135→  const props = (el.properties as { type: 'table'; data: TableProperties }).data;
+   136→  const cw = props.colWidths ?? Array(props.cols ?? 0).fill(1);
+   137→  const rh = props.rowHeights ?? Array(props.rows ?? 0).fill(1);
+   138→
+   139→  // Check cache first — include colWidths/rowHeights in key so cache invalidates when they change
+   140→  const cacheKey = `${el.id}:${el.x},${el.y},${el.width},${el.height}:${cw.join(',')}:${rh.join(',')}`;
+   141→  const cached = tableGridCache.get(cacheKey);
+   142→  if (cached) return cached;
+   143→
+   144→  if (!props.showInnerBorders) {
+   145→    const result = { colEdges: [], rowEdges: [] };
+   146→    tableGridCache.set(cacheKey, result);
+   147→    return result;
+   148→  }
+   149→
+   150→  const cols = props.cols ?? 0;
+   151→  const rows = props.rows ?? 0;
+   152→  const totalW = el.width;
+   153→  const totalH = el.height;
+   154→
+   155→  const colEdges: number[] = [];
+   156→  const rowEdges: number[] = [];
+   157→
+   158→  // Use colWidths fractions for column edges
+   159→  if (cols > 1) {
+   160→    const totalColFr = cw.reduce((a: number, b: number) => a + b, 0);
+   161→    let cumX = 0;
+   162→    for (let c = 0; c < cols - 1; c++) {
+   163→      cumX += cw[c];
+   164→      colEdges.push(el.x + (cumX / totalColFr) * totalW);
+   165→    }
+   166→  }
+   167→
+   168→  // Use rowHeights fractions for row edges
+   169→  if (rows > 1) {
+   170→    const totalRowFr = rh.reduce((a: number, b: number) => a + b, 0);
+   171→    let cumY = 0;
+   172→    for (let r = 0; r < rows - 1; r++) {
+   173→      cumY += rh[r];
+   174→      rowEdges.push(el.y + (cumY / totalRowFr) * totalH);
+   175→    }
+   176→  }
+   177→
+   178→  const result = { colEdges, rowEdges };
+   179→  if (tableGridCache.size < MAX_POSITIONS_CACHE) {
+   180→    tableGridCache.set(cacheKey, result);
+   181→  }
+   182→  return result;
+   183→}
+   184→
+   185→/**
+   186→ * Check if a given X position matches any edge or table column border of an element.
+   187→ * Used for determining guideline extents.
+   188→ */
+   189→function matchesXPosition(el: CanvasElement, pos: number): boolean {
+   190→  const op = getElementPositions(el);
+   191→  if (Math.abs(op.left - pos) < 0.5 ||
+   192→      Math.abs(op.right - pos) < 0.5 ||
+   193→      Math.abs(op.centerX - pos) < 0.5) {
+   194→    return true;
+   195→  }
+   196→  // Check deformed rectangle corner points (inner corners are not on the bbox)
+   197→  if (hasCustomCorners(el)) {
+   198→    const corners = getRectCornerPoints(el);
+   199→    if (corners.some(c => Math.abs(c.x - pos) < 0.5)) return true;
+   200→  }
+   201→  // Check table column borders
+   202→  const grid = getTableGridPositions(el);
+   203→  return grid.colEdges.some(edge => Math.abs(edge - pos) < 0.5);
+   204→}
+   205→
+   206→/**
+   207→ * Check if a given Y position matches any edge or table row border of an element.
+   208→ * Used for determining guideline extents.
+   209→ */
+   210→function matchesYPosition(el: CanvasElement, pos: number): boolean {
+   211→  const op = getElementPositions(el);
+   212→  if (Math.abs(op.top - pos) < 0.5 ||
+   213→      Math.abs(op.bottom - pos) < 0.5 ||
+   214→      Math.abs(op.centerY - pos) < 0.5) {
+   215→    return true;
+   216→  }
+   217→  // Check deformed rectangle corner points (inner corners are not on the bbox)
+   218→  if (hasCustomCorners(el)) {
+   219→    const corners = getRectCornerPoints(el);
+   220→    if (corners.some(c => Math.abs(c.y - pos) < 0.5)) return true;
+   221→  }
+   222→  // Check table row borders
+   223→  const grid = getTableGridPositions(el);
+   224→  return grid.rowEdges.some(edge => Math.abs(edge - pos) < 0.5);
+   225→}
+   226→
+   227→/**
+   228→ * Extract the effective border/stroke width from an element.
+   229→ * Elements with box-sizing: border-box render their borders INSIDE the
+   230→ * bounding box, so the visual border center is offset inward by half the
+   231→ * border width. This function returns the border width so snapping can
+   232→ * account for it.
+   233→ */
+   234→export function getElementBorderWidth(el: CanvasElement): number {
+   235→  try {
+   236→    switch (el.type) {
+   237→      case 'rectangle': {
+   238→        const props = (el.properties as { type: 'rectangle'; data: RectangleProperties }).data;
+   239→        return props.borderWidth ?? 0;
+   240→      }
+   241→      case 'ellipse': {
+   242→        const props = (el.properties as { type: 'ellipse'; data: EllipseProperties }).data;
+   243→        return props.borderWidth ?? 0;
+   244→      }
+   245→      case 'image': {
+   246→        const props = (el.properties as { type: 'image'; data: ImageProperties }).data;
+   247→        return props.borderWidth ?? 0;
+   248→      }
+   249→      case 'table': {
+   250→        const props = (el.properties as { type: 'table'; data: TableProperties }).data;
+   251→        return props.borderWidth ?? 0;
+   252→      }
+   253→      case 'line': {
+   254→        const props = (el.properties as { type: 'line'; data: LineProperties }).data;
+   255→        // For lines, the stroke is centered on the path, so the visual
+   256→        // edge aligns with the bounding box edge already when strokeWidth
+   257→        // is accounted for via endpoint-based positions.
+   258→        return 0;
+   259→      }
+   260→      default:
+   261→        return 0;
+   262→    }
+   263→  } catch {
+   264→    return 0;
+   265→  }
+   266→}
+   267→
+   268→/**
+   269→ * Adjust a guide line position from bounding-box edge to the visual center
+   270→ * of the element's border. With box-sizing: border-box, the border is inside
+   271→ * the bounding box, so the border center is offset inward by half the border width.
+   272→ *
+   273→ * For left/top edges: border center = boundingBoxEdge + halfBw
+   274→ * For right/bottom edges: border center = boundingBoxEdge - halfBw
+   275→ * For center edges: no adjustment needed
+   276→ */
+   277→function adjustGuidePositionToBorderCenter(
+   278→  guidePosition: number,
+   279→  matchedEdge: string | undefined,
+   280→  targetElement: CanvasElement
+   281→): number {
+   282→  if (!matchedEdge) return guidePosition;
+   283→  const bw = getElementBorderWidth(targetElement);
+   284→  return adjustGuidePositionByBorderWidth(guidePosition, matchedEdge, bw);
+   285→}
+   286→
+   287→/**
+   288→ * Adjust a guide line position by a given border width.
+   289→ * Used when the primary element's border width is known (e.g., from the borderWidth parameter)
+   290→ * rather than derived from a CanvasElement object.
+   291→ */
+   292→function adjustGuidePositionByBorderWidth(
+   293→  guidePosition: number,
+   294→  matchedEdge: string | undefined,
+   295→  borderWidth: number
+   296→): number {
+   297→  if (!matchedEdge || borderWidth === 0) return guidePosition;
+   298→  const halfBw = borderWidth / 2;
+   299→
+   300→  switch (matchedEdge) {
+   301→    case 'left':
+   302→      return guidePosition + halfBw;
+   303→    case 'right':
+   304→      return guidePosition - halfBw;
+   305→    case 'top':
+   306→      return guidePosition + halfBw;
+   307→    case 'bottom':
+   308→      return guidePosition - halfBw;
+   309→    default:
+   310→      // centerX, centerY, tableColEdge, tableRowEdge — no adjustment
+   311→      return guidePosition;
+   312→  }
+   313→}
+   314→
+   315→/**
+   316→ * Compute the guide line position adjusted for BOTH the primary element's and
+   317→ * the target element's border widths. The final position is the average of
+   318→ * both border center positions, so the line appears visually "between" both
+   319→ * borders — i.e., in the middle of each element's border when they have the
+   320→ * same border width, or a reasonable compromise when they differ.
+   321→ *
+   322→ * @param guidePosition  The bounding-box position where the two edges align
+   323→ * @param currentEdge    Which edge of the primary (moving/resizing) element matched
+   324→ * @param primaryBw      Border width of the primary element
+   325→ * @param matchedEdge    Which edge of the target element matched
+   326→ * @param targetElement  The target element (or undefined if none)
+   327→ */
+   328→function adjustGuidePositionForBothBorders(
+   329→  guidePosition: number,
+   330→  currentEdge: string | undefined,
+   331→  primaryBw: number,
+   332→  matchedEdge: string | undefined,
+   333→  targetElement: CanvasElement | undefined
+   334→): number {
+   335→  const primaryAdjusted = adjustGuidePositionByBorderWidth(guidePosition, currentEdge, primaryBw);
+   336→  if (!targetElement) return primaryAdjusted;
+   337→  const targetBw = getElementBorderWidth(targetElement);
+   338→  if (targetBw === 0) return primaryAdjusted;
+   339→  const targetAdjusted = adjustGuidePositionToBorderCenter(guidePosition, matchedEdge, targetElement);
+   340→  // Average both adjusted positions so the line sits between both border centers
+   341→  return (primaryAdjusted + targetAdjusted) / 2;
+   342→}
+   343→
+   344→/**
+   345→ * Get the key positions of an element for alignment.
+   346→ * For line elements, uses the actual endpoint coordinates so that
+   347→ * alignment lines appear at the line's visual center (midpoint of endpoints)
+   348→ * rather than the thin bounding box center.
+   349→ *
+   350→ * All positions are in bounding-box coordinates (el.x, el.x + el.width, etc.)
+   351→ * which correspond to the outer edge of the element's border. This ensures
+   352→ * that snapping two elements to the same position makes their borders
+   353→ * overlap perfectly (pixel-perfect alignment).
+   354→ *
+   355→ * Guide lines are later adjusted to the visual border center for display
+   356→ * (see adjustGuidePositionToBorderCenter).
+   357→ */
+   358→function getElementPositions(el: CanvasElement) {
+   359→  // Build cache key from element ID + position. For rectangles, include the
+   360→  // rotation so the cache invalidates when only the rotation changes (x/y/w/h
+   361→  // can stay constant while the visual extents move with rotation).
+   362→  let cacheKey: string;
+   363→  if (el.type === 'line' && el.lineStartX !== undefined && el.lineStartY !== undefined &&
+   364→      el.lineEndX !== undefined && el.lineEndY !== undefined) {
+   365→    cacheKey = `${el.id}:l:${el.lineStartX},${el.lineStartY},${el.lineEndX},${el.lineEndY}`;
+   366→  } else {
+   367→    const rot = el.type === 'rectangle' ? getRectRotation(el) : 0;
+   368→    cacheKey = `${el.id}:${el.x},${el.y},${el.width},${el.height}:r${rot}`;
+   369→  }
+   370→
+   371→  const cached = elementPositionsCache.get(cacheKey);
+   372→  if (cached) return cached;
+   373→
+   374→  let result: { left: number; right: number; top: number; bottom: number; centerX: number; centerY: number };
+   375→
+   376→  // For line elements, compute positions from actual endpoints
+   377→  if (el.type === 'line' && el.lineStartX !== undefined && el.lineStartY !== undefined &&
+   378→      el.lineEndX !== undefined && el.lineEndY !== undefined) {
+   379→    const left = Math.min(el.lineStartX, el.lineEndX);
+   380→    const right = Math.max(el.lineStartX, el.lineEndX);
+   381→    const top = Math.min(el.lineStartY, el.lineEndY);
+   382→    const bottom = Math.max(el.lineStartY, el.lineEndY);
+   383→    result = {
+   384→      left,
+   385→      right,
+   386→      top,
+   387→      bottom,
+   388→      centerX: (el.lineStartX + el.lineEndX) / 2,
+   389→      centerY: (el.lineStartY + el.lineEndY) / 2,
+   390→    };
+   391→  } else {
+   392→    // For rectangles, use the rotation-aware screen-space extents so the
+   393→    // axis-aligned snap engine draws guide lines at the rotated rectangle's
+   394→    // TRUE visual edges (and two rotated rectangles can align along X/Y).
+   395→    const rotated = getRotatedScreenExtents(el);
+   396→    if (rotated) {
+   397→      result = rotated;
+   398→    } else {
+   399→      result = {
+   400→        left: el.x,
+   401→        right: el.x + el.width,
+   402→        top: el.y,
+   403→        bottom: el.y + el.height,
+   404→        centerX: el.x + el.width / 2,
+   405→        centerY: el.y + el.height / 2,
+   406→      };
+   407→    }
+   408→  }
+   409→
+   410→  if (elementPositionsCache.size >= MAX_POSITIONS_CACHE) {
+   411→    elementPositionsCache.clear();
+   412→  }
+   413→  elementPositionsCache.set(cacheKey, result);
+   414→  return result;
+   415→}
+   416→
+   417→interface SnapMatch {
+   418→  diff: number;       // how far from snap position
+   419→  guidePosition: number; // where to draw the guide line (bounding-box position)
+   420→  matchedOtherPos: number; // the position on the other element we matched
+   421→  matchedEdge?: 'left' | 'right' | 'top' | 'bottom' | 'centerX' | 'centerY'; // which edge of the TARGET matched
+   422→  currentEdge?: 'left' | 'right' | 'top' | 'bottom' | 'centerX' | 'centerY'; // which edge of the CURRENT (primary) element matched
+   423→}
+   424→
+   425→/**
+   426→ * Find the best snap for a set of current positions against a set of target positions.
+   427→ */
+   428→function findBestSnap(
+   429→  currentPositions: { value: number; name: string }[],
+   430→  targetPositions: { value: number; name: string }[]
+   431→): SnapMatch | null {
+   432→  let best: SnapMatch | null = null;
+   433→
+   434→  for (const curr of currentPositions) {
+   435→    for (const target of targetPositions) {
+   436→      const diff = curr.value - target.value;
+   437→      if (Math.abs(diff) <= SNAP_THRESHOLD) {
+   438→        if (!best || Math.abs(diff) < Math.abs(best.diff)) {
+   439→          best = { diff, guidePosition: target.value, matchedOtherPos: target.value, matchedEdge: target.name as SnapMatch['matchedEdge'], currentEdge: curr.name as SnapMatch['currentEdge'] };
+   440→          // Early exit: perfect snap found (distance === 0)
+   441→          if (diff === 0) return best;
+   442→        }
+   443→      }
+   444→    }
+   445→  }
+   446→
+   447→  return best;
+   448→}
+   449→
+   450→/**
+   451→ * Find ALL snap matches (not just the best one) for guideline display.
+   452→ * Returns one match per unique target position that is within snap threshold.
+   453→ */
+   454→function findAllSnaps(
+   455→  currentPositions: { value: number; name: string }[],
+   456→  targetPositions: { value: number; name: string }[]
+   457→): SnapMatch[] {
+   458→  const results: SnapMatch[] = [];
+   459→  const seenTargets = new Set<number>();
+   460→
+   461→  for (const curr of currentPositions) {
+   462→    for (const target of targetPositions) {
+   463→      const diff = curr.value - target.value;
+   464→      if (Math.abs(diff) <= SNAP_THRESHOLD) {
+   465→        // Round to avoid floating-point duplicate keys
+   466→        const key = Math.round(target.value * 100);
+   467→        if (!seenTargets.has(key)) {
+   468→          seenTargets.add(key);
+   469→          results.push({ diff, guidePosition: target.value, matchedOtherPos: target.value, matchedEdge: target.name as SnapMatch['matchedEdge'], currentEdge: curr.name as SnapMatch['currentEdge'] });
+   470→        }
+   471→      }
+   472→    }
+   473→  }
+   474→
+   475→  return results;
+   476→}
+   477→
+   478→/**
+   479→ * Get all snap-relevant positions for an element.
+   480→ * For groups, this returns the positions of each visible child (in absolute coords),
+   481→ * so that snap lines appear at the actual element edges, not the bounding box.
+   482→ * For non-group elements, returns the standard positions.
+   483→ */
+   484→function getElementSnapPositions(el: CanvasElement): { left: number; right: number; top: number; bottom: number; centerX: number; centerY: number }[] {
+   485→  if (el.type === 'group' && el.children && el.children.length > 0) {
+   486→    // Return positions for each visible child with absolute coordinates
+   487→    return el.children
+   488→      .filter(c => c.visible)
+   489→      .map(c => getElementPositions({
+   490→        ...c,
+   491→        x: el.x + c.x,
+   492→        y: el.y + c.y,
+   493→        // Adjust line endpoints to absolute
+   494→        ...(c.type === 'line' && c.lineStartX !== undefined ? {
+   495→          lineStartX: el.x + c.lineStartX,
+   496→          lineStartY: el.y + c.lineStartY!,
+   497→          lineEndX: el.x + c.lineEndX!,
+   498→          lineEndY: el.y + c.lineEndY!,
+   499→        } : {}),
+   500→      }));
+   501→  }
+   502→  const positions = [getElementPositions(el)];
+   503→  // For deformed rectangles, also include each corner point as a snap
+   504→  // position. Without this, only the bbox edges (the furthest corner points)
+   505→  // generate alignment lines — inner (deformed-inward) corners are invisible
+   506→  // to snapping. Each corner contributes its X (for vertical lines) and Y
+   507→  // (for horizontal lines) as snap positions.
+   508→  if (hasCustomCorners(el)) {
+   509→    const corners = getRectCornerPoints(el);
+   510→    for (const c of corners) {
+   511→      positions.push({
+   512→        left: c.x,
+   513→        right: c.x,
+   514→        top: c.y,
+   515→        bottom: c.y,
+   516→        centerX: c.x,
+   517→        centerY: c.y,
+   518→      });
+   519→    }
+   520→  }
+   521→  return positions;
+   522→}
+   523→
+   524→// ── Rotated-rectangle alignment (vertical & horizontal only) ────────────────
+   525→//
+   526→// Alignment guide lines are ONLY ever vertical or horizontal — but for a
+   527→// ROTATED rectangle the unrotated bounding box (el.x/el.y/el.width/el.height)
+   528→// does NOT match what the user sees. The renderer rotates the rectangle around
+   529→// its center (`transform-origin: center`), so its visible left/right/top/bottom
+   530→// extremities are the min/max X/Y of the rotated corners, not the bbox edges.
+   531→//
+   532→// `getRotatedScreenExtents` computes those screen-space extents so the existing
+   533→// axis-aligned snap engine (findAllSnaps on left/right/centerX/top/bottom/
+   534→// centerY) draws guide lines at the rotated rectangle's true visual edges and
+   535→// lets two rotated rectangles align to each other along the X or Y axis. No
+   536→// angled guide lines are produced — alignment is strictly vertical/horizontal.
+   537→
+   538→/**
+   539→ * Compute the screen-space (visual) extents of a rectangle element, accounting
+   540→ * for its rotation. Returns null for non-rectangles and unrotated rectangles so
+   541→ * the caller can fall back to the plain bbox.
+   542→ *
+   543→ * The 4 corners are rotated around the bbox center. left/right = min/max X of
+   544→ * the rotated corners; top/bottom = min/max Y; centerX/centerY = the bbox
+   545→ * center (which is the rotation pivot and therefore invariant under rotation).
+   546→ * For a rectangle with custom (deformed) corner points, those stored corners
+   547→ * are rotated the same way the renderer rotates them.
+   548→ */
+   549→function getRotatedScreenExtents(el: CanvasElement): {
+   550→  left: number; right: number; top: number; bottom: number; centerX: number; centerY: number;
+   551→} | null {
+   552→  if (el.type !== 'rectangle') return null;
+   553→  const rot = getRectRotation(el);
+   554→  if (rot === 0) return null; // unrotated → caller uses the plain bbox
+   555→  const cx = el.x + el.width / 2;
+   556→  const cy = el.y + el.height / 2;
+   557→  const theta = (rot * Math.PI) / 180;
+   558→  const cos = Math.cos(theta);
+   559→  const sin = Math.sin(theta);
+   560→
+   561→  // Source corners in absolute (unrotated) canvas coords.
+   562→  const src = hasCustomCorners(el)
+   563→    ? getRectCornerPoints(el)
+   564→    : [
+   565→        { x: el.x, y: el.y },                            // TL
+   566→        { x: el.x + el.width, y: el.y },                 // TR
+   567→        { x: el.x + el.width, y: el.y + el.height },     // BR
+   568→        { x: el.x, y: el.y + el.height },                // BL
+   569→      ];
+   570→
+   571→  // Rotate each corner around the bbox center → screen space.
+   572→  const rotated = src.map((p) => {
+   573→    const ox = p.x - cx;
+   574→    const oy = p.y - cy;
+   575→    return { x: cx + ox * cos - oy * sin, y: cy + ox * sin + oy * cos };
+   576→  });
+   577→
+   578→  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+   579→  for (const p of rotated) {
+   580→    if (p.x < minX) minX = p.x;
+   581→    if (p.x > maxX) maxX = p.x;
+   582→    if (p.y < minY) minY = p.y;
+   583→    if (p.y > maxY) maxY = p.y;
+   584→  }
+   585→
+   586→  return {
+   587→    left: minX,
+   588→    right: maxX,
+   589→    top: minY,
+   590→    bottom: maxY,
+   591→    centerX: cx,
+   592→    centerY: cy,
+   593→  };
+   594→}
+   595→
+   596→/**
+   597→ * Calculate snap position and alignment guidelines when moving an element.
+   598→ * Includes page center snapping for guideline display.
+   599→ * For group elements, considers individual child edges for snapping.
+   600→ */
+   601→export function calculateSnap(
+   602→  element: CanvasElement,
+   603→  otherElements: CanvasElement[],
+   604→  snapToElements: boolean,
+   605→  snapToGrid: boolean,
+   606→  snapUnit: number,
+   607→  pageWidth: number,
+   608→  pageHeight: number,
+   609→  marginTop: number = 0,
+   610→  marginBottom: number = 0,
+   611→  marginLeft: number = 0,
+   612→  marginRight: number = 0,
+   613→  primaryBorderWidth?: number
+   614→): SnapResult {
+   615→  // For groups, collect positions from all children; for others, use the element itself
+   616→  const allCurrentPositions = getElementSnapPositions(element);
+   617→  // Also keep the bounding box position for page center / margin snapping
+   618→  const current = getElementPositions(element);
+   619→  let snappedX = element.x;
+   620→  let snappedY = element.y;
+   621→  const guidelines: AlignmentGuide[] = [];
+   622→
+   623→  // === Page center snapping (always active when snapping is enabled) ===
+   624→  const pageCenterX = pageWidth / 2;
+   625→  const pageCenterY = pageHeight / 2;
+   626→
+   627→  // Check if element center aligns with page center X
+   628→  const centerXDiff = current.centerX - pageCenterX;
+   629→  if (Math.abs(centerXDiff) <= SNAP_THRESHOLD) {
+   630→    snappedX = element.x - centerXDiff;
+   631→    guidelines.push({
+   632→      orientation: 'vertical',
+   633→      position: pageCenterX,
+   634→      start: 0,
+   635→      end: pageHeight,
+   636→    });
+   637→  }
+   638→
+   639→  // Check if element center aligns with page center Y
+   640→  const centerYDiff = current.centerY - pageCenterY;
+   641→  if (Math.abs(centerYDiff) <= SNAP_THRESHOLD) {
+   642→    snappedY = element.y - centerYDiff;
+   643→    guidelines.push({
+   644→      orientation: 'horizontal',
+   645→      position: pageCenterY,
+   646→      start: 0,
+   647→      end: pageWidth,
+   648→    });
+   649→  }
+   650→
+   651→  // === Margin line snapping (always active when snapping is enabled) ===
+   652→  const marginPositions = {
+   653→    left: marginLeft,
+   654→    right: pageWidth - marginRight,
+   655→    top: marginTop,
+   656→    bottom: pageHeight - marginBottom,
+   657→  };
+   658→
+   659→  // X-axis margin snapping: check element left, right, centerX against left/right margin lines
+   660→  const marginXTargets = [
+   661→    { value: marginPositions.left, name: 'marginLeft' },
+   662→    { value: marginPositions.right, name: 'marginRight' },
+   663→  ];
+   664→  const marginCurrentXPositions = [
+   665→    { value: current.left, name: 'left' },
+   666→    { value: current.right, name: 'right' },
+   667→    { value: current.centerX, name: 'centerX' },
+   668→  ];
+   669→  const marginXSnap = findBestSnap(marginCurrentXPositions, marginXTargets);
+   670→  if (marginXSnap) {
+   671→    // Track best X adjustment so far (page center already set snappedX)
+   672→    const currentXDiff = snappedX - element.x; // adjustment already applied
+   673→    const marginXDiff = -marginXSnap.diff;       // adjustment margin wants to apply
+   674→    if (Math.abs(marginXDiff) < Math.abs(currentXDiff) || currentXDiff === 0) {
+   675→      snappedX = element.x + marginXDiff;
+   676→      // Remove page center X guideline if margin snap is closer
+   677→      const pcIdx = guidelines.findIndex(g => g.orientation === 'vertical' && g.position === pageCenterX);
+   678→      if (pcIdx !== -1) guidelines.splice(pcIdx, 1);
+   679→    }
+   680→    guidelines.push({
+   681→      orientation: 'vertical',
+   682→      position: marginXSnap.guidePosition,
+   683→      start: 0,
+   684→      end: pageHeight,
+   685→    });
+   686→  }
+   687→
+   688→  // Y-axis margin snapping: check element top, bottom, centerY against top/bottom margin lines
+   689→  const marginYTargets = [
+   690→    { value: marginPositions.top, name: 'marginTop' },
+   691→    { value: marginPositions.bottom, name: 'marginBottom' },
+   692→  ];
+   693→  const marginCurrentYPositions = [
+   694→    { value: current.top, name: 'top' },
+   695→    { value: current.bottom, name: 'bottom' },
+   696→    { value: current.centerY, name: 'centerY' },
+   697→  ];
+   698→  const marginYSnap = findBestSnap(marginCurrentYPositions, marginYTargets);
+   699→  if (marginYSnap) {
+   700→    const currentYDiff = snappedY - element.y;
+   701→    const marginYDiff = -marginYSnap.diff;
+   702→    if (Math.abs(marginYDiff) < Math.abs(currentYDiff) || currentYDiff === 0) {
+   703→      snappedY = element.y + marginYDiff;
+   704→      const pcIdx = guidelines.findIndex(g => g.orientation === 'horizontal' && g.position === pageCenterY);
+   705→      if (pcIdx !== -1) guidelines.splice(pcIdx, 1);
+   706→    }
+   707→    guidelines.push({
+   708→      orientation: 'horizontal',
+   709→      position: marginYSnap.guidePosition,
+   710→      start: 0,
+   711→      end: pageWidth,
+   712→    });
+   713→  }
+   714→
+   715→  // === Element snapping ===
+   716→  if (snapToElements) {
+   717→    // Flatten groups into their children so snap lines align with actual
+   718→    // element edges, not group bounding boxes (cached for performance)
+   719→    const flatOthers = getCachedFlattenedElements(otherElements);
+   720→    const excludedIds = new Set<string>([element.id]);
+   721→    const visibleOthers = flatOthers.filter(
+   722→      (o) => o.visible && !excludedIds.has(o.id) && isWithinCullingRange(o, element.x, element.y, element.width, element.height)
+   723→    );
+   724→
+   725→    if (visibleOthers.length > 0) {
+   726→      // Collect all target positions from other elements
+   727→      const targetXPositions: { value: number; name: string }[] = [];
+   728→      const targetYPositions: { value: number; name: string }[] = [];
+   729→
+   730→      for (const other of visibleOthers) {
+   731→        const op = getElementPositions(other);
+   732→        targetXPositions.push(
+   733→          { value: op.left, name: 'left' },
+   734→          { value: op.right, name: 'right' },
+   735→          { value: op.centerX, name: 'centerX' }
+   736→        );
+   737→        targetYPositions.push(
+   738→          { value: op.top, name: 'top' },
+   739→          { value: op.bottom, name: 'bottom' },
+   740→          { value: op.centerY, name: 'centerY' }
+   741→        );
+   742→        // Add deformed rectangle corner points as snap targets so that a
+   743→        // dragged element can align to an inner (deformed-inward) corner of
+   744→        // another deformed rectangle, not just its bbox edges.
+   745→        if (hasCustomCorners(other)) {
+   746→          const corners = getRectCornerPoints(other);
+   747→          for (const c of corners) {
+   748→            targetXPositions.push({ value: c.x, name: 'corner' });
+   749→            targetYPositions.push({ value: c.y, name: 'corner' });
+   750→          }
+   751→        }
+   752→        // Add table internal grid line positions as snap targets
+   753→        const grid = getTableGridPositions(other);
+   754→        for (const colEdge of grid.colEdges) {
+   755→          targetXPositions.push({ value: colEdge, name: 'tableColEdge' });
+   756→        }
+   757→        for (const rowEdge of grid.rowEdges) {
+   758→          targetYPositions.push({ value: rowEdge, name: 'tableRowEdge' });
+   759→        }
+   760→      }
+   761→
+   762→      // Current element's X-axis positions (use all children positions for groups)
+   763→      const currentXPositions: { value: number; name: string }[] = [];
+   764→      const currentYPositions: { value: number; name: string }[] = [];
+   765→      for (const pos of allCurrentPositions) {
+   766→        currentXPositions.push(
+   767→          { value: pos.left, name: 'left' },
+   768→          { value: pos.right, name: 'right' },
+   769→          { value: pos.centerX, name: 'centerX' }
+   770→        );
+   771→        currentYPositions.push(
+   772→          { value: pos.top, name: 'top' },
+   773→          { value: pos.bottom, name: 'bottom' },
+   774→          { value: pos.centerY, name: 'centerY' }
+   775→        );
+   776→      }
+   777→
+   778→      // Find ALL X-axis alignments (not just the best one) so a guide line
+   779→      // appears for every edge that aligns — e.g. when both the left and right
+   780→      // edges of the dragged element line up with target edges simultaneously.
+   781→      const xSnaps = findAllSnaps(currentXPositions, targetXPositions);
+   782→      if (xSnaps.length > 0) {
+   783→        // The BEST snap (smallest |diff|) drives the position adjustment;
+   784→        // every matching snap still gets its own guide line below.
+   785→        const xSnap = xSnaps.reduce((a, b) => (Math.abs(a.diff) <= Math.abs(b.diff) ? a : b));
+   786→        const elemXDiff = -xSnap.diff;
+   787→        const currentXDiff = snappedX - element.x;
+   788→        // Element snap overrides if it's closer than the current best (page center or margin)
+   789→        if (Math.abs(elemXDiff) <= Math.abs(currentXDiff) || currentXDiff === 0) {
+   790→          snappedX = element.x + elemXDiff;
+   791→          // Bug #6 fix: Remove page center or margin X guideline if element snap is closer.
+   792→          // Be specific: match both orientation AND position (within 1px tolerance) to
+   793→          // avoid accidentally removing the wrong guideline when both vertical and
+   794→          // horizontal page-center/margin guidelines exist.
+   795→          const existingIdx = guidelines.findIndex(g =>
+   796→            g.orientation === 'vertical' && Math.abs(g.position - (element.x + currentXDiff)) < 1
+   797→          );
+   798→          if (existingIdx !== -1 && Math.abs(elemXDiff) < Math.abs(currentXDiff)) {
+   799→            guidelines.splice(existingIdx, 1);
+   800→          }
+   801→        }
+   802→        // Push a vertical guideline for EVERY matching X alignment (dedup by
+   803→        // position so two snaps at the same coordinate don't draw twice).
+   804→        const primaryPos = getElementPositions(element);
+   805→        const primaryBw = primaryBorderWidth ?? getElementBorderWidth(element);
+   806→        const existingVerticalPositions = new Set(
+   807→          guidelines.filter((g) => g.orientation === 'vertical').map((g) => Math.round(g.position * 100))
+   808→        );
+   809→        for (const xs of xSnaps) {
+   810→          const matchedOthers = visibleOthers.filter((o) => matchesXPosition(o, xs.matchedOtherPos));
+   811→          const guidePos = adjustGuidePositionForBothBorders(
+   812→            xs.guidePosition, xs.currentEdge, primaryBw,
+   813→            xs.matchedEdge, matchedOthers.length > 0 ? matchedOthers[0] : undefined
+   814→          );
+   815→          const posKey = Math.round(guidePos * 100);
+   816→          if (existingVerticalPositions.has(posKey)) continue;
+   817→          // Use rotation-aware extents so the guide line spans the visual
+   818→          // tops/bottoms of rotated rectangles rather than their unrotated bbox.
+   819→          const startY = Math.min(primaryPos.top, ...matchedOthers.map((o) => getElementPositions(o).top));
+   820→          const endY = Math.max(primaryPos.bottom, ...matchedOthers.map((o) => getElementPositions(o).bottom));
+   821→          guidelines.push({
+   822→            orientation: 'vertical',
+   823→            position: guidePos,
+   824→            start: startY,
+   825→            end: endY,
+   826→          });
+   827→          existingVerticalPositions.add(posKey);
+   828→        }
+   829→      }
+   830→
+   831→      // Find ALL Y-axis alignments (not just the best one) so a guide line
+   832→      // appears for every edge that aligns — e.g. when both the top and bottom
+   833→      // edges of the dragged element line up with target edges simultaneously.
+   834→      const ySnaps = findAllSnaps(currentYPositions, targetYPositions);
+   835→      if (ySnaps.length > 0) {
+   836→        // The BEST snap (smallest |diff|) drives the position adjustment;
+   837→        // every matching snap still gets its own guide line below.
+   838→        const ySnap = ySnaps.reduce((a, b) => (Math.abs(a.diff) <= Math.abs(b.diff) ? a : b));
+   839→        const elemYDiff = -ySnap.diff;
+   840→        const currentYDiff = snappedY - element.y;
+   841→        // Element snap overrides if it's closer than the current best (page center or margin)
+   842→        if (Math.abs(elemYDiff) <= Math.abs(currentYDiff) || currentYDiff === 0) {
+   843→          snappedY = element.y + elemYDiff;
+   844→          // Bug #6 fix: Remove page center or margin Y guideline if element snap is closer.
+   845→          // Be specific: match both orientation AND position (within 1px tolerance) to
+   846→          // avoid accidentally removing the wrong guideline when both vertical and
+   847→          // horizontal page-center/margin guidelines exist.
+   848→          const existingIdx = guidelines.findIndex(g =>
+   849→            g.orientation === 'horizontal' && Math.abs(g.position - (element.y + currentYDiff)) < 1
+   850→          );
+   851→          if (existingIdx !== -1 && Math.abs(elemYDiff) < Math.abs(currentYDiff)) {
+   852→            guidelines.splice(existingIdx, 1);
+   853→          }
+   854→        }
+   855→        // Push a horizontal guideline for EVERY matching Y alignment (dedup by
+   856→        // position so two snaps at the same coordinate don't draw twice).
+   857→        const primaryPos = getElementPositions(element);
+   858→        const primaryBw = primaryBorderWidth ?? getElementBorderWidth(element);
+   859→        const existingHorizontalPositions = new Set(
+   860→          guidelines.filter((g) => g.orientation === 'horizontal').map((g) => Math.round(g.position * 100))
+   861→        );
+   862→        for (const ys of ySnaps) {
+   863→          const matchedOthers = visibleOthers.filter((o) => matchesYPosition(o, ys.matchedOtherPos));
+   864→          const guidePos = adjustGuidePositionForBothBorders(
+   865→            ys.guidePosition, ys.currentEdge, primaryBw,
+   866→            ys.matchedEdge, matchedOthers.length > 0 ? matchedOthers[0] : undefined
+   867→          );
+   868→          const posKey = Math.round(guidePos * 100);
+   869→          if (existingHorizontalPositions.has(posKey)) continue;
+   870→          // Use rotation-aware extents so the guide line spans the visual
+   871→          // lefts/rights of rotated rectangles rather than their unrotated bbox.
+   872→          const startX = Math.min(primaryPos.left, ...matchedOthers.map((o) => getElementPositions(o).left));
+   873→          const endX = Math.max(primaryPos.right, ...matchedOthers.map((o) => getElementPositions(o).right));
+   874→          guidelines.push({
+   875→            orientation: 'horizontal',
+   876→            position: guidePos,
+   877→            start: startX,
+   878→            end: endX,
+   879→          });
+   880→          existingHorizontalPositions.add(posKey);
+   881→        }
+   882→      }
+   883→    }
+   884→  }
+   885→
+   886→  // === Grid snapping ===
+   887→  if (snapToGrid && snapUnit > 0) {
+   888→    const gridSnappedX = Math.round(snappedX / snapUnit) * snapUnit;
+   889→    const gridSnappedY = Math.round(snappedY / snapUnit) * snapUnit;
+   890→
+   891→    if (Math.abs(gridSnappedX - snappedX) <= SNAP_THRESHOLD) {
+   892→      snappedX = gridSnappedX;
+   893→    }
+   894→    if (Math.abs(gridSnappedY - snappedY) <= SNAP_THRESHOLD) {
+   895→      snappedY = gridSnappedY;
+   896→    }
+   897→  }
+   898→
+   899→  return { snappedX, snappedY, guidelines };
+   900→}
+
+[showing lines 1-900 of 1807; use offset=901 with limit to continue reading]

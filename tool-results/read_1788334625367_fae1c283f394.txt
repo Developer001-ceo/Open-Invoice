@@ -1,0 +1,702 @@
+     1→'use client';
+     2→
+     3→import { useDesignerStore } from '@/store/designer-store';
+     4→import { CanvasElement, TextProperties, TableProperties, ImageProperties, LineProperties, RectangleProperties, EllipseProperties, RectangleEffects, GradientFill, ShadowEffect, ReflectionEffect, GlowEffect, GradientStop, CellOverride, computeLineBounds, DEFAULT_EFFECTS, DEFAULT_GRADIENT_FILL, DEFAULT_SHADOW, DEFAULT_REFLECTION, DEFAULT_GLOW, GRADIENT_PRESETS, buildGradientCSS, normalizeRectBorderRadius, getRectRotation, normalizeAngle } from '@/lib/element-types';
+     5→import { hasCustomCorners } from '@/lib/rectangle-corners';
+     6→import { ensureColWidths, ensureRowHeights, ensureRowNames, ensureColNames } from '@/lib/table-helpers';
+     7→import { Input } from '@/components/ui/input';
+     8→import { Label } from '@/components/ui/label';
+     9→import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue, SelectGroup, SelectLabel } from '@/components/ui/select';
+    10→import { Button } from '@/components/ui/button';
+    11→import { NumericField } from '@/components/ui/numeric-field';
+    12→import { SliderField } from '@/components/ui/slider-field';
+    13→import { ScrollArea } from '@/components/ui/scroll-area';
+    14→import { GradientStopBar } from '@/components/designer/gradient-stop-bar';
+    15→import { DraggableReorderList, ReorderItem } from '@/components/designer/draggable-reorder-list';
+    16→import { Switch } from '@/components/ui/switch';
+    17→import { ColorInput } from '@/components/ui/color-input';
+    18→import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
+    19→import { FONT_FAMILIES, FONT_FAMILIES_GROUPED, DEFAULT_FONT_FAMILY } from '@/lib/fonts';
+    20→import {
+    21→  Trash2,
+    22→  Copy,
+    23→  Lock,
+    24→  Unlock,
+    25→  Eye,
+    26→  EyeOff,
+    27→  ArrowUpToLine,
+    28→  ArrowDownToLine,
+    29→  Type,
+    30→  Table,
+    31→  Image as ImageIcon,
+    32→  Minus,
+    33→  Square,
+    34→  Circle,
+    35→  Plus,
+    36→  X,
+    37→  Link,
+    38→  Link2Off,
+    39→  ChevronRight as ChevronRightIcon,
+    40→  Search,
+    41→  Crosshair,
+    42→  AlignCenterHorizontal,
+    43→  AlignCenterVertical,
+    44→  PanelTop,
+    45→  PanelBottom,
+    46→  PanelLeft,
+    47→  PanelRight,
+    48→  Grid3x3,
+    49→  Palette,
+    50→  Sun,
+    51→  Sparkles,
+    52→  Layers,
+    53→  RotateCw,
+    54→  Columns3,
+    55→  Rows3,
+    56→  RotateCcw,
+    57→} from 'lucide-react';
+    58→import { useRef, useState, createContext, useContext, useMemo, useCallback, memo, useEffect } from 'react';
+    59→import { FormattingToolbar } from '@/components/designer/rich-text-editor';
+    60→import { StaticFormattingToolbar } from '@/components/designer/floating-card';
+    61→
+    62→// ---- Debounced update hook ----
+    63→// Debounces rapid numeric input changes so the store isn't updated on every keystroke.
+    64→function useDebouncedCallback<T extends (...args: never[]) => void>(
+    65→  callback: T,
+    66→  delay: number,
+    67→): T {
+    68→  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    69→  const callbackRef = useRef(callback);
+    70→  // Update the callback ref in an effect to avoid accessing ref during render
+    71→  useEffect(() => {
+    72→    callbackRef.current = callback;
+    73→  });
+    74→  // Cleanup on unmount
+    75→  useEffect(() => {
+    76→    return () => {
+    77→      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+    78→    };
+    79→  }, []);
+    80→
+    81→  return useCallback(
+    82→    (...args: Parameters<T>) => {
+    83→      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+    84→      timeoutRef.current = setTimeout(() => callbackRef.current(...args), delay);
+    85→    },
+    86→    [delay],
+    87→  ) as T;
+    88→}
+    89→
+    90→// ---- Remap helpers for row/col swap ----
+    91→
+    92→function remapOverridesForRowSwap(
+    93→  overrides: Record<string, CellOverride>,
+    94→  rowA: number,
+    95→  rowB: number
+    96→): Record<string, CellOverride> {
+    97→  const result: Record<string, CellOverride> = {};
+    98→  for (const [key, val] of Object.entries(overrides)) {
+    99→    const [r, c] = key.split('-').map(Number);
+   100→    let newR = r;
+   101→    if (r === rowA) newR = rowB;
+   102→    else if (r === rowB) newR = rowA;
+   103→    result[`${newR}-${c}`] = val;
+   104→  }
+   105→  return result;
+   106→}
+   107→
+   108→function remapOverridesForColSwap(
+   109→  overrides: Record<string, CellOverride>,
+   110→  colA: number,
+   111→  colB: number
+   112→): Record<string, CellOverride> {
+   113→  const result: Record<string, CellOverride> = {};
+   114→  for (const [key, val] of Object.entries(overrides)) {
+   115→    const [r, c] = key.split('-').map(Number);
+   116→    let newC = c;
+   117→    if (c === colA) newC = colB;
+   118→    else if (c === colB) newC = colA;
+   119→    result[`${r}-${newC}`] = val;
+   120→  }
+   121→  return result;
+   122→}
+   123→
+   124→function remapRowBgForSwap(
+   125→  rowBg: Record<number, string>,
+   126→  rowA: number,
+   127→  rowB: number
+   128→): Record<number, string> {
+   129→  const result: Record<number, string> = {};
+   130→  for (const [k, v] of Object.entries(rowBg)) {
+   131→    const r = Number(k);
+   132→    let newR = r;
+   133→    if (r === rowA) newR = rowB;
+   134→    else if (r === rowB) newR = rowA;
+   135→    result[newR] = v;
+   136→  }
+   137→  return result;
+   138→}
+   139→
+   140→function remapColBgForSwap(
+   141→  colBg: Record<number, string>,
+   142→  colA: number,
+   143→  colB: number
+   144→): Record<number, string> {
+   145→  const result: Record<number, string> = {};
+   146→  for (const [k, v] of Object.entries(colBg)) {
+   147→    const c = Number(k);
+   148→    let newC = c;
+   149→    if (c === colA) newC = colB;
+   150→    else if (c === colB) newC = colA;
+   151→    result[newC] = v;
+   152→  }
+   153→  return result;
+   154→}
+   155→
+   156→// Remap overrides when a row/col is moved from `fromIndex` to `toIndex` (arbitrary distance)
+   157→function remapOverridesForInsertion(
+   158→  overrides: Record<string, CellOverride>,
+   159→  fromIndex: number,
+   160→  toIndex: number,
+   161→  axis: 'row' | 'col'
+   162→): Record<string, CellOverride> {
+   163→  if (fromIndex === toIndex) return overrides;
+   164→  const result: Record<string, CellOverride> = {};
+   165→  for (const [key, val] of Object.entries(overrides)) {
+   166→    const [r, c] = key.split('-').map(Number);
+   167→    let newIdx = axis === 'row' ? r : c;
+   168→    if (newIdx === fromIndex) {
+   169→      newIdx = toIndex;
+   170→    } else if (fromIndex < toIndex) {
+   171→      // Moving down/right: shift items between from+1 and to up/left by 1
+   172→      if (newIdx > fromIndex && newIdx <= toIndex) newIdx -= 1;
+   173→    } else {
+   174→      // Moving up/left: shift items between to and from-1 down/right by 1
+   175→      if (newIdx >= toIndex && newIdx < fromIndex) newIdx += 1;
+   176→    }
+   177→    const newKey = axis === 'row' ? `${newIdx}-${c}` : `${r}-${newIdx}`;
+   178→    result[newKey] = val;
+   179→  }
+   180→  return result;
+   181→}
+   182→
+   183→function remapRowBgForInsertion(
+   184→  rowBg: Record<number, string>,
+   185→  fromIndex: number,
+   186→  toIndex: number
+   187→): Record<number, string> {
+   188→  if (fromIndex === toIndex) return rowBg;
+   189→  const result: Record<number, string> = {};
+   190→  for (const [k, v] of Object.entries(rowBg)) {
+   191→    const r = Number(k);
+   192→    let newR = r;
+   193→    if (r === fromIndex) {
+   194→      newR = toIndex;
+   195→    } else if (fromIndex < toIndex) {
+   196→      if (r > fromIndex && r <= toIndex) newR -= 1;
+   197→    } else {
+   198→      if (r >= toIndex && r < fromIndex) newR += 1;
+   199→    }
+   200→    result[newR] = v;
+   201→  }
+   202→  return result;
+   203→}
+   204→
+   205→function remapColBgForInsertion(
+   206→  colBg: Record<number, string>,
+   207→  fromIndex: number,
+   208→  toIndex: number
+   209→): Record<number, string> {
+   210→  if (fromIndex === toIndex) return colBg;
+   211→  const result: Record<number, string> = {};
+   212→  for (const [k, v] of Object.entries(colBg)) {
+   213→    const c = Number(k);
+   214→    let newC = c;
+   215→    if (c === fromIndex) {
+   216→      newC = toIndex;
+   217→    } else if (fromIndex < toIndex) {
+   218→      if (c > fromIndex && c <= toIndex) newC -= 1;
+   219→    } else {
+   220→      if (c >= toIndex && c < fromIndex) newC += 1;
+   221→    }
+   222→    result[newC] = v;
+   223→  }
+   224→  return result;
+   225→}
+   226→
+   227→const typeIcons: Record<string, React.ReactNode> = {
+   228→  text: <Type className="h-4 w-4" />,
+   229→  table: <Table className="h-4 w-4" />,
+   230→  image: <ImageIcon className="h-4 w-4" />,
+   231→  line: <Minus className="h-4 w-4" />,
+   232→  rectangle: <Square className="h-4 w-4" />,
+   233→  ellipse: <Circle className="h-4 w-4" />,
+   234→};
+   235→
+   236→// Compact labeled input — label above the input for full-width value visibility
+   237→function PropertyField({ label, children }: { label: string; children: React.ReactNode }) {
+   238→  return (
+   239→    <div className="space-y-1">
+   240→      <Label className="text-[10px] text-muted-foreground uppercase tracking-wide">{label}</Label>
+   241→      {children}
+   242→    </div>
+   243→  );
+   244→}
+   245→
+   246→// Inline row for small paired fields (like X/Y, W/H)
+   247→function PropertyPair({ label1, child1, label2, child2 }: {
+   248→  label1: string; child1: React.ReactNode;
+   249→  label2: string; child2: React.ReactNode;
+   250→}) {
+   251→  return (
+   252→    <div className="grid grid-cols-2 gap-2">
+   253→      <PropertyField label={label1}>{child1}</PropertyField>
+   254→      <PropertyField label={label2}>{child2}</PropertyField>
+   255→    </div>
+   256→  );
+   257→}
+   258→
+   259→function SectionTitle({ children }: { children: React.ReactNode }) {
+   260→  return (
+   261→    <div className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mt-4 mb-2 first:mt-0 first:mb-2">
+   262→      {children}
+   263→    </div>
+   264→  );
+   265→}
+   266→
+   267→// ─── Search Context ──────────────────────────────────────────────────────
+   268→// Provides the active search term so sections can auto-show when matching
+   269→const SearchContext = createContext('');
+   270→function useSearchTerm() {
+   271→  return useContext(SearchContext);
+   272→}
+   273→
+   274→// ─── Accordion Section ───────────────────────────────────────────────────
+   275→// Replaces SectionTitle with a collapsible card wrapper.
+   276→// - Collapsible with smooth animation (Suggestion 1)
+   277→// - Visual card container (Suggestion 6)
+   278→// - Auto-expands when search term matches the label (Suggestion 7)
+   279→// - `defaultOpen` controls initial state; rarely-used sections default to closed
+   280→// - `keywords` allows search to match additional terms beyond the label
+   281→function AccordionSection({
+   282→  label,
+   283→  defaultOpen = false,
+   284→  forceOpen = false,
+   285→  keywords,
+   286→  children,
+   287→}: {
+   288→  label: string;
+   289→  defaultOpen?: boolean;
+   290→  forceOpen?: boolean;
+   291→  keywords?: string;
+   292→  children: React.ReactNode;
+   293→}) {
+   294→  const [isOpen, setIsOpen] = useState(defaultOpen);
+   295→  const searchTerm = useSearchTerm();
+   296→
+   297→  // Auto-expand when search matches the label or keywords
+   298→  const searchText = [label, keywords].filter(Boolean).join(' ').toLowerCase();
+   299→  const matchesSearch = searchTerm
+   300→    ? searchText.includes(searchTerm.toLowerCase())
+   301→    : false;
+   302→
+   303→  // If search is active and matches, force open; if search is active but doesn't match, force closed
+   304→  // If forceOpen is true, always keep open
+   305→  const effectiveOpen = searchTerm ? matchesSearch : (forceOpen || isOpen);
+   306→
+   307→  return (
+   308→    <div
+   309→      className="rounded-lg border border-border/60 bg-muted/20 overflow-hidden"
+   310→      data-section-label={label.toLowerCase()}
+   311→    >
+   312→      <button
+   313→        type="button"
+   314→        className="w-full flex items-center gap-1.5 px-2.5 py-1.5 text-left hover:bg-muted/40 transition-colors duration-150"
+   315→        onClick={() => setIsOpen(!isOpen)}
+   316→      >
+   317→        <ChevronRightIcon
+   318→          className={`h-3 w-3 text-muted-foreground/60 shrink-0 transition-transform duration-200 ${
+   319→            effectiveOpen ? 'rotate-90' : ''
+   320→          }`}
+   321→        />
+   322→        <span className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">
+   323→          {label}
+   324→        </span>
+   325→      </button>
+   326→      <div
+   327→        className="grid transition-[grid-template-rows] duration-250 ease-[cubic-bezier(0.33,1,0.68,1)]"
+   328→        style={{ gridTemplateRows: effectiveOpen ? '1fr' : '0fr' }}
+   329→      >
+   330→        <div className="overflow-hidden">
+   331→          <div className="px-2.5 pb-2.5 pt-0.5 space-y-2">
+   332→            {children}
+   333→          </div>
+   334→        </div>
+   335→      </div>
+   336→    </div>
+   337→  );
+   338→}
+   339→
+   340→// ─── Search Bar ──────────────────────────────────────────────────────────
+   341→// A compact search input that filters visible property sections (Suggestion 7)
+   342→function SearchBar({
+   343→  value,
+   344→  onChange,
+   345→}: {
+   346→  value: string;
+   347→  onChange: (v: string) => void;
+   348→}) {
+   349→  return (
+   350→    <div className="relative">
+   351→      <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3 w-3 text-muted-foreground/50" />
+   352→      <input
+   353→        type="text"
+   354→        value={value}
+   355→        onChange={(e) => onChange(e.target.value)}
+   356→        placeholder="Search properties..."
+   357→        className="w-full h-7 text-[11px] pl-6 pr-6 bg-muted/30 border border-border/60 rounded-md
+   358→          focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring focus-visible:border-ring
+   359→          placeholder:text-muted-foreground/40 transition-colors duration-150"
+   360→      />
+   361→      {value && (
+   362→        <button
+   363→          type="button"
+   364→          onClick={() => onChange('')}
+   365→          className="absolute right-1.5 top-1/2 -translate-y-1/2 h-4 w-4 rounded-sm hover:bg-muted flex items-center justify-center"
+   366→        >
+   367→          <X className="h-2.5 w-2.5 text-muted-foreground" />
+   368→        </button>
+   369→      )}
+   370→    </div>
+   371→  );
+   372→}
+   373→
+   374→// Position & Size Properties
+   375→function TransformProperties({ element }: { element: CanvasElement }) {
+   376→  const updateElement = useDesignerStore((s) => s.updateElement);
+   377→  const alignElementHorizontalCenter = useDesignerStore((s) => s.alignElementHorizontalCenter);
+   378→  const alignElementVerticalCenter = useDesignerStore((s) => s.alignElementVerticalCenter);
+   379→
+   380→  // Debounced position/size updates to avoid store churn on every keystroke
+   381→  const debouncedUpdatePosition = useDebouncedCallback(
+   382→    (field: 'x' | 'y', value: number) => updateElement(element.id, { [field]: value }),
+   383→    150,
+   384→  );
+   385→  const debouncedUpdateSize = useDebouncedCallback(
+   386→    (field: 'width' | 'height', value: number) => updateElement(element.id, { [field]: Math.max(10, value) }),
+   387→    150,
+   388→  );
+   389→
+   390→  const handleAlignHCenter = useCallback(
+   391→    () => alignElementHorizontalCenter(element.id),
+   392→    [alignElementHorizontalCenter, element.id],
+   393→  );
+   394→  const handleAlignVCenter = useCallback(
+   395→    () => alignElementVerticalCenter(element.id),
+   396→    [alignElementVerticalCenter, element.id],
+   397→  );
+   398→
+   399→  // For line elements, skip the standard position/size section
+   400→  // (lines use endpoint coordinates managed by LinePropertiesPanel)
+   401→  if (element.type === 'line') {
+   402→    return (
+   403→      <>
+   404→        <AccordionSection label="Alignment" keywords="center horizontal vertical align">
+   405→          <div className="flex gap-1">
+   406→            <Button
+   407→              variant="outline"
+   408→              size="sm"
+   409→              className="h-7 text-[10px] flex-1 gap-1"
+   410→              onClick={handleAlignHCenter}
+   411→              title="Center horizontally on page"
+   412→            >
+   413→              <AlignCenterVertical className="h-3 w-3" /> H-Center
+   414→            </Button>
+   415→            <Button
+   416→              variant="outline"
+   417→              size="sm"
+   418→              className="h-7 text-[10px] flex-1 gap-1"
+   419→              onClick={handleAlignVCenter}
+   420→              title="Center vertically on page"
+   421→            >
+   422→              <AlignCenterHorizontal className="h-3 w-3" /> V-Center
+   423→            </Button>
+   424→          </div>
+   425→        </AccordionSection>
+   426→      </>
+   427→    );
+   428→  }
+   429→
+   430→  return (
+   431→    <>
+   432→      <AccordionSection label="Alignment" keywords="center horizontal vertical align">
+   433→        <div className="flex gap-1">
+   434→          <Button
+   435→            variant="outline"
+   436→            size="sm"
+   437→            className="h-7 text-[10px] flex-1 gap-1"
+   438→            onClick={handleAlignHCenter}
+   439→            title="Center horizontally on page"
+   440→          >
+   441→            <AlignCenterVertical className="h-3 w-3" /> H-Center
+   442→          </Button>
+   443→          <Button
+   444→            variant="outline"
+   445→            size="sm"
+   446→            className="h-7 text-[10px] flex-1 gap-1"
+   447→            onClick={handleAlignVCenter}
+   448→            title="Center vertically on page"
+   449→          >
+   450→            <AlignCenterHorizontal className="h-3 w-3" /> V-Center
+   451→          </Button>
+   452→        </div>
+   453→      </AccordionSection>
+   454→      <AccordionSection label="Position" keywords="x y location coordinates" defaultOpen={false}>
+   455→        <PropertyPair
+   456→          label1="X"
+   457→          child1={
+   458→            <Input
+   459→              type="number"
+   460→              value={Math.round(element.x)}
+   461→              onChange={(e) => debouncedUpdatePosition('x', +e.target.value)}
+   462→              className="h-7 text-xs"
+   463→            />
+   464→          }
+   465→          label2="Y"
+   466→          child2={
+   467→            <Input
+   468→              type="number"
+   469→              value={Math.round(element.y)}
+   470→              onChange={(e) => debouncedUpdatePosition('y', +e.target.value)}
+   471→              className="h-7 text-xs"
+   472→            />
+   473→          }
+   474→        />
+   475→      </AccordionSection>
+   476→      <AccordionSection label="Size" keywords="width height dimensions w h">
+   477→        <PropertyPair
+   478→          label1="Width"
+   479→          child1={
+   480→            <Input
+   481→              type="number"
+   482→              value={Math.round(element.width)}
+   483→              onChange={(e) => debouncedUpdateSize('width', +e.target.value)}
+   484→              className="h-7 text-xs"
+   485→            />
+   486→          }
+   487→          label2="Height"
+   488→          child2={
+   489→            <Input
+   490→              type="number"
+   491→              value={Math.round(element.height)}
+   492→              onChange={(e) => debouncedUpdateSize('height', +e.target.value)}
+   493→              className="h-7 text-xs"
+   494→            />
+   495→          }
+   496→        />
+   497→      </AccordionSection>
+   498→    </>
+   499→  );
+   500→}
+   501→
+   502→// Text Properties — base/default formatting for text elements
+   503→// Note: Per-character formatting is now available via the canvas text editor
+   504→// (double-click a text element). These properties serve as the element-wide defaults.
+   505→function TextPropertiesPanel({ element }: { element: CanvasElement }) {
+   506→  const props = (element.properties as { type: 'text'; data: TextProperties }).data;
+   507→  const updateElementProperties = useDesignerStore((s) => s.updateElementProperties);
+   508→  const editingTextElementId = useDesignerStore((s) => s.editingTextElementId);
+   509→  const activeTextEditor = useDesignerStore((s) => s.activeTextEditor);
+   510→
+   511→  const isEditing = editingTextElementId === element.id;
+   512→
+   513→  const update = useCallback((updates: Partial<TextProperties>) => {
+   514→    let finalUpdates = updates;
+   515→    // When textAlign is changed, apply it to the entire content
+   516→    if (updates.textAlign) {
+   517→      if (isEditing && activeTextEditor) {
+   518→        // While editing: use TipTap's setTextAlign to update all paragraphs
+   519→        activeTextEditor.chain().focus().setTextAlign(updates.textAlign).run();
+   520→      } else {
+   521→        // While not editing: update the HTML content directly to change/add
+   522→        // text-align on all block-level elements (p, h1-h6, li, etc.)
+   523→        const align = updates.textAlign;
+   524→        let updatedContent = props.content;
+   525→        // Step 1: For tags with style="..." — replace or add text-align
+   526→        updatedContent = updatedContent.replace(
+   527→          /(<(?:p|h[1-6]|li|div|blockquote)[^>]*?style=")([^"]*)(")/gi,
+   528→          (_match, styleStart: string, styleContent: string, styleEnd: string) => {
+   529→            if (styleContent.includes('text-align')) {
+   530→              // Replace existing text-align value
+   531→              return `${styleStart}${styleContent.replace(/text-align:\s*[^;"]+/gi, `text-align: ${align}`)}${styleEnd}`;
+   532→            }
+   533→            // Add text-align to existing style
+   534→            const sep = styleContent && !styleContent.endsWith(';') ? ';' : '';
+   535→            return `${styleStart}${styleContent}${sep}text-align: ${align}${styleEnd}`;
+   536→          }
+   537→        );
+   538→        // Step 2: For tags without any style attribute — add style="text-align: X"
+   539→        updatedContent = updatedContent.replace(
+   540→          /<(p|h[1-6]|li|div|blockquote)(\s[^>]*?)?>/gi,
+   541→          (match, tag: string, attrs: string | undefined) => {
+   542→            if (attrs && attrs.includes('style=')) return match; // already handled in step 1
+   543→            return `<${tag}${attrs || ''} style="text-align: ${align}">`;
+   544→          }
+   545→        );
+   546→        finalUpdates = { ...updates, content: updatedContent };
+   547→      }
+   548→    }
+   549→    updateElementProperties(element.id, {
+   550→      type: 'text',
+   551→      data: { ...props, ...finalUpdates },
+   552→    });
+   553→  }, [element.id, props, updateElementProperties, isEditing, activeTextEditor]);
+   554→
+   555→  return (
+   556→    <>
+   557→      {/* Text Formatting section — always visible with formatting controls */}
+   558→      <AccordionSection label="Default Alignment & Spacing" keywords="align left center right justify line height letter spacing default base">
+   559→        <PropertyField label="Align">
+   560→          <Select value={props.textAlign} onValueChange={(v) => update({ textAlign: v as 'left' | 'center' | 'right' | 'justify' })}>
+   561→            <SelectTrigger className="h-7 text-xs">
+   562→              <SelectValue />
+   563→            </SelectTrigger>
+   564→            <SelectContent>
+   565→              <SelectItem value="left">Left</SelectItem>
+   566→              <SelectItem value="center">Center</SelectItem>
+   567→              <SelectItem value="right">Right</SelectItem>
+   568→              <SelectItem value="justify">Justify</SelectItem>
+   569→            </SelectContent>
+   570→          </Select>
+   571→        </PropertyField>
+   572→        <PropertyField label="Line Height">
+   573→          <SliderField
+   574→            value={[props.lineHeight * 100]}
+   575→            min={80}
+   576→            max={300}
+   577→            step={10}
+   578→            unit="%"
+   579→            colorTheme="green"
+   580→            onValueChange={([v]) => update({ lineHeight: v / 100 })}
+   581→            className="flex-1"
+   582→          />
+   583→        </PropertyField>
+   584→        <PropertyField label="Letter Spacing">
+   585→          <SliderField
+   586→            value={[props.letterSpacing]}
+   587→            min={-5}
+   588→            max={20}
+   589→            step={0.5}
+   590→            unit="px"
+   591→            colorTheme="teal"
+   592→            onValueChange={([v]) => update({ letterSpacing: v })}
+   593→            className="flex-1"
+   594→          />
+   595→        </PropertyField>
+   596→      </AccordionSection>
+   597→
+   598→      <AccordionSection label="Default Color" keywords="text color opacity default base">
+   599→        <PropertyField label="Color">
+   600→          <ColorInput value={props.color} onChange={(v) => update({ color: v })} />
+   601→        </PropertyField>
+   602→        <PropertyField label="Opacity">
+   603→          <SliderField
+   604→            value={[props.opacity * 100]}
+   605→            min={0}
+   606→            max={100}
+   607→            step={1}
+   608→            unit="%"
+   609→            colorTheme="gray"
+   610→            onValueChange={([v]) => update({ opacity: v / 100 })}
+   611→            className="flex-1"
+   612→          />
+   613→        </PropertyField>
+   614→      </AccordionSection>
+   615→      <AccordionSection label="Default Typography" keywords="font size family weight style decoration transform uppercase lowercase capitalize default base">
+   616→        <p className="text-[9px] text-muted-foreground -mt-1 mb-1">Base styles applied to all text. Use inline editor for per-character formatting.</p>
+   617→        <PropertyField label="Font Size">
+   618→          <SliderField
+   619→            value={[props.fontSize]}
+   620→            min={6}
+   621→            max={100}
+   622→            step={1}
+   623→            unit="px"
+   624→            colorTheme="purple"
+   625→            onValueChange={([v]) => update({ fontSize: v })}
+   626→            className="flex-1"
+   627→          />
+   628→        </PropertyField>
+   629→        <PropertyField label="Font Family">
+   630→          <Select value={props.fontFamily} onValueChange={(v) => update({ fontFamily: v })}>
+   631→            <SelectTrigger className="h-7 text-xs">
+   632→              <SelectValue />
+   633→            </SelectTrigger>
+   634→            <SelectContent>
+   635→              {FONT_FAMILIES_GROUPED.map((group) => (
+   636→                <SelectGroup key={group.label}>
+   637→                  <SelectLabel className="text-[10px] text-muted-foreground px-2 py-1">{group.label}</SelectLabel>
+   638→                  {group.options.map((f) => (
+   639→                    <SelectItem key={f.value} value={f.value} style={{ fontFamily: f.value }}>
+   640→                      {f.label}
+   641→                    </SelectItem>
+   642→                  ))}
+   643→                </SelectGroup>
+   644→              ))}
+   645→            </SelectContent>
+   646→          </Select>
+   647→        </PropertyField>
+   648→        <PropertyField label="Weight">
+   649→          <Select value={props.fontWeight} onValueChange={(v) => update({ fontWeight: v })}>
+   650→            <SelectTrigger className="h-7 text-xs">
+   651→              <SelectValue />
+   652→            </SelectTrigger>
+   653→            <SelectContent>
+   654→              <SelectItem value="normal">Normal</SelectItem>
+   655→              <SelectItem value="bold">Bold</SelectItem>
+   656→              <SelectItem value="lighter">Lighter</SelectItem>
+   657→              <SelectItem value="100">100</SelectItem>
+   658→              <SelectItem value="300">300</SelectItem>
+   659→              <SelectItem value="500">500</SelectItem>
+   660→              <SelectItem value="700">700</SelectItem>
+   661→              <SelectItem value="900">900</SelectItem>
+   662→            </SelectContent>
+   663→          </Select>
+   664→        </PropertyField>
+   665→        <PropertyField label="Style">
+   666→          <Select value={props.fontStyle} onValueChange={(v) => update({ fontStyle: v })}>
+   667→            <SelectTrigger className="h-7 text-xs">
+   668→              <SelectValue />
+   669→            </SelectTrigger>
+   670→            <SelectContent>
+   671→              <SelectItem value="normal">Normal</SelectItem>
+   672→              <SelectItem value="italic">Italic</SelectItem>
+   673→            </SelectContent>
+   674→          </Select>
+   675→        </PropertyField>
+   676→        <PropertyField label="Decoration">
+   677→          <Select value={props.textDecoration} onValueChange={(v) => update({ textDecoration: v })}>
+   678→            <SelectTrigger className="h-7 text-xs">
+   679→              <SelectValue />
+   680→            </SelectTrigger>
+   681→            <SelectContent>
+   682→              <SelectItem value="none">None</SelectItem>
+   683→              <SelectItem value="underline">Underline</SelectItem>
+   684→              <SelectItem value="line-through">Strikethrough</SelectItem>
+   685→              <SelectItem value="overline">Overline</SelectItem>
+   686→            </SelectContent>
+   687→          </Select>
+   688→        </PropertyField>
+   689→        <PropertyField label="Transform">
+   690→          <Select value={props.textTransform} onValueChange={(v) => update({ textTransform: v as 'none' | 'uppercase' | 'lowercase' | 'capitalize' })}>
+   691→            <SelectTrigger className="h-7 text-xs">
+   692→              <SelectValue />
+   693→            </SelectTrigger>
+   694→            <SelectContent>
+   695→              <SelectItem value="none">None</SelectItem>
+   696→              <SelectItem value="uppercase">UPPERCASE</SelectItem>
+   697→              <SelectItem value="lowercase">lowercase</SelectItem>
+   698→              <SelectItem value="capitalize">Capitalize</SelectItem>
+   699→            </SelectContent>
+   700→          </Select>
+
+[showing lines 1-700 of 4064; use offset=701 with limit to continue reading]

@@ -1,0 +1,1078 @@
+     1→'use client';
+     2→
+     3→import { useEffect, useLayoutEffect, useRef, useCallback, useState, useMemo, memo } from 'react';
+     4→import { properCapitalizeHTML } from '@/lib/utils';
+     5→import { useDesignerStore, ZOOM_STEP_PRESETS } from '@/store/designer-store';
+     6→import {
+     7→  CanvasElement,
+     8→  TextProperties,
+     9→  TableProperties,
+    10→  ImageProperties,
+    11→  LineProperties,
+    12→  RectangleProperties,
+    13→  EllipseProperties,
+    14→  RectangleEffects,
+    15→  DEFAULT_EFFECTS,
+    16→  buildGradientCSS,
+    17→  buildShadowCSS,
+    18→  buildGlowCSS,
+    19→  buildPictureFillCSS,
+    20→  resolveCornerRadius,
+    21→  resolveRectBorderRadius,
+    22→  getRectRotation,
+    23→} from '@/lib/element-types';
+    24→import {
+    25→  hasCustomCorners,
+    26→  getRectCornerPoints,
+    27→  buildRoundedPolygonPath,
+    28→  buildSvgFillDescriptor,
+    29→  buildSvgFilterCSS,
+    30→  svgStrokeDasharray,
+    31→} from '@/lib/rectangle-corners';
+    32→import {
+    33→  getCellBg,
+    34→  getCellColor,
+    35→  getCellFontWeight,
+    36→  getCellFontSize,
+    37→  getCellPadding,
+    38→  getCellTextAlign,
+    39→  getCellVerticalAlign,
+    40→  getCellBorderTop,
+    41→  getCellBorderBottom,
+    42→  getCellBorderLeft,
+    43→  getCellBorderRight,
+    44→  normalizeTableProps,
+    45→  ensureColWidths,
+    46→  ensureRowHeights,
+    47→} from '@/lib/table-helpers';
+    48→import { X, ZoomIn, ZoomOut, Maximize, ChevronDown } from 'lucide-react';
+    49→import { Button } from '@/components/ui/button';
+    50→import {
+    51→  DropdownMenu,
+    52→  DropdownMenuContent,
+    53→  DropdownMenuItem,
+    54→  DropdownMenuSeparator,
+    55→  DropdownMenuTrigger,
+    56→} from '@/components/ui/dropdown-menu';
+    57→import { Input } from '@/components/ui/input';
+    58→import { DarkPreviewToggle } from './dark-preview-toggle';
+    59→
+    60→// Zoom constraints
+    61→const MIN_ZOOM = 0.1;
+    62→const MAX_ZOOM = 8;
+    63→
+    64→// Zoom level presets (same as workspace)
+    65→const zoomPresets = [
+    66→  { label: '10%', value: 0.1 },
+    67→  { label: '25%', value: 0.25 },
+    68→  { label: '50%', value: 0.5 },
+    69→  { label: '75%', value: 0.75 },
+    70→  { label: '100%', value: 1 },
+    71→  { label: '150%', value: 1.5 },
+    72→  { label: '200%', value: 2 },
+    73→  { label: '300%', value: 3 },
+    74→  { label: '400%', value: 4 },
+    75→];
+    76→
+    77→// ── Preview Element Renderers ──────────────────────────────────────────────
+    78→// These render elements identically to canvas-element.tsx but WITHOUT
+    79→// any interactive features (no editing, no selection, no drag handles).
+    80→
+    81→// Module-level constant for reflection masks — avoids per-render allocation
+    82→const REFLECTION_MASKS: Record<string, string> = {
+    83→  soft: 'linear-gradient(to bottom, black 0%, transparent 80%)',
+    84→  tight: 'linear-gradient(to bottom, black 0%, transparent 50%)',
+    85→  fade: 'linear-gradient(to bottom, black 0%, transparent 100%)',
+    86→  mirror: 'linear-gradient(to bottom, black 0%, transparent 60%, transparent 100%)',
+    87→};
+    88→
+    89→function getReflectionMask(preset: string): string {
+    90→  return REFLECTION_MASKS[preset] ?? 'linear-gradient(to bottom, black 0%, transparent 100%)';
+    91→}
+    92→
+    93→function PreviewTextElement({ element }: { element: CanvasElement }) {
+    94→  const props = (element.properties as { type: 'text'; data: TextProperties }).data;
+    95→
+    96→  const effectiveTextTransform = props.textTransform === 'capitalize' ? 'none' : props.textTransform;
+    97→  const displayContent = useMemo(() => {
+    98→    const raw = props.content || '<p></p>';
+    99→    if (props.textTransform === 'capitalize') {
+   100→      return properCapitalizeHTML(raw);
+   101→    }
+   102→    return raw;
+   103→  }, [props.content, props.textTransform]);
+   104→
+   105→  return (
+   106→    <div
+   107→      className="rich-text-content"
+   108→      style={{
+   109→        width: '100%',
+   110→        height: '100%',
+   111→        overflow: 'hidden',
+   112→        fontSize: `${props.fontSize}px`,
+   113→        fontFamily: props.fontFamily,
+   114→        fontWeight: props.fontWeight,
+   115→        fontStyle: props.fontStyle,
+   116→        textDecoration: props.textDecoration,
+   117→        textTransform: effectiveTextTransform as 'none' | 'uppercase' | 'lowercase',
+   118→        color: props.color,
+   119→        textAlign: props.textAlign,
+   120→        ...(props.textAlign === 'justify' ? { textAlignLast: 'left' as const, textJustify: 'inter-character' as const, hyphens: 'auto' as const } : {}),
+   121→        lineHeight: props.lineHeight,
+   122→        letterSpacing: `${props.letterSpacing}px`,
+   123→        opacity: props.opacity,
+   124→        wordBreak: 'break-word',
+   125→        whiteSpace: 'pre-wrap',
+   126→      }}
+   127→      dangerouslySetInnerHTML={{ __html: displayContent }}
+   128→    />
+   129→  );
+   130→}
+   131→
+   132→function PreviewTableElement({ element }: { element: CanvasElement }) {
+   133→  const rawProps = (element.properties as { type: 'table'; data: TableProperties }).data;
+   134→  const props = normalizeTableProps(rawProps);
+   135→
+   136→  const bw = props.borderWidth;
+   137→  const borderStyleValue = props.borderStyle;
+   138→  const borderColorValue = props.borderColor;
+   139→  const borderStr = `${bw}px ${borderStyleValue} ${borderColorValue}`;
+   140→
+   141→  const visibleRows = props.showHeader ? props.rows : Math.max(props.rows - 1, 1);
+   142→  const radii = resolveCornerRadius(props.cornerRadius);
+   143→
+   144→  // Convert colWidths/rowHeights proportional fractions into EXPLICIT pixel
+   145→  // track sizes — matching the canvas rendering. We must NOT use CSS `fr`
+   146→  // units here: `fr` tracks are expanded by min-content/max-content of cell
+   147→  // content, so a wide cell would blow out the user's resized ratio and the
+   148→  // preview would show default/equal sizes instead of the adjusted ones.
+   149→  // Explicit px values (with the last track absorbing rounding) reproduce the
+   150→  // canvas layout exactly.
+   151→  const cw = ensureColWidths(props.cols, props.colWidths);
+   152→  const rh = ensureRowHeights(props.rows, props.rowHeights);
+   153→  const visibleRowHeights = props.showHeader ? rh : rh.slice(1);
+   154→  const totalColFr = cw.reduce((a, b) => a + b, 0) || 1;
+   155→  const visRh = visibleRowHeights.length > 0 ? visibleRowHeights : [1];
+   156→  const totalRowFr = visRh.reduce((a, b) => a + b, 0) || 1;
+   157→  const computeTrackSizes = (fracs: number[], total: number, totalFr: number): string[] => {
+   158→    if (fracs.length === 0) return ['100%'];
+   159→    const sizes = fracs.map((f) => (f / totalFr) * total);
+   160→    const allocated = sizes.slice(0, -1).reduce((a, b) => a + b, 0);
+   161→    sizes[sizes.length - 1] = total - allocated;
+   162→    return sizes.map((s) => `${s}px`);
+   163→  };
+   164→  const gridTemplateColumns = computeTrackSizes(cw, element.width, totalColFr).join(' ');
+   165→  const gridTemplateRows = computeTrackSizes(visRh, element.height, totalRowFr).join(' ');
+   166→
+   167→  const cells: React.ReactNode[] = [];
+   168→  for (let r = 0; r < props.rows; r++) {
+   169→    if (r === 0 && !props.showHeader) continue;
+   170→    const gridRow = props.showHeader ? r + 1 : r;
+   171→
+   172→    for (let c = 0; c < props.cols; c++) {
+   173→      const padding = getCellPadding(r, c, props);
+   174→      const bgColor = getCellBg(r, c, props);
+   175→      const textColor = getCellColor(r, c, props);
+   176→      const fontWeight = getCellFontWeight(r, c, props);
+   177→      const fontSize = getCellFontSize(r, c, props);
+   178→      const textAlign = getCellTextAlign(r, c, props);
+   179→      const verticalAlign = getCellVerticalAlign(r, c, props);
+   180→
+   181→      // Collapsed border model: each shared edge drawn once
+   182→      const borderTop = getCellBorderTop(r, c, props) ? borderStr : 'none';
+   183→      const borderLeft = getCellBorderLeft(r, c, props) ? borderStr : 'none';
+   184→      const borderBottom = (r === props.rows - 1 && getCellBorderBottom(r, c, props)) ? borderStr : 'none';
+   185→      const borderRight = (c === props.cols - 1 && getCellBorderRight(r, c, props)) ? borderStr : 'none';
+   186→
+   187→      // Corner radius: apply to corner cells so borders follow the curve
+   188→      const isFirstVisibleRow = props.showHeader ? r === 0 : r === 1;
+   189→      const isLastRow = r === props.rows - 1;
+   190→      const isFirstCol = c === 0;
+   191→      const isLastCol = c === props.cols - 1;
+   192→      const cellBorderRadius = `${isFirstVisibleRow && isFirstCol ? radii.topLeft : 0}px ${isFirstVisibleRow && isLastCol ? radii.topRight : 0}px ${isLastRow && isLastCol ? radii.bottomRight : 0}px ${isLastRow && isFirstCol ? radii.bottomLeft : 0}px`;
+   193→
+   194→      const justifyContent = verticalAlign === 'top' ? 'flex-start' : verticalAlign === 'bottom' ? 'flex-end' : 'center';
+   195→
+   196→      cells.push(
+   197→        <div
+   198→          key={`${r}-${c}`}
+   199→          style={{
+   200→            gridRow,
+   201→            gridColumn: c + 1,
+   202→            overflow: 'hidden',
+   203→            padding: `${padding}px`,
+   204→            backgroundColor: bgColor,
+   205→            color: textColor,
+   206→            fontWeight,
+   207→            fontSize: `${fontSize}px`,
+   208→            textAlign: textAlign as 'left' | 'center' | 'right' | 'justify',
+   209→            ...(textAlign === 'justify' ? { textAlignLast: 'left' as const, textJustify: 'inter-character' as const, hyphens: 'auto' as const } : {}),
+   210→            borderTop,
+   211→            borderBottom,
+   212→            borderLeft,
+   213→            borderRight,
+   214→            borderRadius: cellBorderRadius,
+   215→            boxSizing: 'border-box',
+   216→            display: 'flex',
+   217→            alignItems: justifyContent,
+   218→            minHeight: 0,
+   219→            minWidth: 0,
+   220→          }}
+   221→        >
+   222→          <span
+   223→            style={{
+   224→              display: 'block',
+   225→              width: '100%',
+   226→              overflow: 'hidden',
+   227→              textOverflow: 'ellipsis',
+   228→              whiteSpace: 'nowrap',
+   229→              lineHeight: 1.2,
+   230→            }}
+   231→          >
+   232→            {props.cellData[r]?.[c] || ''}
+   233→          </span>
+   234→        </div>
+   235→      );
+   236→    }
+   237→  }
+   238→
+   239→  return (
+   240→    <div style={{
+   241→      width: '100%',
+   242→      height: '100%',
+   243→      opacity: props.opacity,
+   244→      borderRadius: `${radii.topLeft}px ${radii.topRight}px ${radii.bottomRight}px ${radii.bottomLeft}px`,
+   245→    }}>
+   246→      <div
+   247→        style={{
+   248→          display: 'grid',
+   249→          gridTemplateRows,
+   250→          gridTemplateColumns,
+   251→          width: '100%',
+   252→          height: '100%',
+   253→          fontSize: `${props.fontSize}px`,
+   254→          overflow: 'hidden',
+   255→        }}
+   256→      >
+   257→        {cells}
+   258→      </div>
+   259→    </div>
+   260→  );
+   261→}
+   262→
+   263→function PreviewImageElement({ element }: { element: CanvasElement }) {
+   264→  const props = (element.properties as { type: 'image'; data: ImageProperties }).data;
+   265→  const effects: RectangleEffects = props.effects ?? { ...DEFAULT_EFFECTS };
+   266→
+   267→  // Compute combined box shadow (glow + shadow)
+   268→  const combinedBoxShadow = (() => {
+   269→    const glowBoxShadow = buildGlowCSS(effects.glow).boxShadow as string | undefined;
+   270→    const shadowBoxShadow = buildShadowCSS(effects.shadow, props.borderRadius).boxShadow as string | undefined;
+   271→    if (glowBoxShadow && shadowBoxShadow) return `${glowBoxShadow}, ${shadowBoxShadow}`;
+   272→    if (glowBoxShadow) return glowBoxShadow;
+   273→    if (shadowBoxShadow) return shadowBoxShadow;
+   274→    return undefined;
+   275→  })();
+   276→
+   277→  const reflectionMask = effects.reflection.enabled ? getReflectionMask(effects.reflection.preset) : undefined;
+   278→
+   279→  if (!props.src) {
+   280→    return (
+   281→      <div
+   282→        style={{
+   283→          width: '100%',
+   284→          height: '100%',
+   285→          display: 'flex',
+   286→          flexDirection: 'column',
+   287→          alignItems: 'center',
+   288→          justifyContent: 'center',
+   289→          backgroundColor: '#f9fafb',
+   290→          border: '2px dashed #d1d5db',
+   291→          borderRadius: `${props.borderRadius}px`,
+   292→          opacity: props.opacity,
+   293→          boxShadow: combinedBoxShadow,
+   294→        }}
+   295→      >
+   296→        <span style={{ fontSize: '10px', color: '#9ca3af' }}>No image</span>
+   297→      </div>
+   298→    );
+   299→  }
+   300→
+   301→  return (
+   302→    <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+   303→      {/* Main image with glow + shadow */}
+   304→      <div
+   305→        style={{
+   306→          width: '100%',
+   307→          height: '100%',
+   308→          overflow: 'hidden',
+   309→          borderRadius: `${props.borderRadius}px`,
+   310→          border: props.borderWidth > 0 ? `${props.borderWidth}px solid ${props.borderColor}` : 'none',
+   311→          opacity: props.opacity,
+   312→          boxShadow: combinedBoxShadow,
+   313→          position: 'relative',
+   314→          zIndex: 2,
+   315→        }}
+   316→      >
+   317→        <img
+   318→          src={props.src}
+   319→          alt=""
+   320→          style={{
+   321→            width: '100%',
+   322→            height: '100%',
+   323→            objectFit: props.objectFit,
+   324→            filter: `brightness(${props.brightness ?? 100}%) contrast(${props.contrast ?? 100}%) saturate(${props.saturation ?? 100}%) blur(${props.blur ?? 0}px)`,
+   325→          }}
+   326→          draggable={false}
+   327→        />
+   328→      </div>
+   329→
+   330→      {/* Reflection below */}
+   331→      {effects.reflection.enabled && (
+   332→        <div
+   333→          style={{
+   334→            position: 'absolute',
+   335→            top: `calc(100% + ${effects.reflection.distance}px)`,
+   336→            left: 0,
+   337→            width: '100%',
+   338→            height: `${effects.reflection.size}%`,
+   339→            overflow: 'hidden',
+   340→            zIndex: 1,
+   341→            pointerEvents: 'none',
+   342→            maskImage: reflectionMask,
+   343→            WebkitMaskImage: reflectionMask,
+   344→            borderRadius: `${props.borderRadius}px`,
+   345→          }}
+   346→        >
+   347→          <div style={{
+   348→            width: '100%',
+   349→            height: '100%',
+   350→            overflow: 'hidden',
+   351→            borderRadius: `${props.borderRadius}px`,
+   352→            border: props.borderWidth > 0 ? `${props.borderWidth}px solid ${props.borderColor}` : 'none',
+   353→            transform: 'scaleY(-1)',
+   354→            opacity: effects.reflection.opacity,
+   355→          }}>
+   356→            <img
+   357→              src={props.src}
+   358→              alt=""
+   359→              style={{
+   360→                width: '100%',
+   361→                height: '100%',
+   362→                objectFit: props.objectFit,
+   363→                filter: `brightness(${props.brightness ?? 100}%) contrast(${props.contrast ?? 100}%) saturate(${props.saturation ?? 100}%) blur(${props.blur ?? 0}px)`,
+   364→              }}
+   365→              draggable={false}
+   366→            />
+   367→          </div>
+   368→        </div>
+   369→      )}
+   370→    </div>
+   371→  );
+   372→}
+   373→
+   374→function PreviewLineElement({ element }: { element: CanvasElement }) {
+   375→  const props = (element.properties as { type: 'line'; data: LineProperties }).data;
+   376→
+   377→  const startX = element.lineStartX ?? element.x;
+   378→  const startY = element.lineStartY ?? (element.y + element.height / 2);
+   379→  const endX = element.lineEndX ?? (element.x + element.width);
+   380→  const endY = element.lineEndY ?? (element.y + element.height / 2);
+   381→
+   382→  const relStartX = startX - element.x;
+   383→  const relStartY = startY - element.y;
+   384→  const relEndX = endX - element.x;
+   385→  const relEndY = endY - element.y;
+   386→
+   387→  const dashArray = props.strokeStyle === 'dashed' ? '8,4' : props.strokeStyle === 'dotted' ? '2,4' : 'none';
+   388→
+   389→  return (
+   390→    <svg style={{ width: '100%', height: '100%', opacity: props.opacity, overflow: 'visible' }}>
+   391→      <path
+   392→        d={`M ${relStartX} ${relStartY} L ${relEndX} ${relEndY}`}
+   393→        stroke={props.strokeColor}
+   394→        strokeWidth={props.strokeWidth}
+   395→        strokeDasharray={dashArray}
+   396→        strokeLinecap={props.lineCap}
+   397→        fill="none"
+   398→      />
+   399→    </svg>
+   400→  );
+   401→}
+   402→
+   403→function PreviewRectangleElement({ element }: { element: CanvasElement }) {
+   404→  const props = (element.properties as { type: 'rectangle'; data: RectangleProperties }).data;
+   405→  const effects: RectangleEffects = props.effects ?? { ...DEFAULT_EFFECTS };
+   406→
+   407→  // ── Custom-corner (deformed) rectangle: render as an SVG polygon ──────────
+   408→  if (hasCustomCorners(element)) {
+   409→    const corners = getRectCornerPoints(element);
+   410→    // Build a rounded path so corner radius still applies after deformation.
+   411→    // When all radii are 0 this is equivalent to the straight-edged polygon.
+   412→    const radii = resolveRectBorderRadius(props.borderRadius);
+   413→    const pathD = buildRoundedPolygonPath(corners, radii, { x: element.x, y: element.y });
+   414→    const svgIdPrefix = `prevrect-${element.id}`;
+   415→    const fillDesc = buildSvgFillDescriptor(effects.gradient, svgIdPrefix, props.fill);
+   416→    const filterCSS = buildSvgFilterCSS(effects);
+   417→    const dasharray = svgStrokeDasharray(props.borderStyle, props.borderWidth);
+   418→    const borderStyleValue =
+   419→      props.borderStyle === 'dotted' ? 'dotted' : props.borderStyle === 'dashed' ? 'dashed' : 'solid';
+   420→    const reflectionMask = effects.reflection.enabled ? getReflectionMask(effects.reflection.preset) : undefined;
+   421→    return (
+   422→      <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+   423→        <svg
+   424→          width="100%"
+   425→          height="100%"
+   426→          viewBox={`0 0 ${element.width} ${element.height}`}
+   427→          overflow="visible"
+   428→          style={{ position: 'relative', zIndex: 2, display: 'block', filter: filterCSS || undefined, opacity: props.opacity }}
+   429→        >
+   430→          {fillDesc.defs ? <g dangerouslySetInnerHTML={{ __html: fillDesc.defs }} /> : null}
+   431→          <path
+   432→            d={pathD}
+   433→            fill={fillDesc.fill}
+   434→            stroke={props.borderColor}
+   435→            strokeWidth={props.borderWidth}
+   436→            strokeDasharray={dasharray}
+   437→            strokeLinejoin="round"
+   438→            strokeLinecap={borderStyleValue === 'dotted' ? 'round' : 'butt'}
+   439→          />
+   440→        </svg>
+   441→        {effects.reflection.enabled && (
+   442→          <div
+   443→            style={{
+   444→              position: 'absolute',
+   445→              top: `calc(100% + ${effects.reflection.distance}px)`,
+   446→              left: 0,
+   447→              width: '100%',
+   448→              height: `${effects.reflection.size}%`,
+   449→              overflow: 'hidden',
+   450→              zIndex: 1,
+   451→              pointerEvents: 'none',
+   452→              maskImage: reflectionMask,
+   453→              WebkitMaskImage: reflectionMask,
+   454→            }}
+   455→          >
+   456→            <svg
+   457→              width="100%"
+   458→              height="100%"
+   459→              viewBox={`0 0 ${element.width} ${element.height}`}
+   460→              overflow="visible"
+   461→              style={{ display: 'block', transform: 'scaleY(-1)', opacity: effects.reflection.opacity }}
+   462→            >
+   463→              {fillDesc.defs ? <g dangerouslySetInnerHTML={{ __html: fillDesc.defs }} /> : null}
+   464→              <path
+   465→                d={pathD}
+   466→                fill={fillDesc.fill}
+   467→                stroke={props.borderColor}
+   468→                strokeWidth={props.borderWidth}
+   469→                strokeDasharray={dasharray}
+   470→                strokeLinejoin="round"
+   471→              />
+   472→            </svg>
+   473→          </div>
+   474→        )}
+   475→      </div>
+   476→    );
+   477→  }
+   478→
+   479→  // Build box-shadow combining glow + shadow
+   480→  const glowCSS = buildGlowCSS(effects.glow);
+   481→  const shadowCSS = buildShadowCSS(effects.shadow, typeof props.borderRadius === 'number' ? props.borderRadius : resolveRectBorderRadius(props.borderRadius).topLeft);
+   482→  let boxShadow = '';
+   483→  if (effects.glow.enabled && effects.shadow.enabled) {
+   484→    const glowShadow = glowCSS.boxShadow || '';
+   485→    const dropShadow = shadowCSS.boxShadow || '';
+   486→    boxShadow = `${dropShadow}, ${glowShadow}`;
+   487→  } else if (effects.glow.enabled) {
+   488→    boxShadow = (glowCSS.boxShadow as string) || '';
+   489→  } else if (effects.shadow.enabled) {
+   490→    boxShadow = (shadowCSS.boxShadow as string) || '';
+   491→  }
+   492→
+   493→  // Build background using only longhand CSS properties to avoid
+   494→  // React warnings about mixing shorthand/longhand for same value.
+   495→  const bgStyle: React.CSSProperties = effects.gradient.type === 'transparent'
+   496→    ? {} // Transparent — no background
+   497→    : effects.gradient.type === 'gradient'
+   498→      ? { backgroundImage: buildGradientCSS(effects.gradient, element.width, element.height) }
+   499→      : effects.gradient.type === 'picture'
+   500→        ? { backgroundColor: props.fill, ...buildPictureFillCSS(effects.gradient) }
+   501→        : { backgroundColor: props.fill };
+   502→
+   503→  return (
+   504→    <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+   505→      <div style={{
+   506→        width: '100%',
+   507→        height: '100%',
+   508→        ...bgStyle,
+   509→        borderWidth: `${props.borderWidth}px`,
+   510→        borderColor: props.borderColor,
+   511→        borderStyle: props.borderStyle === 'dotted' ? 'dotted' : props.borderStyle === 'dashed' ? 'dashed' : 'solid',
+   512→        borderRadius: (() => { const r = resolveRectBorderRadius(props.borderRadius); return `${r.topLeft}px ${r.topRight}px ${r.bottomRight}px ${r.bottomLeft}px`; })(),
+   513→        opacity: props.opacity,
+   514→        boxSizing: 'border-box',
+   515→        ...(boxShadow ? { boxShadow } : {}),
+   516→        position: 'relative',
+   517→        zIndex: 2,
+   518→      }} />
+   519→      {effects.reflection.enabled && (() => {
+   520→        const maskGradient = REFLECTION_MASKS[effects.reflection.preset] || REFLECTION_MASKS.fade;
+   521→        const radii = resolveRectBorderRadius(props.borderRadius);
+   522→        const borderRadiusStr = `${radii.topLeft}px ${radii.topRight}px ${radii.bottomRight}px ${radii.bottomLeft}px`;
+   523→        return (
+   524→          <div style={{
+   525→            position: 'absolute',
+   526→            top: `calc(100% + ${effects.reflection.distance}px)`,
+   527→            left: 0,
+   528→            width: '100%',
+   529→            height: `${effects.reflection.size}%`,
+   530→            overflow: 'hidden',
+   531→            zIndex: 1,
+   532→            pointerEvents: 'none',
+   533→            WebkitMaskImage: maskGradient,
+   534→            maskImage: maskGradient,
+   535→          }}>
+   536→            <div style={{
+   537→              width: '100%',
+   538→              height: '100%',
+   539→              transform: 'scaleY(-1)',
+   540→              opacity: effects.reflection.opacity,
+   541→              ...bgStyle,
+   542→              borderWidth: `${props.borderWidth}px`,
+   543→              borderColor: props.borderColor,
+   544→              borderStyle: props.borderStyle === 'dotted' ? 'dotted' : props.borderStyle === 'dashed' ? 'dashed' : 'solid',
+   545→              borderRadius: borderRadiusStr,
+   546→              boxSizing: 'border-box',
+   547→            }} />
+   548→          </div>
+   549→        );
+   550→      })()}
+   551→    </div>
+   552→  );
+   553→}
+   554→
+   555→function PreviewEllipseElement({ element }: { element: CanvasElement }) {
+   556→  const props = (element.properties as { type: 'ellipse'; data: EllipseProperties }).data;
+   557→  const effects: RectangleEffects = props.effects ?? { ...DEFAULT_EFFECTS };
+   558→
+   559→  // Build box-shadow combining glow + shadow
+   560→  const glowCSS = buildGlowCSS(effects.glow);
+   561→  const shadowCSS = buildShadowCSS(effects.shadow, 50);
+   562→  let boxShadow = '';
+   563→  if (effects.glow.enabled && effects.shadow.enabled) {
+   564→    const glowShadow = glowCSS.boxShadow || '';
+   565→    const dropShadow = shadowCSS.boxShadow || '';
+   566→    boxShadow = `${dropShadow}, ${glowShadow}`;
+   567→  } else if (effects.glow.enabled) {
+   568→    boxShadow = (glowCSS.boxShadow as string) || '';
+   569→  } else if (effects.shadow.enabled) {
+   570→    boxShadow = (shadowCSS.boxShadow as string) || '';
+   571→  }
+   572→
+   573→  // Build background using only longhand CSS properties to avoid
+   574→  // React warnings about mixing shorthand/longhand for same value.
+   575→  const bgStyle: React.CSSProperties = effects.gradient.type === 'transparent'
+   576→    ? {} // Transparent — no background
+   577→    : effects.gradient.type === 'gradient'
+   578→      ? { backgroundImage: buildGradientCSS(effects.gradient, element.width, element.height) }
+   579→      : effects.gradient.type === 'picture'
+   580→        ? { backgroundColor: props.fill, ...buildPictureFillCSS(effects.gradient) }
+   581→        : { backgroundColor: props.fill };
+   582→
+   583→  return (
+   584→    <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+   585→      <div style={{
+   586→        width: '100%',
+   587→        height: '100%',
+   588→        ...bgStyle,
+   589→        borderWidth: `${props.borderWidth}px`,
+   590→        borderColor: props.borderColor,
+   591→        borderStyle: props.borderStyle === 'dotted' ? 'dotted' : props.borderStyle === 'dashed' ? 'dashed' : 'solid',
+   592→        borderRadius: '50%',
+   593→        opacity: props.opacity,
+   594→        boxSizing: 'border-box',
+   595→        ...(boxShadow ? { boxShadow } : {}),
+   596→        position: 'relative',
+   597→        zIndex: 2,
+   598→      }} />
+   599→      {effects.reflection.enabled && (() => {
+   600→        const maskGradient = REFLECTION_MASKS[effects.reflection.preset] || REFLECTION_MASKS.fade;
+   601→        return (
+   602→          <div style={{
+   603→            position: 'absolute',
+   604→            top: `calc(100% + ${effects.reflection.distance}px)`,
+   605→            left: 0,
+   606→            width: '100%',
+   607→            height: `${effects.reflection.size}%`,
+   608→            overflow: 'hidden',
+   609→            zIndex: 1,
+   610→            pointerEvents: 'none',
+   611→            WebkitMaskImage: maskGradient,
+   612→            maskImage: maskGradient,
+   613→          }}>
+   614→            <div style={{
+   615→              width: '100%',
+   616→              height: '100%',
+   617→              transform: 'scaleY(-1)',
+   618→              opacity: effects.reflection.opacity,
+   619→              ...bgStyle,
+   620→              borderWidth: `${props.borderWidth}px`,
+   621→              borderColor: props.borderColor,
+   622→              borderStyle: props.borderStyle === 'dotted' ? 'dotted' : props.borderStyle === 'dashed' ? 'dashed' : 'solid',
+   623→              borderRadius: '50%',
+   624→              boxSizing: 'border-box',
+   625→            }} />
+   626→          </div>
+   627→        );
+   628→      })()}
+   629→    </div>
+   630→  );
+   631→}
+   632→
+   633→// Renders the visual content of a child element inside a group (non-interactive)
+   634→function PreviewGroupChildContent({ element }: { element: CanvasElement }) {
+   635→  if (!element.visible) return null;
+   636→  switch (element.type) {
+   637→    case 'text': return <PreviewTextElement element={element} />;
+   638→    case 'table': return <PreviewTableElement element={element} />;
+   639→    case 'image': return <PreviewImageElement element={element} />;
+   640→    case 'line': return <PreviewLineElement element={element} />;
+   641→    case 'rectangle': return <PreviewRectangleElement element={element} />;
+   642→    case 'ellipse': return <PreviewEllipseElement element={element} />;
+   643→    case 'group': return <PreviewGroupElement element={element} />;
+   644→    default: return null;
+   645→  }
+   646→}
+   647→
+   648→// Renders a group element by rendering its children at their relative positions
+   649→function PreviewGroupElement({ element }: { element: CanvasElement }) {
+   650→  if (!element.children || element.children.length === 0) return null;
+   651→  return (
+   652→    <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+   653→      {element.children.map((child) => {
+   654→        if (!child.visible) return null;
+   655→        return (
+   656→          <div
+   657→            key={child.id}
+   658→            style={{
+   659→              position: 'absolute',
+   660→              left: child.x,
+   661→              top: child.y,
+   662→              width: child.width,
+   663→              height: child.height,
+   664→            }}
+   665→          >
+   666→            <PreviewGroupChildContent element={child} />
+   667→          </div>
+   668→        );
+   669→      })}
+   670→    </div>
+   671→  );
+   672→}
+   673→
+   674→const PreviewElement = memo(function PreviewElement({ element }: { element: CanvasElement }) {
+   675→  if (!element.visible) return null;
+   676→
+   677→  // For rectangles with rotation, wrap the shape content in a rotating div
+   678→  // (same "rotate content only" strategy as the canvas + PDF renderers — the
+   679→  // outer positioning wrapper stays axis-aligned so the absolute left/top/
+   680→  // width/height = bbox is correct; only the inner shape spins).
+   681→  const rectRotation = element.type === 'rectangle' ? getRectRotation(element) : 0;
+   682→  const rotationWrapperStyle = rectRotation
+   683→    ? { transform: `rotate(${rectRotation}deg)`, transformOrigin: 'center' as const, width: '100%' as const, height: '100%' as const }
+   684→    : { width: '100%' as const, height: '100%' as const };
+   685→
+   686→  return (
+   687→    <div
+   688→      style={{
+   689→        position: 'absolute',
+   690→        left: element.x,
+   691→        top: element.y,
+   692→        width: element.width,
+   693→        height: element.height,
+   694→      }}
+   695→    >
+   696→      <div style={rotationWrapperStyle}>
+   697→        {element.type === 'text' && <PreviewTextElement element={element} />}
+   698→        {element.type === 'table' && <PreviewTableElement element={element} />}
+   699→        {element.type === 'image' && <PreviewImageElement element={element} />}
+   700→        {element.type === 'line' && <PreviewLineElement element={element} />}
+   701→        {element.type === 'rectangle' && <PreviewRectangleElement element={element} />}
+   702→        {element.type === 'ellipse' && <PreviewEllipseElement element={element} />}
+   703→        {element.type === 'group' && <PreviewGroupElement element={element} />}
+   704→      </div>
+   705→    </div>
+   706→  );
+   707→});
+   708→
+   709→// ── Main Modal Component ──────────────────────────────────────────────────
+   710→
+   711→export function LargePreviewModal() {
+   712→  const largePreviewOpen = useDesignerStore((s) => s.largePreviewOpen);
+   713→  const setLargePreviewOpen = useDesignerStore((s) => s.setLargePreviewOpen);
+   714→  const [zoom, setZoom] = useState(1);
+   715→  const [zoomStep, setZoomStep] = useState(15);
+   716→  const [customStep, setCustomStep] = useState('');
+   717→  const [showCustomStep, setShowCustomStep] = useState(false);
+   718→  // Dark preview background — toggles the preview workspace area to a dark
+   719→  // grey so the user can preview how the invoice looks on a dark backdrop.
+   720→  // Only affects the area around the page, not the page itself.
+   721→  const [darkPreview, setDarkPreview] = useState(false);
+   722→  const containerRef = useRef<HTMLDivElement>(null);
+   723→  const zoomRef = useRef(1);
+   724→  // Ref to queue a scroll-adjustment that must happen after the next render
+   725→  const pendingScrollAdjust = useRef<{ contentX: number; contentY: number } | null>(null);
+   726→
+   727→  const pageWidth = useDesignerStore((s) => s.canvasSettings.pageWidth);
+   728→  const pageHeight = useDesignerStore((s) => s.canvasSettings.pageHeight);
+   729→  const pageBackgroundColor = useDesignerStore((s) => s.canvasSettings.pageBackgroundColor);
+   730→  const elements = useDesignerStore((s) => s.elements);
+   731→
+   732→  // Apply pending scroll adjustments synchronously before the browser paints
+   733→  // so the user never sees a frame with wrong scroll position
+   734→  useLayoutEffect(() => {
+   735→    const adj = pendingScrollAdjust.current;
+   736→    if (adj === null) return;
+   737→    pendingScrollAdjust.current = null;
+   738→
+   739→    const container = containerRef.current;
+   740→    if (!container) return;
+   741→
+   742→    const centerX = container.clientWidth / 2;
+   743→    const centerY = container.clientHeight / 2;
+   744→    container.scrollLeft = adj.contentX * zoom - centerX;
+   745→    container.scrollTop = adj.contentY * zoom - centerY;
+   746→  }, [zoom]);
+   747→
+   748→  // Close on Escape
+   749→  useEffect(() => {
+   750→    if (!largePreviewOpen) return;
+   751→    const handleKeyDown = (e: KeyboardEvent) => {
+   752→      if (e.key === 'Escape') {
+   753→        setLargePreviewOpen(false);
+   754→      }
+   755→    };
+   756→    window.addEventListener('keydown', handleKeyDown);
+   757→    return () => window.removeEventListener('keydown', handleKeyDown);
+   758→  }, [largePreviewOpen, setLargePreviewOpen]);
+   759→
+   760→  // Mouse wheel zoom — RAF-throttled to coalesce rapid scroll events
+   761→  const wheelAccumRef = useRef({ delta: 0, contentX: 0, contentY: 0 });
+   762→  const wheelRafRef = useRef<number | null>(null);
+   763→
+   764→  useEffect(() => {
+   765→    if (!largePreviewOpen) return;
+   766→    const container = containerRef.current;
+   767→    if (!container) return;
+   768→
+   769→    const handleWheel = (e: WheelEvent) => {
+   770→      e.preventDefault();
+   771→
+   772→      const currentZoom = zoomRef.current;
+   773→      const step = (e.ctrlKey || e.metaKey ? 5 : zoomStep) / 100;
+   774→      const delta = e.deltaY > 0 ? -step : step;
+   775→
+   776→      // Compute content point at viewport center BEFORE zoom changes
+   777→      const centerX = container.clientWidth / 2;
+   778→      const centerY = container.clientHeight / 2;
+   779→      const contentX = (container.scrollLeft + centerX) / currentZoom;
+   780→      const contentY = (container.scrollTop + centerY) / currentZoom;
+   781→
+   782→      // Accumulate and coalesce via RAF
+   783→      wheelAccumRef.current.delta += delta;
+   784→      wheelAccumRef.current.contentX = contentX;
+   785→      wheelAccumRef.current.contentY = contentY;
+   786→
+   787→      if (wheelRafRef.current === null) {
+   788→        wheelRafRef.current = requestAnimationFrame(() => {
+   789→          const accum = wheelAccumRef.current;
+   790→          const newZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, currentZoom + accum.delta));
+   791→          accum.delta = 0;
+   792→
+   793→          if (newZoom !== currentZoom) {
+   794→            pendingScrollAdjust.current = { contentX: accum.contentX, contentY: accum.contentY };
+   795→            zoomRef.current = newZoom;
+   796→            setZoom(newZoom);
+   797→          }
+   798→
+   799→          wheelRafRef.current = null;
+   800→        });
+   801→      }
+   802→    };
+   803→
+   804→    container.addEventListener('wheel', handleWheel, { passive: false });
+   805→    return () => {
+   806→      container.removeEventListener('wheel', handleWheel);
+   807→      if (wheelRafRef.current !== null) {
+   808→        cancelAnimationFrame(wheelRafRef.current);
+   809→        wheelRafRef.current = null;
+   810→      }
+   811→    };
+   812→  }, [largePreviewOpen, zoomStep]);
+   813→
+   814→  // Helper: update zoom and re-center on the viewport center
+   815→  const applyZoomCentered = useCallback((newZoom: number) => {
+   816→    const container = containerRef.current;
+   817→    if (!container) return;
+   818→
+   819→    const currentZoom = zoomRef.current;
+   820→    const clamped = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, newZoom));
+   821→
+   822→    // Compute content point at viewport center BEFORE updating zoom
+   823→    const centerX = container.scrollLeft + container.clientWidth / 2;
+   824→    const centerY = container.scrollTop + container.clientHeight / 2;
+   825→    const contentX = centerX / currentZoom;
+   826→    const contentY = centerY / currentZoom;
+   827→
+   828→    // Queue scroll adjustment for useLayoutEffect (runs before paint)
+   829→    pendingScrollAdjust.current = { contentX, contentY };
+   830→    zoomRef.current = clamped;
+   831→    setZoom(clamped);
+   832→  }, []);
+   833→
+   834→  // Fit to view
+   835→  const handleFitToView = useCallback(() => {
+   836→    const container = containerRef.current;
+   837→    if (!container) return;
+   838→
+   839→    const containerW = container.clientWidth - 48;
+   840→    const containerH = container.clientHeight - 48;
+   841→    const fitZoom = Math.min(containerW / pageWidth, containerH / pageHeight, 1);
+   842→
+   843→    // Center the page in the viewport via pendingScrollAdjust
+   844→    pendingScrollAdjust.current = { contentX: pageWidth / 2, contentY: pageHeight / 2 };
+   845→    zoomRef.current = fitZoom;
+   846→    setZoom(fitZoom);
+   847→  }, [pageWidth, pageHeight]);
+   848→
+   849→  // Fit to view when modal opens
+   850→  useEffect(() => {
+   851→    if (!largePreviewOpen) return;
+   852→    // Wait for the container to mount and layout before calculating fit zoom
+   853→    const raf = requestAnimationFrame(() => {
+   854→      handleFitToView();
+   855→    });
+   856→    return () => cancelAnimationFrame(raf);
+   857→  }, [largePreviewOpen, handleFitToView]);
+   858→
+   859→  // Zoom step handlers
+   860→  const handleStepSelect = (value: number) => {
+   861→    setZoomStep(value);
+   862→    setShowCustomStep(false);
+   863→    setCustomStep('');
+   864→  };
+   865→
+   866→  const handleCustomStepSubmit = () => {
+   867→    const val = parseInt(customStep, 10);
+   868→    if (!isNaN(val) && val >= 1 && val <= 100) {
+   869→      setZoomStep(val);
+   870→      setShowCustomStep(false);
+   871→      setCustomStep('');
+   872→    }
+   873→  };
+   874→
+   875→  const zoomPercent = Math.round(zoom * 100);
+   876→  const step = zoomStep / 100;
+   877→
+   878→  // Memoize visible elements to avoid unnecessary re-renders
+   879→  const visibleElements = useMemo(() => elements.filter((el) => el.visible), [elements]);
+   880→
+   881→  if (!largePreviewOpen) return null;
+   882→
+   883→  const scaledWidth = pageWidth * zoom;
+   884→  const scaledHeight = pageHeight * zoom;
+   885→
+   886→  return (
+   887→    <div
+   888→      className="fixed inset-0 z-[99999] flex items-center justify-center"
+   889→      onClick={() => setLargePreviewOpen(false)}
+   890→    >
+   891→      {/* Dark overlay */}
+   892→      <div className="absolute inset-0 bg-black/60" />
+   893→
+   894→      {/* Modal content */}
+   895→      <div
+   896→        className="relative z-10 bg-card rounded-lg shadow-2xl border border-border overflow-hidden flex flex-col"
+   897→        style={{ width: '90vw', height: '90vh', maxWidth: '1400px', maxHeight: '95vh' }}
+   898→        onClick={(e) => e.stopPropagation()}
+   899→      >
+   900→        {/* Header */}
+   901→        <div className="flex items-center justify-between px-4 py-3 border-b border-border shrink-0">
+   902→          <div className="flex items-center gap-3">
+   903→            <h2 className="text-sm font-semibold text-foreground">PDF Preview</h2>
+   904→            <span className="text-xs text-muted-foreground">
+   905→              {pageWidth} × {pageHeight}px
+   906→            </span>
+   907→          </div>
+   908→          <div className="flex items-center gap-1">
+   909→            {/* Zoom controls */}
+   910→            <div className="flex items-center gap-1 bg-card border border-border rounded-lg px-1 py-0.5 shadow-sm">
+   911→              <Button
+   912→                variant="ghost"
+   913→                size="icon"
+   914→                className="h-7 w-7"
+   915→                onClick={() => applyZoomCentered(zoom - step)}
+   916→                title="Zoom out"
+   917→              >
+   918→                <ZoomOut className="h-3.5 w-3.5" />
+   919→              </Button>
+   920→              <DropdownMenu>
+   921→                <DropdownMenuTrigger asChild>
+   922→                  <Button variant="ghost" size="sm" className="h-7 px-2 text-xs font-mono gap-0.5" title="Zoom level">
+   923→                    {zoomPercent}%
+   924→                    <ChevronDown className="h-3 w-3" />
+   925→                  </Button>
+   926→                </DropdownMenuTrigger>
+   927→                <DropdownMenuContent align="center" className="z-[100000] min-w-[120px]">
+   928→                  {zoomPresets.map((preset) => (
+   929→                    <DropdownMenuItem
+   930→                      key={preset.label}
+   931→                      onClick={() => applyZoomCentered(preset.value)}
+   932→                      className={zoomPercent === Math.round(preset.value * 100) ? 'bg-accent' : ''}
+   933→                    >
+   934→                      {preset.label}
+   935→                    </DropdownMenuItem>
+   936→                  ))}
+   937→                </DropdownMenuContent>
+   938→              </DropdownMenu>
+   939→              <Button
+   940→                variant="ghost"
+   941→                size="icon"
+   942→                className="h-7 w-7"
+   943→                onClick={() => applyZoomCentered(zoom + step)}
+   944→                title="Zoom in"
+   945→              >
+   946→                <ZoomIn className="h-3.5 w-3.5" />
+   947→              </Button>
+   948→              <div className="w-px h-4 bg-border mx-0.5" />
+   949→              <Button
+   950→                variant="ghost"
+   951→                size="icon"
+   952→                className="h-7 w-7"
+   953→                onClick={handleFitToView}
+   954→                title="Fit to view"
+   955→              >
+   956→                <Maximize className="h-3.5 w-3.5" />
+   957→              </Button>
+   958→            </div>
+   959→
+   960→            {/* Zoom step selector */}
+   961→            <DropdownMenu>
+   962→              <DropdownMenuTrigger asChild>
+   963→                <Button variant="outline" size="sm" className="h-7 px-2 text-xs font-mono gap-0.5" title="Zoom step size">
+   964→                  Step: {zoomStep}%
+   965→                  <ChevronDown className="h-3 w-3" />
+   966→                </Button>
+   967→              </DropdownMenuTrigger>
+   968→              <DropdownMenuContent align="center" className="z-[100000] min-w-[140px]">
+   969→                {ZOOM_STEP_PRESETS.map((preset) => (
+   970→                  <DropdownMenuItem
+   971→                    key={preset.label}
+   972→                    onClick={() => handleStepSelect(preset.value)}
+   973→                    className={zoomStep === preset.value ? 'bg-accent' : ''}
+   974→                  >
+   975→                    {preset.label}
+   976→                  </DropdownMenuItem>
+   977→                ))}
+   978→                <DropdownMenuSeparator />
+   979→                <DropdownMenuItem
+   980→                  onClick={() => setShowCustomStep(true)}
+   981→                  className={
+   982→                    ![1, 5, 10, 20, 50].includes(zoomStep) ? 'bg-accent' : ''
+   983→                  }
+   984→                >
+   985→                  Custom ({zoomStep}%)
+   986→                </DropdownMenuItem>
+   987→                {showCustomStep && (
+   988→                  <div className="px-2 py-1.5 flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
+   989→                    <Input
+   990→                      type="number"
+   991→                      min={1}
+   992→                      max={100}
+   993→                      value={customStep}
+   994→                      onChange={(e) => setCustomStep(e.target.value)}
+   995→                      onKeyDown={(e) => e.key === 'Enter' && handleCustomStepSubmit()}
+   996→                      placeholder="1-100"
+   997→                      className="h-7 w-16 text-xs"
+   998→                      autoFocus
+   999→                    />
+  1000→                    <Button size="sm" className="h-7 text-xs px-2" onClick={handleCustomStepSubmit}>
+  1001→                      Set
+  1002→                    </Button>
+  1003→                  </div>
+  1004→                )}
+  1005→              </DropdownMenuContent>
+  1006→            </DropdownMenu>
+  1007→
+  1008→            <div className="w-px h-4 bg-border mx-1" />
+  1009→            <DarkPreviewToggle checked={darkPreview} onCheckedChange={setDarkPreview} />
+  1010→            <div className="w-px h-4 bg-border mx-1" />
+  1011→            <Button
+  1012→              variant="ghost"
+  1013→              size="icon"
+  1014→              className="h-7 w-7"
+  1015→              onClick={() => setLargePreviewOpen(false)}
+  1016→              title="Close (Esc)"
+  1017→            >
+  1018→              <X className="h-4 w-4" />
+  1019→            </Button>
+  1020→          </div>
+  1021→        </div>
+  1022→
+  1023→        {/* Preview area — scrollable, wheel zoom enabled, centered */}
+  1024→        <div
+  1025→          ref={containerRef}
+  1026→          className="flex-1 overflow-auto bg-muted/30"
+  1027→          style={{
+  1028→            cursor: 'default',
+  1029→            // Dark preview background — dark grey workspace (not the page).
+  1030→            // Only the area behind/around the page turns dark.
+  1031→            backgroundColor: darkPreview ? '#313136' : undefined,
+  1032→            transition: 'background-color .4s ease',
+  1033→          }}
+  1034→        >
+  1035→          <div
+  1036→            className="flex items-center justify-center min-h-full"
+  1037→            style={{ padding: '24px' }}
+  1038→          >
+  1039→            <div
+  1040→              className="shadow-lg border border-gray-200 rounded-sm shrink-0 relative overflow-hidden"
+  1041→              style={{
+  1042→                width: scaledWidth,
+  1043→                height: scaledHeight,
+  1044→                backgroundColor: pageBackgroundColor || '#ffffff',
+  1045→              }}
+  1046→            >
+  1047→              {/* Live DOM preview zoomed via the CSS `zoom` property (the SAME
+  1048→                  method the canvas now uses). `zoom` makes the browser lay out
+  1049→                  + re-rasterize every descendant (text, SVG, borders) at the
+  1050→                  TARGET (zoomed) resolution, so rendering stays pixel-perfect
+  1051→                  at every zoom level — no compositing-layer downscale blur like
+  1052→                  `transform: scale()` causes when zooming out. The parent is
+  1053→                  already sized to `scaledWidth × scaledHeight` so the zoomed
+  1054→                  page fills it exactly. */}
+  1055→              <div
+  1056→                style={{
+  1057→                  width: pageWidth,
+  1058→                  height: pageHeight,
+  1059→                  position: 'relative',
+  1060→                  overflow: 'hidden',
+  1061→                  zoom: zoom,
+  1062→                  // Crisp text & vector rendering at any zoom
+  1063→                  textRendering: 'geometricPrecision',
+  1064→                  WebkitFontSmoothing: 'antialiased',
+  1065→                }}
+  1066→              >
+  1067→                {visibleElements.map((element) => (
+  1068→                  <PreviewElement key={element.id} element={element} />
+  1069→                ))}
+  1070→              </div>
+  1071→            </div>
+  1072→          </div>
+  1073→        </div>
+  1074→      </div>
+  1075→    </div>
+  1076→  );
+  1077→}
+  1078→

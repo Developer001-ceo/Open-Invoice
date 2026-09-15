@@ -766,11 +766,19 @@ export function Canvas() {
     };
   }, []);
 
-  // Track ALT key state globally for table cell multi-selection
+  // Track ALT key state globally for table cell multi-selection.
+  // altHeld is always tracked, but preventDefault only fires while the pointer
+  // is over the canvas viewport — swallowing Alt everywhere would break the
+  // browser menu-access shortcut (notably Firefox) for the rest of the page.
   useEffect(() => {
+    let pointerInCanvas = false;
+    const handlePointerOver = (e: PointerEvent) => {
+      const vp = viewportRef.current;
+      pointerInCanvas = !!vp && !!e.target && vp.contains(e.target as Node);
+    };
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Alt') {
-        e.preventDefault();
+        if (pointerInCanvas) e.preventDefault();
         useDesignerStore.getState().setAltHeld(true);
       }
     };
@@ -779,9 +787,11 @@ export function Canvas() {
         useDesignerStore.getState().setAltHeld(false);
       }
     };
+    window.addEventListener('pointerover', handlePointerOver, { passive: true });
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
     return () => {
+      window.removeEventListener('pointerover', handlePointerOver);
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
     };

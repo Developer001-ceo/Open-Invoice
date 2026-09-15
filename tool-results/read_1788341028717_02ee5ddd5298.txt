@@ -1,0 +1,2002 @@
+     1→import { create } from 'zustand';
+     2→import { v4 as uuidv4 } from 'uuid';
+     3→import {
+     4→  CanvasElement,
+     5→  ElementType,
+     6→  getDefaultProperties,
+     7→  getDefaultSize,
+     8→  getDefaultName,
+     9→  ElementProperties,
+    10→  computeLineBounds,
+    11→  TableProperties,
+    12→  RectangleProperties,
+    13→  getRectRotation,
+    14→  normalizeAngle,
+    15→} from '@/lib/element-types';
+    16→import { ensureColWidths, ensureRowHeights } from '@/lib/table-helpers';
+    17→import {
+    18→  hasCustomCorners,
+    19→  getRectCornerPoints,
+    20→  initRectCornerPointsFromBBox,
+    21→  bboxOfPoints,
+    22→  scaleCornerPoints,
+    23→  resizeCornerPointsByEdges,
+    24→  resizeRotatedCornerPoints,
+    25→  translateCornerPoints,
+    26→  CORNER_HANDLE_MAP,
+    27→  horizontalAlignPartnerIndex,
+    28→  verticalAlignPartnerIndex,
+    29→  type Point,
+    30→} from '@/lib/rectangle-corners';
+    31→import { PREDEFINED_BLOCKS } from '@/lib/predefined-blocks';
+    32→import { AlignmentGuide, calculateSnapForPosition, calculateSnapForResize, calculateSnapForEndpointDrag, flattenElementsForSnap, invalidateSnapCache, getElementBorderWidth } from '@/lib/snapping';
+    33→import {
+    34→  serializeProject,
+    35→  deserializeProject,
+    36→  validateProjectFile,
+    37→  saveProjectToFile,
+    38→  saveProjectAsWithDialog,
+    39→  saveProjectToHandle,
+    40→  openProjectWithDialog,
+    41→  loadProjectFromFile,
+    42→  ProjectFile,
+    43→  APP_VERSION,
+    44→} from '@/lib/project-file';
+    45→import { clearAutosave } from '@/lib/autosave';
+    46→import { toast } from '@/hooks/use-toast';
+    47→
+    48→const VIEWPORT_PADDING = 40;
+    49→
+    50→// Module-level timers for the store's fire-and-forget UI animations (auto-pan
+    51→// flag clear, alignment-guideline clear). Tracked so a new invocation cancels
+    52→// any pending one from the previous invocation — prevents timer accumulation
+    53→// when actions are triggered rapidly (e.g. repeated alignment clicks).
+    54→let autoPanTimer: ReturnType<typeof setTimeout> | null = null;
+    55→let alignmentGuidelineTimer: ReturnType<typeof setTimeout> | null = null;
+    56→
+    57→// Horizontal centering ratio for fit-to-page. Instead of dead-center (0.5), the
+    58→// page is centered at 45% of the viewport width so it nudges slightly toward
+    59→// the left tool panel — leaving a little more room on the right for the
+    60→// shortcuts overlay. Vertical centering stays at 0.5.
+    61→const HORIZONTAL_CENTER_RATIO = 0.45;
+    62→
+    63→// ── Re-ID element helper ────────────────────────────────────────────────────
+    64→// When duplicating/pasting an element (especially a group), we must assign new
+    65→// UUIDs to the element AND all of its children to avoid duplicate IDs in the
+    66→// element tree.  Duplicate IDs cause lookups (findElementById, findParentGroup)
+    67→// to return the wrong element.
+    68→function reIdElement(element: CanvasElement): CanvasElement {
+    69→  const result: CanvasElement = {
+    70→    ...element,
+    71→    id: uuidv4(),
+    72→    // Deep-copy cornerPoints so duplicates/pastes have independent corners
+    73→    // (a shallow copy would share the array reference with the source).
+    74→    ...(element.cornerPoints
+    75→      ? { cornerPoints: element.cornerPoints.map((p) => ({ x: p.x, y: p.y })) }
+    76→      : {}),
+    77→  };
+    78→  if (result.type === 'group' && result.children) {
+    79→    result.children = result.children.map((c) => reIdElement(c));
+    80→  }
+    81→  return result;
+    82→}
+    83→
+    84→// ── Line–Rectangle intersection ────────────────────────────────────────────
+    85→// Used by marquee selection to accurately test whether a line element
+    86→// intersects the selection rectangle, rather than relying on the line's
+    87→// bounding box which can be much larger than the visible line itself.
+    88→
+    89→/** Check if point (px, py) lies inside the axis-aligned rect [l,t,r,b]. */
+    90→function pointInRect(px: number, py: number, l: number, t: number, r: number, b: number): boolean {
+    91→  return px >= l && px <= r && py >= t && py <= b;
+    92→}
+    93→
+    94→/** Return the cross product of vectors (p1→p2) × (p1→p3). */
+    95→function cross(p1x: number, p1y: number, p2x: number, p2y: number, p3x: number, p3y: number): number {
+    96→  return (p2x - p1x) * (p3y - p1y) - (p2y - p1y) * (p3x - p1x);
+    97→}
+    98→
+    99→/**
+   100→ * Check whether the line segment (x1,y1)→(x2,y2) intersects the
+   101→ * axis-aligned rectangle [left, top, right, bottom].
+   102→ *
+   103→ * Algorithm:
+   104→ *  1. If either endpoint is inside the rect → intersect.
+   105→ *  2. Test intersection of the segment against each of the 4 rectangle
+   106→ *     edges using the separating-axis (cross-product) test.
+   107→ */
+   108→function lineIntersectsRect(
+   109→  x1: number, y1: number, x2: number, y2: number,
+   110→  left: number, top: number, right: number, bottom: number,
+   111→): boolean {
+   112→  // Quick check: either endpoint inside the rect
+   113→  if (pointInRect(x1, y1, left, top, right, bottom)) return true;
+   114→  if (pointInRect(x2, y2, left, top, right, bottom)) return true;
+   115→
+   116→  // Check intersection with each of the 4 edges of the rectangle
+   117→  // Top edge: (left,top)→(right,top)
+   118→  if (segmentsIntersect(x1, y1, x2, y2, left, top, right, top)) return true;
+   119→  // Bottom edge: (left,bottom)→(right,bottom)
+   120→  if (segmentsIntersect(x1, y1, x2, y2, left, bottom, right, bottom)) return true;
+   121→  // Left edge: (left,top)→(left,bottom)
+   122→  if (segmentsIntersect(x1, y1, x2, y2, left, top, left, bottom)) return true;
+   123→  // Right edge: (right,top)→(right,bottom)
+   124→  if (segmentsIntersect(x1, y1, x2, y2, right, top, right, bottom)) return true;
+   125→
+   126→  return false;
+   127→}
+   128→
+   129→/**
+   130→ * Check whether two line segments (ax1,ay1)→(ax2,ay2) and
+   131→ * (bx1,by1)→(bx2,by2) properly intersect (crossing each other,
+   132→ * not just touching at endpoints).
+   133→ */
+   134→function segmentsIntersect(
+   135→  ax1: number, ay1: number, ax2: number, ay2: number,
+   136→  bx1: number, by1: number, bx2: number, by2: number,
+   137→): boolean {
+   138→  const d1 = cross(bx1, by1, bx2, by2, ax1, ay1);
+   139→  const d2 = cross(bx1, by1, bx2, by2, ax2, ay2);
+   140→  const d3 = cross(ax1, ay1, ax2, ay2, bx1, by1);
+   141→  const d4 = cross(ax1, ay1, ax2, ay2, bx2, by2);
+   142→
+   143→  if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+   144→      ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) {
+   145→    return true;
+   146→  }
+   147→
+   148→  // Collinear / endpoint-touching cases — treat as non-intersecting for
+   149→  // marquee selection purposes (the endpoint-inside-rect check above
+   150→  // already handles the case where a line endpoint is inside the rect).
+   151→  return false;
+   152→}
+   153→
+   154→// ── Undo / Redo ────────────────────────────────────────────────────────────
+   155→const MAX_UNDO_HISTORY = 50;
+   156→
+   157→/**
+   158→ * Depth counter for bulk operations that must produce a SINGLE undo entry.
+   159→ * While > 0, pushUndo() becomes a no-op so batch actions (e.g. multi-element
+   160→ * cut) can push one snapshot themselves instead of one per sub-operation.
+   161→ */
+   162→let suppressAutoUndoDepth = 0;
+   163→
+   164→/** Subset of store state that represents a "document" snapshot for undo/redo. */
+   165→interface HistorySnapshot {
+   166→  elements: CanvasElement[];
+   167→  elementCounter: Record<ElementType, number>;
+   168→  canvasSettings: CanvasSettings;
+   169→}
+   170→
+   171→function takeSnapshot(state: {
+   172→  elements: CanvasElement[];
+   173→  elementCounter: Record<ElementType, number>;
+   174→  canvasSettings: CanvasSettings;
+   175→}): HistorySnapshot {
+   176→  return {
+   177→    elements: structuredClone(state.elements),
+   178→    elementCounter: { ...state.elementCounter },
+   179→    canvasSettings: structuredClone(state.canvasSettings),
+   180→  };
+   181→}
+   182→
+   183→// Debounce state for property update undo pushes.
+   184→// Prevents flooding the undo stack when sliders or text inputs fire many rapid changes.
+   185→let propertyUndoTimer: ReturnType<typeof setTimeout> | null = null;
+   186→let pendingPropertySnapshot: HistorySnapshot | null = null;
+   187→const PROPERTY_UNDO_DEBOUNCE_MS = 400;
+   188→
+   189→/** Internal helper: push a snapshot onto the undo stack and clear redo. */
+   190→function commitSnapshotToUndo(snapshot: HistorySnapshot) {
+   191→  const current = useDesignerStore.getState();
+   192→  const newUndoStack = [...current.undoStack, snapshot];
+   193→  if (newUndoStack.length > MAX_UNDO_HISTORY) newUndoStack.shift();
+   194→  useDesignerStore.setState({
+   195→    undoStack: newUndoStack,
+   196→    redoStack: [],
+   197→    canUndo: true,
+   198→    canRedo: false,
+   199→  });
+   200→}
+   201→
+   202→/** Push a debounced undo snapshot for property changes.
+   203→ *  The first call captures the "before" state, immediately clears the redo
+   204→ *  stack and updates canUndo/canRedo so the UI stays consistent. Subsequent
+   205→ *  calls within the debounce window are absorbed. When the timer fires, the
+   206→ *  snapshot is pushed onto the undo stack. */
+   207→function debouncedPropertyPushUndo(
+   208→  state: { elements: CanvasElement[]; elementCounter: Record<ElementType, number>; canvasSettings: CanvasSettings },
+   209→) {
+   210→  if (propertyUndoTimer === null) {
+   211→    // First call in a new interaction — capture the BEFORE state immediately
+   212→    pendingPropertySnapshot = takeSnapshot(state);
+   213→    // Immediately clear redo stack & update flags so the UI is consistent
+   214→    // from the moment the first property change happens.
+   215→    useDesignerStore.setState({
+   216→      redoStack: [],
+   217→      canRedo: false,
+   218→      canUndo: true, // the pending snapshot guarantees at least one undo step
+   219→    });
+   220→  }
+   221→  // Reset the debounce timer
+   222→  if (propertyUndoTimer) clearTimeout(propertyUndoTimer);
+   223→  propertyUndoTimer = setTimeout(() => {
+   224→    if (pendingPropertySnapshot !== null) {
+   225→      // Push the captured "before" snapshot
+   226→      commitSnapshotToUndo(pendingPropertySnapshot);
+   227→      pendingPropertySnapshot = null;
+   228→    }
+   229→    propertyUndoTimer = null;
+   230→  }, PROPERTY_UNDO_DEBOUNCE_MS);
+   231→}
+   232→
+   233→/** Immediately flush any pending debounced undo entry (call before non-debounced actions).
+   234→ *  Returns true if a pending snapshot was committed. */
+   235→function flushPropertyUndo(): boolean {
+   236→  if (propertyUndoTimer !== null) {
+   237→    clearTimeout(propertyUndoTimer);
+   238→    if (pendingPropertySnapshot !== null) {
+   239→      commitSnapshotToUndo(pendingPropertySnapshot);
+   240→      pendingPropertySnapshot = null;
+   241→    }
+   242→    propertyUndoTimer = null;
+   243→    return true;
+   244→  }
+   245→  return false;
+   246→}
+   247→
+   248→/** Cancel any pending debounced undo entry WITHOUT committing it.
+   249→ *  Used when undo/redo is invoked — the pending "before" state is already
+   250→ *  what the user wants to go back to, so we don't need to push it. */
+   251→function cancelPropertyUndo() {
+   252→  if (propertyUndoTimer !== null) {
+   253→    clearTimeout(propertyUndoTimer);
+   254→    pendingPropertySnapshot = null;
+   255→    propertyUndoTimer = null;
+   256→    // The optimistic `canUndo: true` set when the pending snapshot was created
+   257→    // must be recomputed — if the stack was empty (first-ever edit) the Undo
+   258→    // button would otherwise stay enabled while undo() is a no-op.
+   259→    useDesignerStore.setState({ canUndo: useDesignerStore.getState().undoStack.length > 0 });
+   260→  }
+   261→}
+   262→
+   263→/**
+   264→ * Pure recursive helper: returns a NEW elements tree with the properties of the
+   265→ * element identified by `id` replaced. Searches both top-level elements and the
+   266→ * `children` arrays of groups (arbitrarily deep, matching `findElementById`).
+   267→ *
+   268→ * Unlike the `updateElementProperties` store action, this is side-effect-free —
+   269→ * no undo snapshot is captured — so it is safe to call on every mousemove of a
+   270→ * drag whose undo entry was already pushed at drag start (e.g. table resize).
+   271→ */
+   272→function setElementPropertiesInTree(
+   273→  elements: CanvasElement[],
+   274→  id: string,
+   275→  properties: ElementProperties,
+   276→): CanvasElement[] {
+   277→  const updateChildren = (children: CanvasElement[]): CanvasElement[] => {
+   278→    const idx = children.findIndex((c) => c.id === id);
+   279→    if (idx !== -1) {
+   280→      const next = [...children];
+   281→      next[idx] = { ...next[idx], properties };
+   282→      return next;
+   283→    }
+   284→    // Recurse into nested groups (groups are normally single-level here, but
+   285→    // recurse anyway to stay consistent with findElementById).
+   286→    let changed = false;
+   287→    const maybeDeeper = children.map((c) => {
+   288→      if (c.type === 'group' && c.children) {
+   289→        const newGrand = updateChildren(c.children);
+   290→        if (newGrand !== c.children) {
+   291→          changed = true;
+   292→          return { ...c, children: newGrand };
+   293→        }
+   294→      }
+   295→      return c;
+   296→    });
+   297→    return changed ? maybeDeeper : children;
+   298→  };
+   299→
+   300→  let changed = false;
+   301→  const result = elements.map((el) => {
+   302→    if (el.id === id) {
+   303→      changed = true;
+   304→      return { ...el, properties };
+   305→    }
+   306→    if (el.type === 'group' && el.children) {
+   307→      const newChildren = updateChildren(el.children);
+   308→      if (newChildren !== el.children) {
+   309→        changed = true;
+   310→        return { ...el, children: newChildren };
+   311→      }
+   312→    }
+   313→    return el;
+   314→  });
+   315→  return changed ? result : elements;
+   316→}
+   317→// ────────────────────────────────────────────────────────────────────────────
+   318→
+   319→// Page size presets
+   320→export interface PageSizePreset {
+   321→  label: string;
+   322→  width: number;
+   323→  height: number;
+   324→}
+   325→
+   326→export const PAGE_SIZE_PRESETS: PageSizePreset[] = [
+   327→  { label: 'A4 (210 × 297 mm)', width: 794, height: 1123 },
+   328→  { label: 'A5 (148 × 210 mm)', width: 559, height: 794 },
+   329→  { label: 'Letter (8.5 × 11 in)', width: 816, height: 1056 },
+   330→  { label: 'Legal (8.5 × 14 in)', width: 816, height: 1344 },
+   331→  { label: 'Custom', width: 794, height: 1123 },
+   332→];
+   333→
+   334→// Margin presets
+   335→export type MarginPreset = 'none' | 'narrow' | 'normal' | 'wide' | 'custom';
+   336→
+   337→export const MARGIN_PRESETS: Record<Exclude<MarginPreset, 'custom'>, { top: number; bottom: number; left: number; right: number }> = {
+   338→  none: { top: 0, bottom: 0, left: 0, right: 0 },
+   339→  narrow: { top: 25, bottom: 25, left: 25, right: 25 },
+   340→  normal: { top: 50, bottom: 50, left: 50, right: 50 },
+   341→  wide: { top: 80, bottom: 80, left: 80, right: 80 },
+   342→};
+   343→
+   344→export interface MarginGuidelineSettings {
+   345→  show: boolean;
+   346→  color: string;
+   347→  thickness: number;
+   348→  style: 'solid' | 'dashed';
+   349→  opacity: number;
+   350→}
+   351→
+   352→export interface CanvasSettings {
+   353→  pageWidth: number;
+   354→  pageHeight: number;
+   355→  pageBackgroundColor: string;
+   356→  marginPreset: MarginPreset;
+   357→  marginTop: number;
+   358→  marginBottom: number;
+   359→  marginLeft: number;
+   360→  marginRight: number;
+   361→  marginGuideline: MarginGuidelineSettings;
+   362→}
+   363→
+   364→// Zoom step presets (in percentage points)
+   365→export const ZOOM_STEP_PRESETS = [
+   366→  { label: '1%', value: 1 },
+   367→  { label: '5%', value: 5 },
+   368→  { label: '10%', value: 10 },
+   369→  { label: '20%', value: 20 },
+   370→  { label: '50%', value: 50 },
+   371→];
+   372→
+   373→// Multi-drag start info — stores initial positions of elements for multi-element drag
+   374→export interface DragStartInfo {
+   375→  x: number;
+   376→  y: number;
+   377→  lineStartX?: number;
+   378→  lineStartY?: number;
+   379→  lineEndX?: number;
+   380→  lineEndY?: number;
+   381→  // Snapshot of rectangle corner points (absolute) at drag start, so the
+   382→  // whole deformed shape translates together with the element during drag.
+   383→  cornerPoints?: { x: number; y: number }[];
+   384→}
+   385→
+   386→interface DesignerState {
+   387→  elements: CanvasElement[];
+   388→  selectedElementIds: string[];
+   389→  /** @deprecated Backward-compatible getter — returns selectedElementIds[0] or null */
+   390→  selectedElementId: string | null;
+   391→  zoom: number;
+   392→  panX: number;
+   393→  panY: number;
+   394→  isPanning: boolean;
+   395→  isAutoPanning: boolean;
+   396→  panStart: { x: number; y: number } | null;
+   397→  isDragging: boolean;
+   398→  dragStart: { x: number; y: number; elementX: number; elementY: number } | null;
+   399→  dragMoved: boolean; // tracks whether mouse actually moved during drag (vs. click)
+   400→  dragClickedElementId: string | null; // the element clicked to start the drag (for click-to-deselect)
+   401→  isResizing: boolean;
+   402→  resizeHandle: string | null;
+   403→  resizeStart: { x: number; y: number; elementX: number; elementY: number; elementW: number; elementH: number; originalChildren?: CanvasElement[]; origCornerPoints?: { x: number; y: number }[] } | null;
+   404→  // Multi-element resize state — stores the unified bounding box and per-element
+   405→  // offset ratios so that resizing proportionally scales all selected elements.
+   406→  multiResizeData: {
+   407→    bbox: { x: number; y: number; width: number; height: number }; // original unified bbox
+   408→    elements: Array<{
+   409→      id: string;
+   410→      origX: number; origY: number; origW: number; origH: number;
+   411→      // Ratio of element's position relative to bbox (0 = left/top edge, 1 = right/bottom edge)
+   412→      rx: number; ry: number; rw: number; rh: number;
+   413→      // Line endpoint offsets (for line elements)
+   414→      lineStartX?: number; lineStartY?: number; lineEndX?: number; lineEndY?: number;
+   415→      // Original corner points (absolute) for deformed rectangles
+   416→      origCornerPoints?: { x: number; y: number }[];
+   417→      // Original children for group elements
+   418→      originalChildren?: CanvasElement[];
+   419→    }>;
+   420→  } | null;
+   421→
+   422→  // Endpoint dragging (for line elements)
+   423→  isEndpointDragging: boolean;
+   424→  draggingEndpoint: 'start' | 'end' | null;
+   425→  endpointDragStart: { x: number; y: number; startX: number; startY: number; endX: number; endY: number } | null;
+   426→
+   427→  // ── Rectangle corner dragging (independent corner manipulation) ────────────
+   428→  // When the user Alt-drags a corner handle of a selected rectangle, that
+   429→  // corner moves independently while the other three stay fixed, producing a
+   430→  // custom quadrilateral. Alt+Shift constrains movement to horizontal/vertical.
+   431→  isCornerDragging: boolean;
+   432→  draggingCornerIndex: number | null; // 0=TL, 1=TR, 2=BR, 3=BL
+   433→  cornerDragStart: {
+   434→    x: number; // mouse start (client)
+   435→    y: number;
+   436→    elementId: string;
+   437→    // Snapshot of all 4 corner points (absolute) at drag start
+   438→    origCorners: { x: number; y: number }[];
+   439→    // The original bbox at drag start (element.x/y/w/h) — used to recompute bbox
+   440→    origBbox: { x: number; y: number; width: number; height: number };
+   441→    // The rectangle's rotation in degrees at drag start. The corner points are
+   442→    // stored in UNROTATED (local) space and the renderer applies rotate(θ) on
+   443→    // top — so a screen-space mouse delta must be transformed by R(-θ) before
+   444→    // being added to a corner point, otherwise the visual corner moves at the
+   445→    // wrong angle (e.g. a horizontal drag moves the corner at 45° when θ=45°).
+   446→    rotation: number;
+   447→  } | null;
+   448→  // Live preview of corner points during an active corner drag — updated on
+   449→  // every mousemove WITHOUT mutating the elements array. This lets the dragged
+   450→  // rectangle's renderer subscribe to just this field (via a selector) so only
+   451→  // THAT rectangle re-renders, instead of the whole canvas re-rendering on
+   452→  // every elements-array change. The final position is committed to elements[]
+   453→  // in stopCornerDrag.
+   454→  cornerDragPreview: { elementId: string; corners: { x: number; y: number }[] } | null;
+   455→
+   456→  // Table column/row resize dragging
+   457→  isTableColResizing: boolean;
+   458→  isTableRowResizing: boolean;
+   459→  tableResizeData: {
+   460→    elementId: string;
+   461→    type: 'col' | 'row';
+   462→    index: number;  // the index of the col/row BEFORE the border
+   463→    initialMousePos: number;  // clientX for col, clientY for row
+   464→    initialSizes: number[];  // initial colWidths or rowHeights
+   465→    initialTotalSize: number;  // element.width for col, element.height for row
+   466→  } | null;
+   467→
+   468→  // Shift-held state for angle snapping during endpoint drag
+   469→  shiftHeld: boolean;
+   470→
+   471→  // Ctrl-held state for vertical corner alignment during Alt+Ctrl corner drag.
+   472→  // Mirrors shiftHeld (which drives Alt+Shift horizontal alignment). Set by a
+   473→  // window-level keydown/keyup listener in canvas.tsx.
+   474→  ctrlHeld: boolean;
+   475→
+   476→  // ── Alt-held state for table cell multi-selection ──────────────────────────
+   477→  // When Alt is held and the selected element is a table, the user can
+   478→  // right-click to select individual cells or click-drag to select a
+   479→  // rectangular range of cells on the canvas.
+   480→  altHeld: boolean;
+   481→  selectedTableCells: { row: number; col: number }[];
+   482→  hoveredTableCell: { row: number; col: number; tableId: string } | null;
+   483→  isTableCellSelecting: boolean; // true while Alt+dragging on a table
+   484→  tableCellSelectStart: { row: number; col: number } | null; // drag start cell
+   485→  tableCellSelectEnd: { row: number; col: number } | null; // current drag end cell
+   486→  tableCellSelectTableId: string | null; // which table is being selected on
+   487→  tableCellSelectBaseline: { row: number; col: number }[]; // snapshot of selection before drag started (for toggle-in-drag)
+   488→
+   489→  // Angle snap visual feedback (null when not snapping)
+   490→  angleSnapInfo: { angle: number; label: string } | null;
+   491→
+   492→  // Multi-element selection state
+   493→  isSelecting: boolean;
+   494→  selectionRect: { x: number; y: number; width: number; height: number } | null;
+   495→  selectionAdditive: boolean; // true when Shift was held when rubber-band selection started
+   496→  multiDragStart: Record<string, DragStartInfo>;
+   497→
+   498→  elementCounter: Record<ElementType, number>;
+   499→  clipboardElement: CanvasElement | null; // single-element clipboard (deprecated — kept for backward compat)
+   500→  clipboardElements: CanvasElement[]; // multi-element clipboard
+   501→
+   502→  // ── Group Edit Mode ──────────────────────────────────────────────────────
+   503→  // When a group is being edited (double-clicked into), this stores the
+   504→  // group element's ID. Null means we are at root level.
+   505→  editingGroupId: string | null;
+   506→
+   507→  // ── Text Editing ──────────────────────────────────────────────────────
+   508→  // When a text element is being edited (double-clicked), this stores the
+   509→  // element's ID. Null means no text element is being edited.
+   510→  // The TipTap editor renders inline on the canvas when editing.
+   511→  // Formatting controls live in the properties panel / floating card.
+   512→  editingTextElementId: string | null;
+   513→  setEditingTextElement: (id: string | null) => void;
+   514→  // Reference to the active TipTap Editor instance on the canvas.
+   515→  // This allows the panel/floating-card formatting toolbar to control
+   516→  // the canvas editor (apply bold, italic, etc. to selected text).
+   517→  // Use `any` to avoid importing TipTap types in the store.
+   518→  activeTextEditor: any; // TipTap Editor instance or null
+   519→  setActiveTextEditor: (editor: any) => void;
+   520→
+   521→  // Group child drag state
+   522→  isGroupChildDragging: boolean;
+   523→  groupChildDragStart: { x: number; y: number; originalGroupX: number; originalGroupY: number } | null;
+   524→  groupChildMultiDragStart: Record<string, DragStartInfo>;
+   525→
+   526→  // Group child resize state
+   527→  isGroupChildResizing: boolean;
+   528→  groupChildResizeStart: { x: number; y: number; childX: number; childY: number; childW: number; childH: number; groupX: number; groupY: number; originalChildren: CanvasElement[] } | null;
+   529→
+   530→  // ── Spotlight Property Picker (Shift+S) ────────────────────────────────────
+   531→  spotlightOpen: boolean;
+   532→  floatingCards: FloatingCardData[];
+   533→  propertyDisplayMode: PropertyDisplayMode;
+   534→  spotlightHintShown: number; // counts how many times the Shift+S hint has been shown
+   535→
+   536→  // ── Panel collapse state (responsive — desktop collapsible panels) ──────
+   537→  // When collapsed, a side panel animates to width 0 (still mounted) so the
+   538→  // canvas reclaims the space. Toggled from header buttons.
+   539→  toolPaletteCollapsed: boolean;
+   540→  propsPanelCollapsed: boolean;
+   541→
+   542→  // ── Predefined Blocks Picker (Shift+Q) ────────────────────────────────────
+   543→  predefinedBlocksOpen: boolean;
+   544→
+   545→  // ── Context Menu ────────────────────────────────────────────────────────
+   546→  contextMenu: { x: number; y: number; canvasX: number; canvasY: number } | null;
+   547→
+   548→  canvasSettings: CanvasSettings;
+   549→  settingsOpen: boolean;
+   550→  newProjectOpen: boolean;
+   551→  registerIconOpen: boolean;
+   552→  exportPdfOpen: boolean;
+   553→  // Whether the welcome (create/open project) modal is currently showing.
+   554→  // Feature shortcuts (Shift+S spotlight, Shift+Q predefined blocks) are
+   555→  // disabled while this is true — the user has no project yet, so opening
+   556→  // those overlays over the modal would be confusing.
+   557→  welcomeModalOpen: boolean;
+   558→
+   559→  // PDF preview modal
+   560→  largePreviewOpen: boolean;
+   561→
+   562→  // Zoom step (in percent: 1, 5, 10, 20, 50, or custom)
+   563→  zoomStep: number;
+   564→
+   565→  // Snapping settings
+   566→  snapEnabled: boolean;
+   567→  snapToGrid: boolean;
+   568→  snapToElements: boolean;
+   569→  snapUnit: number; // grid unit in px
+   570→
+   571→  // Alignment guidelines (rendered on canvas during drag/arrow move)
+   572→  alignmentGuidelines: AlignmentGuide[];
+   573→
+   574→  // Undo / Redo
+   575→  undoStack: HistorySnapshot[];
+   576→  redoStack: HistorySnapshot[];
+   577→  canUndo: boolean;
+   578→  canRedo: boolean;
+   579→
+   580→  // Last added element ID (for drop animation)
+   581→  lastAddedElementId: string | null;
+   582→  clearLastAddedElementId: () => void;
+   583→
+   584→  // Actions
+   585→  addElement: (type: ElementType, x: number, y: number) => void;
+   586→  removeElement: (id: string) => void;
+   587→  updateElement: (id: string, updates: Partial<CanvasElement>) => void;
+   588→  updateElementProperties: (id: string, properties: ElementProperties) => void;
+   589→  selectElement: (id: string | null) => void;
+   590→  toggleInSelection: (id: string) => void;
+   591→  clearSelection: () => void;
+   592→  selectAll: () => void;
+   593→  startSelection: (x: number, y: number, additive?: boolean) => void;
+   594→  updateSelection: (x: number, y: number) => void;
+   595→  finishSelection: () => void;
+   596→  duplicateElement: (id: string) => void;
+   597→  setZoom: (zoom: number) => void;
+   598→  setPan: (x: number, y: number) => void;
+   599→  panToElement: (elementId: string) => void;
+   600→  startPanning: (x: number, y: number) => void;
+   601→  stopPanning: () => void;
+   602→  updatePan: (x: number, y: number) => void;
+   603→  startDragging: (id: string, x: number, y: number) => void;
+   604→  stopDragging: () => void;
+   605→  updateDrag: (x: number, y: number) => void;
+   606→  startResizing: (id: string, handle: string, x: number, y: number) => void;
+   607→  stopResizing: () => void;
+   608→  updateResize: (x: number, y: number) => void;
+   609→  startEndpointDrag: (id: string, endpoint: 'start' | 'end', x: number, y: number) => void;
+   610→  updateEndpointDrag: (x: number, y: number, shiftHeld: boolean) => void;
+   611→  stopEndpointDrag: () => void;
+   612→  setShiftHeld: (held: boolean) => void;
+   613→  setCtrlHeld: (held: boolean) => void;
+   614→
+   615→  // Rectangle corner manipulation (independent corner deformation)
+   616→  startCornerDrag: (id: string, cornerIndex: number, x: number, y: number) => void;
+   617→  updateCornerDrag: (x: number, y: number, shiftHeld: boolean, ctrlHeld?: boolean) => void;
+   618→  stopCornerDrag: () => void;
+   619→  /** Reset a deformed rectangle back to its axis-aligned bounding box. */
+   620→  resetRectCorners: (id: string) => void;
+   621→
+   622→  // ── Rectangle rotation ─────────────────────────────────────────────────
+   623→  // Only rectangles support rotation (per spec). Rotation is set directly
+   624→  // from the properties panel / floating card (slider + numeric input) via
+   625→  // setRectRotation — there is no canvas rotation handle. The angle is
+   626→  // normalized to [-180, 180] on write so the displayed value stays bounded.
+   627→  /** Set a rectangle's rotation directly (used by the properties panel). */
+   628→  setRectRotation: (id: string, angle: number) => void;
+   629→
+   630→  // Alt-held & table cell selection actions
+   631→  setAltHeld: (held: boolean) => void;
+   632→  setHoveredTableCell: (cell: { row: number; col: number; tableId: string } | null) => void;
+   633→  selectTableCell: (tableId: string, row: number, col: number, toggle?: boolean) => void;
+   634→  selectTableCellsRange: (tableId: string, startRow: number, startCol: number, endRow: number, endCol: number) => void;
+   635→  startTableCellSelecting: (tableId: string, row: number, col: number, baseline?: { row: number; col: number }[]) => void;
+   636→  updateTableCellSelecting: (row: number, col: number) => void;
+   637→  finishTableCellSelecting: () => void;
+   638→  clearTableCellSelection: () => void;
+   639→
+   640→  // Table column/row resize actions
+   641→  startTableColResize: (elementId: string, colIndex: number, clientX: number) => void;
+   642→  startTableRowResize: (elementId: string, rowIndex: number, clientY: number) => void;
+   643→  updateTableResize: (clientX: number, clientY: number) => void;
+   644→  stopTableResize: () => void;
+   645→  bringToFront: (id: string) => void;
+   646→  sendToBack: (id: string) => void;
+   647→  copyElement: () => void;
+   648→  pasteElement: () => void;
+   649→  cutElement: () => void;
+   650→  pasteElementInPlace: () => void;
+   651→  zoomIn: () => void;
+   652→  zoomOut: () => void;
+   653→  resetZoom: () => void;
+   654→  zoomAtPoint: (newZoom: number, pivotX: number, pivotY: number) => void;
+   655→  toggleLock: (id: string) => void;
+   656→  toggleVisibility: (id: string) => void;
+   657→  updateCanvasSettings: (settings: Partial<CanvasSettings>) => void;
+   658→  setSettingsOpen: (open: boolean) => void;
+   659→  setZoomStep: (step: number) => void;
+   660→  setSnapEnabled: (enabled: boolean) => void;
+   661→  setSnapToGrid: (enabled: boolean) => void;
+   662→  setSnapToElements: (enabled: boolean) => void;
+   663→  setSnapUnit: (unit: number) => void;
+   664→  clearAlignmentGuidelines: () => void;
+   665→  moveElementByKeys: (dx: number, dy: number, skipSnap?: boolean) => void;
+   666→  alignElementHorizontalCenter: (id: string) => void;
+   667→  alignElementVerticalCenter: (id: string) => void;
+   668→  /**
+   669→   * Align a GROUP of elements to the page center as a block — preserves the
+   670→   * relative positions of all selected elements (shifts them all by the same
+   671→   * delta) rather than collapsing each element's center to the page center.
+   672→   * Mirrors how a grouped element aligns.
+   673→   */
+   674→  alignElementsHorizontalCenter: (ids: string[]) => void;
+   675→  alignElementsVerticalCenter: (ids: string[]) => void;
+   676→  /** Set the top-level opacity on multiple elements at once (multi-select & groups). */
+   677→  setElementsOpacity: (ids: string[], opacity: number) => void;
+   678→  reorderElement: (fromIndex: number, toIndex: number) => void;
+   679→  undo: () => void;
+   680→  redo: () => void;
+   681→  /** Push current state onto undo stack (call before mutating document state). */
+   682→  pushUndo: () => void;
+   683→  /** Flush any pending debounced property undo entry immediately. */
+   684→  flushPropertyUndo: () => void;
+   685→
+   686→  // Multi-select alignment actions
+   687→  alignElementsLeft: () => void;
+   688→  alignElementsRight: () => void;
+   689→  alignElementsTop: () => void;
+   690→  alignElementsBottom: () => void;
+   691→  alignElementsCenterH: () => void;
+   692→  alignElementsCenterV: () => void;
+   693→  distributeElementsH: () => void;
+   694→  distributeElementsV: () => void;
+   695→
+   696→  // View
+   697→  showMiniPreview: boolean;
+   698→  setShowMiniPreview: (show: boolean) => void;
+   699→  // On-canvas shortcuts overlay (the muted instruction text on the right side
+   700→  // of the workspace). Toggled from the footer.
+   701→  shortcutsOverlayVisible: boolean;
+   702→  setShortcutsOverlayVisible: (visible: boolean) => void;
+   703→  // Per-element "ⓘ" info icons shown above dropped tools on the canvas.
+   704→  // Toggled from the footer. Clicking an icon opens ToolInfoDialog.
+   705→  toolInfoIconsVisible: boolean;
+   706→  setToolInfoIconsVisible: (visible: boolean) => void;
+   707→  // Which tool type's info dialog is currently open (null = closed).
+   708→  toolInfoElementType: ElementType | null;
+   709→  setToolInfoElementType: (type: ElementType | null) => void;
+   710→  fitToPage: (viewportWidth: number, viewportHeight: number) => void;
+   711→
+   712→  // Project save/load
+   713→  projectName: string;
+   714→  lastSaveFilename: string | null;
+   715→  fileHandle: FileSystemFileHandle | null;
+   716→  isDirty: boolean;
+   717→  saveProject: () => Promise<void>;
+   718→  saveProjectAs: () => Promise<void>;
+   719→  loadProject: () => Promise<boolean>;
+   720→  newProject: (options?: { projectName?: string; canvasSettings?: CanvasSettings }) => void;
+   721→  setNewProjectOpen: (open: boolean) => void;
+   722→  setRegisterIconOpen: (open: boolean) => void;
+   723→  setProjectName: (name: string) => void;
+   724→  loadProjectFromFileData: (file: ProjectFile) => boolean;
+   725→  setExportPdfOpen: (open: boolean) => void;
+   726→  setLargePreviewOpen: (open: boolean) => void;
+   727→  setWelcomeModalOpen: (open: boolean) => void;
+   728→
+   729→  // ── Group Actions ─────────────────────────────────────────────────────────
+   730→  /** Group all currently selected elements into a new group container. */
+   731→  groupSelected: () => void;
+   732→  /** Ungroup the currently selected group, moving children back to root. */
+   733→  ungroupSelected: () => void;
+   734→  /** Enter group edit mode for the given group — allows selecting children. */
+   735→  enterGroup: (groupId: string) => void;
+   736→  /** Exit group edit mode — returns to root-level selection. */
+   737→  exitGroup: () => void;
+   738→  /** Show the context menu at the given screen/canvas position. */
+   739→  setContextMenu: (menu: { x: number; y: number; canvasX: number; canvasY: number } | null) => void;
+   740→  /** Clear the context menu. */
+   741→  clearContextMenu: () => void;
+   742→  /** Find the group element that contains a child with the given ID. */
+   743→  findParentGroup: (childId: string) => CanvasElement | null;
+   744→  /** Find any element by ID, including children nested inside groups. */
+   745→  findElementById: (elementId: string) => CanvasElement | null;
+   746→  /** Check whether a given element ID belongs to a group (not at root level). */
+   747→  /** Check whether the current selection can be grouped. */
+   748→  canGroup: () => boolean;
+   749→  /** Check whether the current selection can be ungrouped. */
+   750→  canUngroup: () => boolean;
+   751→
+   752→  // ── Group Child Drag Actions ─────────────────────────────────────────────
+   753→  /** Start dragging a child element within a group in edit mode. */
+   754→  startGroupChildDrag: (childId: string, x: number, y: number) => void;
+   755→  /** Update the position of a child element being dragged within a group. */
+   756→  updateGroupChildDrag: (x: number, y: number) => void;
+   757→  /** Stop dragging a child element within a group. */
+   758→  stopGroupChildDrag: () => void;
+   759→  /** Recalculate group bounds based on current children positions. */
+   760→  recalculateGroupBounds: (groupId: string) => void;
+   761→
+   762→  // ── Group Child Resize Actions ─────────────────────────────────────────────
+   763→  /** Start resizing a child element within a group in edit mode. */
+   764→  startGroupChildResize: (childId: string, handle: string, x: number, y: number) => void;
+   765→  /** Update the size of a child element being resized within a group. */
+   766→  updateGroupChildResize: (x: number, y: number) => void;
+   767→  /** Stop resizing a child element within a group. */
+   768→  stopGroupChildResize: () => void;
+   769→
+   770→  // ── Spotlight / Floating Cards Actions ────────────────────────────────────
+   771→  openSpotlight: () => void;
+   772→  closeSpotlight: () => void;
+   773→  addFloatingCard: (card: FloatingCardData) => void;
+   774→  removeFloatingCard: (cardId: string) => void;
+   775→
+   776→  // Predefined Blocks
+   777→  openPredefinedBlocks: () => void;
+   778→  closePredefinedBlocks: () => void;
+   779→  addPredefinedBlock: (blockId: string) => void;
+   780→  clearFloatingCards: () => void;
+   781→  setPropertyDisplayMode: (mode: PropertyDisplayMode) => void;
+   782→  setToolPaletteCollapsed: (collapsed: boolean) => void;
+   783→  setPropsPanelCollapsed: (collapsed: boolean) => void;
+   784→  setSpotlightHintShown: (shown: number) => void;
+   785→  clearCardInitialPosition: (cardId: string) => void;
+   786→}
+   787→
+   788→// ── Spotlight / Floating Cards Types ────────────────────────────────────────
+   789→export type PropertyDisplayMode = 'panel' | 'floating' | 'both';
+   790→
+   791→export interface FloatingCardData {
+   792→  id: string;
+   793→  sectionLabel: string; // e.g. 'Position', 'Typography', 'Fill', etc.
+   794→  x: number;
+   795→  y: number;
+   796→  minimized: boolean;
+   797→  zIndex: number;
+   798→  initialX?: number; // Starting X for fly-in animation from spotlight
+   799→  initialY?: number; // Starting Y for fly-in animation from spotlight
+   800→}
+   801→
+   802→export const DEFAULT_CANVAS_SETTINGS: CanvasSettings = {
+   803→  pageWidth: 794,
+   804→  pageHeight: 1123,
+   805→  pageBackgroundColor: '#ffffff',
+   806→  marginPreset: 'normal',
+   807→  marginTop: 50,
+   808→  marginBottom: 50,
+   809→  marginLeft: 50,
+   810→  marginRight: 50,
+   811→  marginGuideline: {
+   812→    show: true,
+   813→    color: '#ec4899',
+   814→    thickness: 1,
+   815→    style: 'dashed',
+   816→    opacity: 40,
+   817→  },
+   818→};
+   819→
+   820→/** Build a Map from element ID to element for O(1) lookups. */
+   821→function buildElementIndex(elements: CanvasElement[]): Map<string, CanvasElement> {
+   822→  const map = new Map<string, CanvasElement>();
+   823→  for (const el of elements) map.set(el.id, el);
+   824→  return map;
+   825→}
+   826→
+   827→/**
+   828→ * Translate an element by (dx, dy): moves x/y and keeps line endpoints and
+   829→ * absolute rectangle corner points in sync. Pure — returns a new element.
+   830→ * Replaces the per-action boilerplate that was previously copy-pasted at
+   831→ * every call site that shifted an element wholesale.
+   832→ */
+   833→function translateElement(el: CanvasElement, dx: number, dy: number): CanvasElement {
+   834→  if (dx === 0 && dy === 0) return el;
+   835→  const moved: CanvasElement = { ...el, x: el.x + dx, y: el.y + dy };
+   836→  if (el.type === 'line' && el.lineStartX !== undefined) {
+   837→    moved.lineStartX = el.lineStartX + dx;
+   838→    moved.lineStartY = (el.lineStartY ?? 0) + dy;
+   839→    moved.lineEndX = (el.lineEndX ?? 0) + dx;
+   840→    moved.lineEndY = (el.lineEndY ?? 0) + dy;
+   841→  }
+   842→  if (el.cornerPoints) {
+   843→    moved.cornerPoints = el.cornerPoints.map((p) => ({ x: p.x + dx, y: p.y + dy }));
+   844→  }
+   845→  return moved;
+   846→}
+   847→
+   848→/** Move an element, correctly adjusting line endpoint / corner-point deltas when x or y changes. */
+   849→function moveElementWithLineDelta(el: CanvasElement, updates: { x?: number; y?: number }): CanvasElement {
+   850→  // Compute BOTH axis deltas up front so a combined {x, y} update never drops
+   851→  // the y (or x) adjustment — previously each branch returned early.
+   852→  if (el.type === 'line' && (el.lineStartX !== undefined || el.lineStartY !== undefined) &&
+   853→      (updates.x !== undefined || updates.y !== undefined)) {
+   854→    const dx = updates.x !== undefined ? updates.x - el.x : 0;
+   855→    const dy = updates.y !== undefined ? updates.y - el.y : 0;
+   856→    return {
+   857→      ...el,
+   858→      ...updates,
+   859→      lineStartX: el.lineStartX !== undefined ? el.lineStartX + dx : el.lineStartX,
+   860→      lineStartY: el.lineStartY !== undefined ? el.lineStartY + dy : el.lineStartY,
+   861→      lineEndX: el.lineEndX !== undefined ? el.lineEndX + dx : el.lineEndX,
+   862→      lineEndY: el.lineEndY !== undefined ? el.lineEndY + dy : el.lineEndY,
+   863→    };
+   864→  }
+   865→  // Translate rectangle corner points (absolute) when the element moves.
+   866→  if (el.cornerPoints && (updates.x !== undefined || updates.y !== undefined)) {
+   867→    const dx = (updates.x ?? el.x) - el.x;
+   868→    const dy = (updates.y ?? el.y) - el.y;
+   869→    if (dx !== 0 || dy !== 0) {
+   870→      return {
+   871→        ...el,
+   872→        ...updates,
+   873→        cornerPoints: el.cornerPoints.map((p) => ({ x: p.x + dx, y: p.y + dy })),
+   874→      };
+   875→    }
+   876→  }
+   877→  return { ...el, ...updates };
+   878→}
+   879→
+   880→/** Helper to compute the backward-compatible selectedElementId from selectedElementIds.
+   881→ *  @deprecated Use selectedElementIds directly instead. */
+   882→function deriveSelectedElementId(ids: string[]): string | null {
+   883→  return ids[0] ?? null;
+   884→}
+   885→
+   886→export const useDesignerStore = create<DesignerState>((set, get) => {
+   887→  /**
+   888→   * Shared implementation for pasteElement (offset +20/+20) and
+   889→   * pasteElementInPlace (offset 0/0). Previously these were two ~95-line
+   890→   * near-identical action bodies; only the paste offset differed.
+   891→   */
+   892→  const pasteClones = (offsetX: number, offsetY: number) => {
+   893→    invalidateSnapCache();
+   894→    const state = get();
+   895→
+   896→    // Prefer multi-element clipboard; fall back to legacy single-element one
+   897→    const clips = state.clipboardElements.length > 0
+   898→      ? state.clipboardElements
+   899→      : state.clipboardElement
+   900→        ? [state.clipboardElement]
+   901→        : [];
+   902→    if (clips.length === 0) return;
+   903→
+   904→    state.pushUndo();
+   905→    const counter = { ...state.elementCounter };
+   906→    const newElements: CanvasElement[] = [];
+   907→    const newSelectionIds: string[] = [];
+   908→
+   909→    for (const clipEl of clips) {
+   910→      counter[clipEl.type] += 1;
+   911→      const reIded = reIdElement(clipEl);
+   912→      const newEl: CanvasElement = {
+   913→        ...reIded,
+   914→        x: clipEl.x + offsetX,
+   915→        y: clipEl.y + offsetY,
+   916→        name: getDefaultName(clipEl.type, counter[clipEl.type]),
+   917→        // Offset absolute rectangle corner points by the same paste offset
+   918→        ...(reIded.cornerPoints
+   919→          ? { cornerPoints: reIded.cornerPoints.map((p) => ({ x: p.x + offsetX, y: p.y + offsetY })) }
+   920→          : {}),
+   921→      };
+   922→      newElements.push(newEl);
+   923→      newSelectionIds.push(newEl.id);
+   924→    }
+   925→
+   926→    if (state.editingGroupId) {
+   927→      set({
+   928→        elements: state.elements.map((el) => {
+   929→          if (el.id === state.editingGroupId && el.type === 'group' && el.children) {
+   930→            return { ...el, children: [...el.children, ...newElements] };
+   931→          }
+   932→          return el;
+   933→        }),
+   934→        selectedElementIds: newSelectionIds,
+   935→        selectedElementId: deriveSelectedElementId(newSelectionIds),
+   936→        elementCounter: counter,
+   937→        isDirty: true,
+   938→      });
+   939→      queueMicrotask(() => get().recalculateGroupBounds(state.editingGroupId!));
+   940→    } else {
+   941→      set({
+   942→        elements: [...state.elements, ...newElements],
+   943→        selectedElementIds: newSelectionIds,
+   944→        selectedElementId: deriveSelectedElementId(newSelectionIds),
+   945→        elementCounter: counter,
+   946→        isDirty: true,
+   947→      });
+   948→    }
+   949→  };
+   950→
+   951→  /** Shared implementation for toggleLock/toggleVisibility — identical apart from the flag. */
+   952→  const toggleElementFlag = (field: 'locked' | 'visible', id: string) => {
+   953→    get().pushUndo();
+   954→    set((state) => ({
+   955→      elements: state.elements.map((el) => {
+   956→        if (el.id === id) return { ...el, [field]: !el[field] };
+   957→        if (el.type === 'group' && el.children) {
+   958→          const childIndex = el.children.findIndex((c) => c.id === id);
+   959→          if (childIndex !== -1) {
+   960→            const newChildren = [...el.children];
+   961→            newChildren[childIndex] = { ...newChildren[childIndex], [field]: !newChildren[childIndex][field] };
+   962→            return { ...el, children: newChildren };
+   963→          }
+   964→        }
+   965→        return el;
+   966→      }),
+   967→      isDirty: true,
+   968→    }));
+   969→  };
+   970→
+   971→  return {
+   972→  elements: [],
+   973→  selectedElementIds: [],
+   974→  selectedElementId: null,
+   975→  zoom: 1,
+   976→  panX: 0,
+   977→  panY: 0,
+   978→  isPanning: false,
+   979→  isAutoPanning: false,
+   980→  panStart: null,
+   981→  isDragging: false,
+   982→  dragStart: null,
+   983→  dragMoved: false,
+   984→  dragClickedElementId: null,
+   985→  isResizing: false,
+   986→  resizeHandle: null,
+   987→  resizeStart: null,
+   988→  multiResizeData: null,
+   989→  isEndpointDragging: false,
+   990→  draggingEndpoint: null,
+   991→  endpointDragStart: null,
+   992→  // Rectangle corner drag state
+   993→  isCornerDragging: false,
+   994→  draggingCornerIndex: null,
+   995→  cornerDragStart: null,
+   996→  cornerDragPreview: null,
+   997→  isTableColResizing: false,
+   998→  isTableRowResizing: false,
+   999→  tableResizeData: null,
+  1000→  shiftHeld: false,
+  1001→  ctrlHeld: false,
+  1002→  altHeld: false,
+  1003→  selectedTableCells: [],
+  1004→  hoveredTableCell: null,
+  1005→  isTableCellSelecting: false,
+  1006→  tableCellSelectStart: null,
+  1007→  tableCellSelectEnd: null,
+  1008→  tableCellSelectTableId: null,
+  1009→  tableCellSelectBaseline: [],
+  1010→  angleSnapInfo: null,
+  1011→  isSelecting: false,
+  1012→  selectionRect: null,
+  1013→  selectionAdditive: false,
+  1014→  multiDragStart: {},
+  1015→  elementCounter: { text: 0, table: 0, image: 0, line: 0, rectangle: 0, ellipse: 0, group: 0 },
+  1016→  clipboardElement: null,
+  1017→  clipboardElements: [],
+  1018→  editingGroupId: null,
+  1019→  editingTextElementId: null,
+  1020→  setEditingTextElement: (id) => set({ editingTextElementId: id, ...(id === null ? { activeTextEditor: null } : {}) }),
+  1021→  activeTextEditor: null,
+  1022→  setActiveTextEditor: (editor) => set({ activeTextEditor: editor }),
+  1023→  isGroupChildDragging: false,
+  1024→  groupChildDragStart: null,
+  1025→  groupChildMultiDragStart: {},
+  1026→  isGroupChildResizing: false,
+  1027→  groupChildResizeStart: null,
+  1028→  contextMenu: null,
+  1029→  spotlightOpen: false,
+  1030→  floatingCards: [],
+  1031→  // Default to 'panel' so the docked properties panel is visible from the
+  1032→  // start — matching the Welcome modal's default selection ("Panel"). This
+  1033→  // keeps the background panel in sync with what the user sees selected in
+  1034→  // the modal before they click Create.
+  1035→  propertyDisplayMode: 'panel',
+  1036→  spotlightHintShown: 0,
+  1037→  predefinedBlocksOpen: false,
+  1038→  toolPaletteCollapsed: false,
+  1039→  propsPanelCollapsed: false,
+  1040→  canvasSettings: DEFAULT_CANVAS_SETTINGS,
+  1041→  settingsOpen: false,
+  1042→  newProjectOpen: false,
+  1043→  registerIconOpen: false,
+  1044→  exportPdfOpen: false,
+  1045→  largePreviewOpen: false,
+  1046→  welcomeModalOpen: false,
+  1047→
+  1048→  // Zoom step default
+  1049→  zoomStep: 5,
+  1050→
+  1051→  // Snap defaults
+  1052→  snapEnabled: true,
+  1053→  snapToGrid: false,
+  1054→  snapToElements: true,
+  1055→  snapUnit: 10,
+  1056→
+  1057→  // Alignment guidelines
+  1058→  alignmentGuidelines: [],
+  1059→
+  1060→  // Undo / Redo
+  1061→  undoStack: [],
+  1062→  redoStack: [],
+  1063→  canUndo: false,
+  1064→  canRedo: false,
+  1065→
+  1066→  // Last added element ID (for drop animation)
+  1067→  lastAddedElementId: null,
+  1068→  clearLastAddedElementId: () => set({ lastAddedElementId: null }),
+  1069→
+  1070→  // View
+  1071→  showMiniPreview: true,
+  1072→  shortcutsOverlayVisible: true,
+  1073→  toolInfoIconsVisible: true,
+  1074→  toolInfoElementType: null,
+  1075→
+  1076→  // Project save/load
+  1077→  projectName: 'Untitled Project',
+  1078→  lastSaveFilename: null,
+  1079→  fileHandle: null,
+  1080→  isDirty: false,
+  1081→
+  1082→  addElement: (type, x, y) => {
+  1083→    invalidateSnapCache();
+  1084→    const state = get();
+  1085→    state.pushUndo();
+  1086→    const counter = { ...state.elementCounter };
+  1087→    counter[type] += 1;
+  1088→    const size = getDefaultSize(type);
+  1089→
+  1090→    const elementX = x - size.width / 2;
+  1091→    const elementY = y - size.height / 2;
+  1092→
+  1093→    const element: CanvasElement = {
+  1094→      id: uuidv4(),
+  1095→      type,
+  1096→      x: elementX,
+  1097→      y: elementY,
+  1098→      width: size.width,
+  1099→      height: size.height,
+  1100→      locked: false,
+  1101→      visible: true,
+  1102→      name: getDefaultName(type, counter[type]),
+  1103→      properties: getDefaultProperties(type),
+  1104→    };
+  1105→
+  1106→    // For line elements, set absolute endpoint coordinates
+  1107→    if (type === 'line') {
+  1108→      element.lineStartX = elementX;
+  1109→      element.lineStartY = y; // center vertically at drop point
+  1110→      element.lineEndX = elementX + size.width;
+  1111→      element.lineEndY = y;
+  1112→      // Recalculate bounds from endpoints
+  1113→      const bounds = computeLineBounds(element.lineStartX, element.lineStartY, element.lineEndX, element.lineEndY);
+  1114→      element.x = bounds.x;
+  1115→      element.y = bounds.y;
+  1116→      element.width = bounds.width;
+  1117→      element.height = bounds.height;
+  1118→    }
+  1119→
+  1120→    const newSelection = [element.id];
+  1121→    set({
+  1122→      elements: [...state.elements, element],
+  1123→      selectedElementIds: newSelection,
+  1124→      selectedElementId: deriveSelectedElementId(newSelection),
+  1125→      // Clear floating cards — the new element is always a different element
+  1126→      // from the previously selected one, so any open property cards must be
+  1127→      // dismissed. Mirrors the clearCards behaviour in selectElement().
+  1128→      floatingCards: [],
+  1129→      elementCounter: counter,
+  1130→      isDirty: true,
+  1131→      lastAddedElementId: element.id,
+  1132→    });
+  1133→  },
+  1134→
+  1135→  removeElement: (id) => {
+  1136→    invalidateSnapCache();
+  1137→    get().pushUndo();
+  1138→    set((state) => {
+  1139→      const newSelectedIds = state.selectedElementIds.filter((sid) => sid !== id);
+  1140→      // Check if the element is a group child
+  1141→      let foundInChildren = false;
+  1142→      let parentGroupId: string | null = null;
+  1143→      const newElements = state.elements.map((el) => {
+  1144→        if (el.type === 'group' && el.children) {
+  1145→          const childIndex = el.children.findIndex((c) => c.id === id);
+  1146→          if (childIndex !== -1) {
+  1147→            foundInChildren = true;
+  1148→            parentGroupId = el.id;
+  1149→            const newChildren = el.children.filter((c) => c.id !== id);
+  1150→            return { ...el, children: newChildren };
+  1151→          }
+  1152→        }
+  1153→        return el;
+  1154→      });
+  1155→      if (foundInChildren) {
+  1156→        // Bug #4 fix: If the group now has zero children, remove the empty group
+  1157→        // entirely (auto-ungroup). An empty group is a "ghost" that causes
+  1158→        // confusion in the layers panel and selection logic.
+  1159→        const filteredElements = newElements.filter((el) => {
+  1160→          if (el.type === 'group' && el.children && el.children.length === 0) {
+  1161→            // Also remove the empty group from selection
+  1162→            const groupId = el.id;
+  1163→            if (newSelectedIds.includes(groupId)) {
+  1164→              newSelectedIds.splice(newSelectedIds.indexOf(groupId), 1);
+  1165→            }
+  1166→            return false;
+  1167→          }
+  1168→          return true;
+  1169→        });
+  1170→
+  1171→        // Bug #9 fix: Schedule a recalculation of the parent group's bounds
+  1172→        // after the state update completes. This ensures the group's selection
+  1173→        // outline and hit testing are accurate after child removal.
+  1174→        if (parentGroupId) {
+  1175→          const groupStillExists = filteredElements.some(el => el.id === parentGroupId);
+  1176→          if (groupStillExists) {
+  1177→            queueMicrotask(() => get().recalculateGroupBounds(parentGroupId!));
+  1178→          }
+  1179→        }
+  1180→
+  1181→        // Clear editingGroupId if the removed element was the group being edited
+  1182→        const shouldClearEditingGroup = state.editingGroupId === id;
+  1183→
+  1184→        return {
+  1185→          elements: filteredElements,
+  1186→          selectedElementIds: newSelectedIds,
+  1187→          selectedElementId: deriveSelectedElementId(newSelectedIds),
+  1188→          isDirty: true,
+  1189→          ...(shouldClearEditingGroup ? { editingGroupId: null } : {}),
+  1190→        };
+  1191→      }
+  1192→      return {
+  1193→        elements: state.elements.filter((el) => el.id !== id),
+  1194→        selectedElementIds: newSelectedIds,
+  1195→        selectedElementId: deriveSelectedElementId(newSelectedIds),
+  1196→        isDirty: true,
+  1197→      };
+  1198→    });
+  1199→  },
+  1200→
+  1201→  updateElement: (id, updates) => {
+  1202→    const state = get();
+  1203→    debouncedPropertyPushUndo(state);
+  1204→    set((s) => ({
+  1205→      elements: s.elements.map((el) => {
+  1206→        if (el.id === id) {
+  1207→          // For line elements, adjust endpoints when position changes
+  1208→          if (el.type === 'line' && (updates.x !== undefined || updates.y !== undefined)) {
+  1209→            return moveElementWithLineDelta(el, updates as { x?: number; y?: number });
+  1210→          }
+  1211→          // For deformed rectangles, translate corner points when x/y changes
+  1212→          // so the shape stays aligned with the element's new position.
+  1213→          if (el.cornerPoints && (updates.x !== undefined || updates.y !== undefined)) {
+  1214→            const dx = (updates.x ?? el.x) - el.x;
+  1215→            const dy = (updates.y ?? el.y) - el.y;
+  1216→            if (dx !== 0 || dy !== 0) {
+  1217→              return {
+  1218→                ...el,
+  1219→                ...updates,
+  1220→                cornerPoints: el.cornerPoints.map((p) => ({ x: p.x + dx, y: p.y + dy })),
+  1221→              };
+  1222→            }
+  1223→          }
+  1224→          return { ...el, ...updates };
+  1225→        }
+  1226→        // Search inside group children
+  1227→        if (el.type === 'group' && el.children) {
+  1228→          const childIndex = el.children.findIndex((c) => c.id === id);
+  1229→          if (childIndex !== -1) {
+  1230→            const child = el.children[childIndex];
+  1231→            // For line children, adjust endpoints when position changes
+  1232→            if (child.type === 'line' && (updates.x !== undefined || updates.y !== undefined)) {
+  1233→              const updatedChild = moveElementWithLineDelta(child, updates as { x?: number; y?: number });
+  1234→              const newChildren = [...el.children];
+  1235→              newChildren[childIndex] = updatedChild;
+  1236→              return { ...el, children: newChildren };
+  1237→            }
+  1238→            // For deformed rectangle children, translate corner points
+  1239→            if (child.cornerPoints && (updates.x !== undefined || updates.y !== undefined)) {
+  1240→              const dx = (updates.x ?? child.x) - child.x;
+  1241→              const dy = (updates.y ?? child.y) - child.y;
+  1242→              if (dx !== 0 || dy !== 0) {
+  1243→                const newChildren = [...el.children];
+  1244→                newChildren[childIndex] = {
+  1245→                  ...child,
+  1246→                  ...updates,
+  1247→                  cornerPoints: child.cornerPoints.map((p) => ({ x: p.x + dx, y: p.y + dy })),
+  1248→                };
+  1249→                return { ...el, children: newChildren };
+  1250→              }
+  1251→            }
+  1252→            const newChildren = [...el.children];
+  1253→            newChildren[childIndex] = { ...newChildren[childIndex], ...updates };
+  1254→            return { ...el, children: newChildren };
+  1255→          }
+  1256→        }
+  1257→        return el;
+  1258→      }),
+  1259→      isDirty: true,
+  1260→    }));
+  1261→  },
+  1262→
+  1263→  updateElementProperties: (id, properties) => {
+  1264→    invalidateSnapCache();
+  1265→    const state = get();
+  1266→    debouncedPropertyPushUndo(state);
+  1267→    set((s) => ({
+  1268→      elements: s.elements.map((el) => {
+  1269→        if (el.id === id) return { ...el, properties };
+  1270→        // Search inside group children
+  1271→        if (el.type === 'group' && el.children) {
+  1272→          const childIndex = el.children.findIndex((c) => c.id === id);
+  1273→          if (childIndex !== -1) {
+  1274→            const newChildren = [...el.children];
+  1275→            newChildren[childIndex] = { ...newChildren[childIndex], properties };
+  1276→            return { ...el, children: newChildren };
+  1277→          }
+  1278→        }
+  1279→        return el;
+  1280→      }),
+  1281→      isDirty: true,
+  1282→    }));
+  1283→  },
+  1284→
+  1285→  selectElement: (id) => {
+  1286→    if (id === null) {
+  1287→      set({
+  1288→        selectedElementIds: [],
+  1289→        selectedElementId: null,
+  1290→        floatingCards: [],
+  1291→        editingTextElementId: null,
+  1292→        selectedTableCells: [],
+  1293→        hoveredTableCell: null,
+  1294→        isTableCellSelecting: false,
+  1295→        tableCellSelectStart: null,
+  1296→        tableCellSelectEnd: null,
+  1297→        tableCellSelectTableId: null,
+  1298→        tableCellSelectBaseline: [],
+  1299→      });
+  1300→    } else {
+  1301→      set((state) => {
+  1302→        // Clear floating cards when selecting a different element
+  1303→        const clearCards = state.selectedElementIds[0] !== id;
+  1304→        // Clear text editing when selecting a different element
+  1305→        const clearTextEditing = state.editingTextElementId && state.editingTextElementId !== id;
+  1306→        // Clear table cell selection when selecting a different element
+  1307→        const clearTableCells = state.selectedTableCells.length > 0 && state.selectedElementIds[0] !== id;
+  1308→        return {
+  1309→          selectedElementIds: [id],
+  1310→          selectedElementId: id,
+  1311→          ...(clearCards ? { floatingCards: [] } : {}),
+  1312→          ...(clearTextEditing ? { editingTextElementId: null } : {}),
+  1313→          ...(clearTableCells ? { selectedTableCells: [], hoveredTableCell: null, isTableCellSelecting: false, tableCellSelectStart: null, tableCellSelectEnd: null, tableCellSelectTableId: null, tableCellSelectBaseline: [] } : {}),
+  1314→        };
+  1315→      });
+  1316→    }
+  1317→  },
+  1318→
+  1319→  toggleInSelection: (id) => {
+  1320→    set((state) => {
+  1321→      if (state.selectedElementIds.includes(id)) {
+  1322→        const newIds = state.selectedElementIds.filter((sid) => sid !== id);
+  1323→        return {
+  1324→          selectedElementIds: newIds,
+  1325→          selectedElementId: deriveSelectedElementId(newIds),
+  1326→        };
+  1327→      } else {
+  1328→        const newIds = [...state.selectedElementIds, id];
+  1329→        return {
+  1330→          selectedElementIds: newIds,
+  1331→          selectedElementId: deriveSelectedElementId(newIds),
+  1332→        };
+  1333→      }
+  1334→    });
+  1335→  },
+  1336→
+  1337→  clearSelection: () => {
+  1338→    set({
+  1339→      selectedElementIds: [],
+  1340→      selectedElementId: null,
+  1341→      editingTextElementId: null,
+  1342→    });
+  1343→  },
+  1344→
+  1345→  selectAll: () => {
+  1346→    set((state) => {
+  1347→      // Bug #2 fix: When in group-edit mode, select the children of the
+  1348→      // currently-edited group instead of root-level elements.
+  1349→      if (state.editingGroupId) {
+  1350→        const group = state.elements.find((el) => el.id === state.editingGroupId);
+  1351→        if (group && group.type === 'group' && group.children) {
+  1352→          const newIds = group.children
+  1353→            .filter((c) => !c.locked && c.visible)
+  1354→            .map((c) => c.id);
+  1355→          return {
+  1356→            selectedElementIds: newIds,
+  1357→            selectedElementId: deriveSelectedElementId(newIds),
+  1358→          };
+  1359→        }
+  1360→      }
+  1361→      const newIds = state.elements
+  1362→        .filter((el) => !el.locked && el.visible)
+  1363→        .map((el) => el.id);
+  1364→      return {
+  1365→        selectedElementIds: newIds,
+  1366→        selectedElementId: deriveSelectedElementId(newIds),
+  1367→      };
+  1368→    });
+  1369→  },
+  1370→
+  1371→  startSelection: (x, y, additive = false) => {
+  1372→    set((state) => ({
+  1373→      isSelecting: true,
+  1374→      selectionRect: { x, y, width: 0, height: 0 },
+  1375→      selectionAdditive: additive,
+  1376→      // When additive (Shift held), preserve existing selection — finishSelection will union
+  1377→      // Otherwise, clear selection now so the rubber band starts fresh.
+  1378→      // Also clear floating cards so dismissed cards don't reappear after a
+  1379→      // fresh rubber-band selection picks up new elements.
+  1380→      ...(additive ? {} : { selectedElementIds: [], selectedElementId: null, floatingCards: [] }),
+  1381→    }));
+  1382→  },
+  1383→
+  1384→  updateSelection: (x, y) => {
+  1385→    set((state) => {
+  1386→      if (!state.selectionRect || !state.isSelecting) return state;
+  1387→      const startX = state.selectionRect.x;
+  1388→      const startY = state.selectionRect.y;
+  1389→      const width = x - startX;
+  1390→      const height = y - startY;
+  1391→      return {
+  1392→        selectionRect: { x: startX, y: startY, width, height },
+  1393→      };
+  1394→    });
+  1395→  },
+  1396→
+  1397→  finishSelection: () => {
+  1398→    const state = get();
+  1399→    if (!state.selectionRect || !state.isSelecting) {
+  1400→      set({ isSelecting: false, selectionRect: null, selectionAdditive: false });
+  1401→      return;
+  1402→    }
+  1403→
+  1404→    // Normalize the selection rect (handle negative width/height)
+  1405→    const rect = state.selectionRect;
+  1406→    const selLeft = Math.min(rect.x, rect.x + rect.width);
+  1407→    const selTop = Math.min(rect.y, rect.y + rect.height);
+  1408→    const selRight = Math.max(rect.x, rect.x + rect.width);
+  1409→    const selBottom = Math.max(rect.y, rect.y + rect.height);
+  1410→
+  1411→    // The selection rect is stored in canvas-inner coordinates (the coordinate
+  1412→    // space of the transform root), but element positions (el.x, el.y,
+  1413→    // lineStartX/Y, etc.) are in the page-content coordinate space — they are
+  1414→    // used as CSS left/top inside the page div, which has
+  1415→    // margin = VIEWPORT_PADDING.  To compare correctly we must convert the
+  1416→    // selection rect into page-content coordinates by subtracting the padding.
+  1417→    const vp = VIEWPORT_PADDING;
+  1418→    const pSelLeft   = selLeft   - vp;
+  1419→    const pSelTop    = selTop    - vp;
+  1420→    const pSelRight  = selRight  - vp;
+  1421→    const pSelBottom = selBottom - vp;
+  1422→
+  1423→    // Find all visible, unlocked elements that intersect with the selection rect.
+  1424→    // For line elements, we test the actual line segment against the rect
+  1425→    // (bounding-box overlap would select lines that are merely *near* the rect).
+  1426→    const selectedIds = state.elements
+  1427→      .filter((el) => {
+  1428→        if (!el.visible || el.locked) return false;
+  1429→        // Line elements: test actual line-segment vs rect intersection
+  1430→        if (el.type === 'line' && el.lineStartX !== undefined && el.lineEndX !== undefined &&
+  1431→            el.lineStartY !== undefined && el.lineEndY !== undefined) {
+  1432→          return lineIntersectsRect(
+  1433→            el.lineStartX, el.lineStartY, el.lineEndX, el.lineEndY,
+  1434→            pSelLeft, pSelTop, pSelRight, pSelBottom,
+  1435→          );
+  1436→        }
+  1437→        // All other element types: bounding-box overlap
+  1438→        const elRight = el.x + el.width;
+  1439→        const elBottom = el.y + el.height;
+  1440→        return el.x < pSelRight && elRight > pSelLeft && el.y < pSelBottom && elBottom > pSelTop;
+  1441→      })
+  1442→      .map((el) => el.id);
+  1443→
+  1444→    // When additive (Shift+drag), union with existing selection instead of replacing
+  1445→    const finalIds = state.selectionAdditive
+  1446→      ? Array.from(new Set([...state.selectedElementIds, ...selectedIds]))
+  1447→      : selectedIds;
+  1448→
+  1449→    set({
+  1450→      isSelecting: false,
+  1451→      selectionRect: null,
+  1452→      selectionAdditive: false,
+  1453→      selectedElementIds: finalIds,
+  1454→      selectedElementId: deriveSelectedElementId(finalIds),
+  1455→    });
+  1456→  },
+  1457→
+  1458→  duplicateElement: (id) => {
+  1459→    invalidateSnapCache();
+  1460→    const state = get();
+  1461→    // Validate BEFORE pushing undo — an invalid id must not clear the redo
+  1462→    // stack or leave a no-op entry on the undo stack.
+  1463→    const element = state.findElementById(id);
+  1464→    if (!element) return;
+  1465→    state.pushUndo();
+  1466→    const counter = { ...state.elementCounter };
+  1467→    counter[element.type] += 1;
+  1468→
+  1469→    // Bug fix: Use reIdElement to assign new UUIDs to the duplicated element
+  1470→    // and all its children (if it's a group). This prevents duplicate IDs.
+  1471→    const reIded = reIdElement(element);
+  1472→    const newElement: CanvasElement = {
+  1473→      ...reIded,
+  1474→      x: element.x + 20,
+  1475→      y: element.y + 20,
+  1476→      name: getDefaultName(element.type, counter[element.type]),
+  1477→      // Offset rectangle corner points by the same +20,+20 duplicate offset
+  1478→      ...(reIded.cornerPoints
+  1479→        ? { cornerPoints: reIded.cornerPoints.map((p) => ({ x: p.x + 20, y: p.y + 20 })) }
+  1480→        : {}),
+  1481→    };
+  1482→    const newSelection = [newElement.id];
+  1483→
+  1484→    // If the element is a group child, insert the duplicate into the same group
+  1485→    const parentGroup = state.findParentGroup(id);
+  1486→    if (parentGroup) {
+  1487→      set({
+  1488→        elements: state.elements.map((el) => {
+  1489→          if (el.id === parentGroup.id && el.type === 'group' && el.children) {
+  1490→            return { ...el, children: [...el.children, newElement] };
+  1491→          }
+  1492→          return el;
+  1493→        }),
+  1494→        selectedElementIds: newSelection,
+  1495→        selectedElementId: deriveSelectedElementId(newSelection),
+  1496→        elementCounter: counter,
+  1497→        isDirty: true,
+  1498→      });
+  1499→      queueMicrotask(() => get().recalculateGroupBounds(parentGroup.id));
+  1500→    } else {
+  1501→      set({
+  1502→        elements: [...state.elements, newElement],
+  1503→        selectedElementIds: newSelection,
+  1504→        selectedElementId: deriveSelectedElementId(newSelection),
+  1505→        elementCounter: counter,
+  1506→        isDirty: true,
+  1507→      });
+  1508→    }
+  1509→  },
+  1510→
+  1511→  setZoom: (zoom) => {
+  1512→    set({ zoom: Math.min(50, Math.max(0.01, zoom)) });
+  1513→  },
+  1514→
+  1515→  setPan: (x, y) => {
+  1516→    set({ panX: x, panY: y });
+  1517→  },
+  1518→
+  1519→  panToElement: (elementId) => {
+  1520→    const state = get();
+  1521→    // Bug #11 fix: Use findElementById to support elements inside groups
+  1522→    const el = state.findElementById(elementId);
+  1523→    if (!el) return;
+  1524→
+  1525→    const VIEWPORT_PADDING = 40;
+  1526→    const TOOL_PALETTE_WIDTH = 220; // approximate left sidebar width
+  1527→    const PROPS_PANEL_WIDTH = 288; // w-72
+  1528→
+  1529→    // Calculate element center in canvas coordinates
+  1530→    const elCenterX = VIEWPORT_PADDING + el.x + el.width / 2;
+  1531→    const elCenterY = VIEWPORT_PADDING + el.y + el.height / 2;
+  1532→
+  1533→    // For lines, use midpoint of the line
+  1534→    const isLine = el.type === 'line';
+  1535→    const lineCenterX = isLine && el.lineStartX !== undefined && el.lineEndX !== undefined
+  1536→      ? VIEWPORT_PADDING + (el.lineStartX + el.lineEndX) / 2
+  1537→      : elCenterX;
+  1538→    const lineCenterY = isLine && el.lineStartY !== undefined && el.lineEndY !== undefined
+  1539→      ? VIEWPORT_PADDING + (el.lineStartY + el.lineEndY) / 2
+  1540→      : elCenterY;
+  1541→
+  1542→    const cx = isLine ? lineCenterX : elCenterX;
+  1543→    const cy = isLine ? lineCenterY : elCenterY;
+  1544→
+  1545→    const zoom = state.zoom;
+  1546→    const vw = window.innerWidth - TOOL_PALETTE_WIDTH - PROPS_PANEL_WIDTH;
+  1547→    const vh = window.innerHeight - 48; // subtract header height
+  1548→
+  1549→    const targetPanX = vw / (2 * zoom) - cx;
+  1550→    const targetPanY = vh / (2 * zoom) - cy;
+  1551→
+  1552→    set({ panX: targetPanX, panY: targetPanY, isAutoPanning: true });
+  1553→
+  1554→    // Remove auto-panning flag after transition completes. Clear any pending
+  1555→    // auto-pan timer first so rapid fit-to-page calls don't accumulate.
+  1556→    if (autoPanTimer) clearTimeout(autoPanTimer);
+  1557→    autoPanTimer = setTimeout(() => {
+  1558→      useDesignerStore.setState({ isAutoPanning: false });
+  1559→      autoPanTimer = null;
+  1560→    }, 500);
+  1561→  },
+  1562→
+  1563→  startPanning: (x, y) => {
+  1564→    set({ isPanning: true, panStart: { x, y } });
+  1565→  },
+  1566→
+  1567→  stopPanning: () => {
+  1568→    set({ isPanning: false, panStart: null });
+  1569→  },
+  1570→
+  1571→  updatePan: (x, y) => {
+  1572→    const state = get();
+  1573→    if (!state.panStart) return;
+  1574→    const dx = x - state.panStart.x;
+  1575→    const dy = y - state.panStart.y;
+  1576→    set({
+  1577→      panX: state.panX + dx / state.zoom,
+  1578→      panY: state.panY + dy / state.zoom,
+  1579→      panStart: { x, y },
+  1580→    });
+  1581→  },
+  1582→
+  1583→  startDragging: (id, x, y) => {
+  1584→    const state = get();
+  1585→    const element = state.elements.find((el) => el.id === id);
+  1586→    if (!element || element.locked) return;
+  1587→
+  1588→    // Push undo BEFORE the drag starts so we can revert to pre-drag positions
+  1589→    state.pushUndo();
+  1590→
+  1591→    // If the clicked element is not in the current selection, make it the only selection
+  1592→    let currentIds = state.selectedElementIds;
+  1593→    const needsReselect = !currentIds.includes(id);
+  1594→    if (needsReselect) {
+  1595→      currentIds = [id];
+  1596→    }
+  1597→
+  1598→    // Build element index for O(1) lookups when computing drag start info
+  1599→    const index = buildElementIndex(state.elements);
+  1600→
+  1601→    set({
+  1602→      isDragging: true,
+  1603→      dragMoved: false,
+  1604→      dragClickedElementId: id,
+  1605→      ...(needsReselect ? { selectedElementIds: currentIds, selectedElementId: id } : {}),
+  1606→      dragStart: { x, y, elementX: element.x, elementY: element.y },
+  1607→      multiDragStart: Object.fromEntries(
+  1608→        currentIds.map((eid) => {
+  1609→          const el = index.get(eid);
+  1610→          if (!el) return null;
+  1611→          const info: DragStartInfo = { x: el.x, y: el.y };
+  1612→          if (el.type === 'line' && el.lineStartX !== undefined) {
+  1613→            info.lineStartX = el.lineStartX;
+  1614→            info.lineStartY = el.lineStartY;
+  1615→            info.lineEndX = el.lineEndX;
+  1616→            info.lineEndY = el.lineEndY;
+  1617→          }
+  1618→          // Snapshot rectangle corner points (absolute) so the deformed shape
+  1619→          // translates together with the element during a multi-drag.
+  1620→          if (el.cornerPoints) {
+  1621→            info.cornerPoints = el.cornerPoints.map((p) => ({ x: p.x, y: p.y }));
+  1622→          }
+  1623→          return [eid, info];
+  1624→        }).filter(Boolean) as [string, DragStartInfo][]
+  1625→      ),
+  1626→    });
+  1627→  },
+  1628→
+  1629→  stopDragging: () => {
+  1630→    const state = get();
+  1631→    // If the mouse didn't actually move during the drag (it was a click, not a drag),
+  1632→    // and we're in a multi-selection, reduce selection to just the clicked element
+  1633→    if (!state.dragMoved && state.dragClickedElementId && state.selectedElementIds.length > 1) {
+  1634→      state.selectElement(state.dragClickedElementId);
+  1635→    }
+  1636→    // Undo was already pushed in startDragging, so just clear drag state
+  1637→    // Mark as dirty since position changed during the drag
+  1638→    set({ isDragging: false, dragStart: null, dragMoved: false, dragClickedElementId: null, multiDragStart: {}, alignmentGuidelines: [], isDirty: true });
+  1639→  },
+  1640→
+  1641→  updateDrag: (x, y) => {
+  1642→    const state = get();
+  1643→    if (!state.dragStart || state.selectedElementIds.length === 0) return;
+  1644→
+  1645→    // Mark that the mouse actually moved (distinguishes click from drag)
+  1646→    if (!state.dragMoved) {
+  1647→      set({ dragMoved: true });
+  1648→    }
+  1649→
+  1650→    const dx = (x - state.dragStart.x) / state.zoom;
+  1651→    const dy = (y - state.dragStart.y) / state.zoom;
+  1652→
+  1653→    // Calculate snap for the primary element (first in selection)
+  1654→    const primaryId = state.selectedElementIds[0];
+  1655→    const primaryStart = state.multiDragStart[primaryId];
+  1656→    if (!primaryStart) return;
+  1657→
+  1658→    // Use the PRIMARY element's start position (not the clicked element's)
+  1659→    // so that actualDx/actualDy correctly represent just the mouse delta.
+  1660→    // Using dragStart.elementX would add an offset when clicking a non-primary
+  1661→    // element in a multi-selection, causing elements to "jump".
+  1662→    const proposedX = primaryStart.x + dx;
+  1663→    const proposedY = primaryStart.y + dy;
+  1664→
+  1665→    const elementIndex = buildElementIndex(state.elements);
+  1666→    const primaryElement = elementIndex.get(primaryId);
+  1667→    if (!primaryElement) return;
+  1668→
+  1669→    // Calculate snapping based on primary element
+  1670→    let actualDx: number;
+  1671→    let actualDy: number;
+  1672→    let guidelines: AlignmentGuide[];
+  1673→
+  1674→    if (state.snapEnabled) {
+  1675→      const selectedIdSet = new Set(state.selectedElementIds);
+  1676→      const others = state.elements.filter((e) => !selectedIdSet.has(e.id));
+  1677→      // For line elements, pass endpoint coordinates so snapping uses the line's
+  1678→      // visual center (midpoint of endpoints) instead of the thin bounding box
+  1679→      const lineEndpoints = primaryElement.type === 'line' && primaryElement.lineStartX !== undefined
+  1680→        ? {
+  1681→            startX: (primaryElement.lineStartX - primaryElement.x) + proposedX,
+  1682→            startY: (primaryElement.lineStartY! - primaryElement.y) + proposedY,
+  1683→            endX: (primaryElement.lineEndX! - primaryElement.x) + proposedX,
+  1684→            endY: (primaryElement.lineEndY! - primaryElement.y) + proposedY,
+  1685→          }
+  1686→        : undefined;
+  1687→      // For group elements, pass children so snapping considers individual child edges
+  1688→      // instead of just the group bounding box
+  1689→      const groupChildren = primaryElement.type === 'group' && primaryElement.children
+  1690→        ? primaryElement.children
+  1691→        : undefined;
+  1692→      // For deformed rectangles, pass the corner points (shifted to the proposed
+  1693→      // position) so snapping considers ALL corner positions — including inner
+  1694→      // (deformed-inward) corners — not just the bounding box edges.
+  1695→      const cornerPoints = primaryElement.type === 'rectangle' && primaryElement.cornerPoints
+  1696→        ? primaryElement.cornerPoints.map((p) => ({
+  1697→            x: p.x + (proposedX - primaryElement.x),
+  1698→            y: p.y + (proposedY - primaryElement.y),
+  1699→          }))
+  1700→        : undefined;
+  1701→      const snapResult = calculateSnapForPosition(
+  1702→        primaryId,
+  1703→        proposedX,
+  1704→        proposedY,
+  1705→        primaryElement.width,
+  1706→        primaryElement.height,
+  1707→        others,
+  1708→        state.snapToElements,
+  1709→        state.snapToGrid,
+  1710→        state.snapUnit,
+  1711→        state.canvasSettings.pageWidth,
+  1712→        state.canvasSettings.pageHeight,
+  1713→        lineEndpoints,
+  1714→        state.canvasSettings.marginTop,
+  1715→        state.canvasSettings.marginBottom,
+  1716→        state.canvasSettings.marginLeft,
+  1717→        state.canvasSettings.marginRight,
+  1718→        groupChildren,
+  1719→        getElementBorderWidth(primaryElement),
+  1720→        cornerPoints,
+  1721→        primaryElement,
+  1722→      );
+  1723→
+  1724→      const snappedX = snapResult.snappedX;
+  1725→      const snappedY = snapResult.snappedY;
+  1726→      actualDx = snappedX - primaryStart.x;
+  1727→      actualDy = snappedY - primaryStart.y;
+  1728→      guidelines = snapResult.guidelines;
+  1729→    } else {
+  1730→      actualDx = proposedX - primaryStart.x;
+  1731→      actualDy = proposedY - primaryStart.y;
+  1732→      guidelines = [];
+  1733→    }
+  1734→
+  1735→    // Apply the same delta to ALL selected elements
+  1736→    set({
+  1737→      elements: state.elements.map((el) => {
+  1738→        const startInfo = state.multiDragStart[el.id];
+  1739→        if (!startInfo) return el;
+  1740→
+  1741→        const newX = startInfo.x + actualDx;
+  1742→        const newY = startInfo.y + actualDy;
+  1743→
+  1744→        // For line elements, also move endpoints by the same delta from their start positions
+  1745→        if (el.type === 'line' && startInfo.lineStartX !== undefined) {
+  1746→          return {
+  1747→            ...el,
+  1748→            x: newX,
+  1749→            y: newY,
+  1750→            lineStartX: startInfo.lineStartX + actualDx,
+  1751→            lineStartY: startInfo.lineStartY! + actualDy,
+  1752→            lineEndX: startInfo.lineEndX! + actualDx,
+  1753→            lineEndY: startInfo.lineEndY! + actualDy,
+  1754→          };
+  1755→        }
+  1756→        // For rectangles with custom corners, translate the corner points too.
+  1757→        if (el.cornerPoints && startInfo.cornerPoints) {
+  1758→          return {
+  1759→            ...el,
+  1760→            x: newX,
+  1761→            y: newY,
+  1762→            cornerPoints: startInfo.cornerPoints.map((p) => ({
+  1763→              x: p.x + actualDx,
+  1764→              y: p.y + actualDy,
+  1765→            })),
+  1766→          };
+  1767→        }
+  1768→        return { ...el, x: newX, y: newY };
+  1769→      }),
+  1770→      alignmentGuidelines: guidelines,
+  1771→    });
+  1772→  },
+  1773→
+  1774→  startResizing: (id, handle, x, y) => {
+  1775→    const state = get();
+  1776→    const element = state.elements.find((el) => el.id === id);
+  1777→    if (!element || element.locked) return;
+  1778→    // Push undo BEFORE the resize starts so we can revert to pre-resize state
+  1779→    state.pushUndo();
+  1780→
+  1781→    // ── Multi-element resize ──────────────────────────────────────────────
+  1782→    // When multiple elements are selected, compute a unified bounding box and
+  1783→    // store per-element offset ratios so updateResize can scale them all
+  1784→    // proportionally from the shared bbox.
+  1785→    if (state.selectedElementIds.length > 1 && state.selectedElementIds.includes(id)) {
+  1786→      const selectedIds = state.selectedElementIds;
+  1787→      const elementIndex = buildElementIndex(state.elements);
+  1788→
+  1789→      // Compute the unified bounding box of all selected elements
+  1790→      let bboxLeft = Infinity, bboxTop = Infinity, bboxRight = -Infinity, bboxBottom = -Infinity;
+  1791→      for (const sid of selectedIds) {
+  1792→        const el = elementIndex.get(sid);
+  1793→        if (!el) continue;
+  1794→        const elLeft = el.x;
+  1795→        const elTop = el.y;
+  1796→        const elRight = el.x + el.width;
+  1797→        const elBottom = el.y + el.height;
+  1798→        if (elLeft < bboxLeft) bboxLeft = elLeft;
+  1799→        if (elTop < bboxTop) bboxTop = elTop;
+  1800→        if (elRight > bboxRight) bboxRight = elRight;
+  1801→        if (elBottom > bboxBottom) bboxBottom = elBottom;
+  1802→      }
+  1803→
+  1804→      const bboxW = bboxRight - bboxLeft;
+  1805→      const bboxH = bboxBottom - bboxTop;
+  1806→
+  1807→      // Store per-element ratios relative to the unified bbox
+  1808→      const elementsData = selectedIds.map((sid) => {
+  1809→        const el = elementIndex.get(sid);
+  1810→        if (!el) return null;
+  1811→        const rx = bboxW > 0 ? (el.x - bboxLeft) / bboxW : 0;
+  1812→        const ry = bboxH > 0 ? (el.y - bboxTop) / bboxH : 0;
+  1813→        const rw = bboxW > 0 ? el.width / bboxW : 1;
+  1814→        const rh = bboxH > 0 ? el.height / bboxH : 1;
+  1815→        return {
+  1816→          id: sid,
+  1817→          origX: el.x, origY: el.y, origW: el.width, origH: el.height,
+  1818→          rx, ry, rw, rh,
+  1819→          lineStartX: el.type === 'line' && el.lineStartX !== undefined ? el.lineStartX : undefined,
+  1820→          lineStartY: el.type === 'line' && el.lineStartY !== undefined ? el.lineStartY : undefined,
+  1821→          lineEndX: el.type === 'line' && el.lineEndX !== undefined ? el.lineEndX : undefined,
+  1822→          lineEndY: el.type === 'line' && el.lineEndY !== undefined ? el.lineEndY : undefined,
+  1823→          // Snapshot original corner points so deformed rectangles scale with the multi-resize
+  1824→          origCornerPoints: el.cornerPoints
+  1825→            ? el.cornerPoints.map((p) => ({ x: p.x, y: p.y }))
+  1826→            : undefined,
+  1827→          originalChildren: el.type === 'group' && el.children ? structuredClone(el.children) : undefined,
+  1828→        };
+  1829→      }).filter(Boolean) as NonNullable<NonNullable<DesignerState['multiResizeData']>['elements']>[number][];
+  1830→
+  1831→      set({
+  1832→        isResizing: true,
+  1833→        resizeHandle: handle,
+  1834→        resizeStart: {
+  1835→          x, y,
+  1836→          elementX: bboxLeft,
+  1837→          elementY: bboxTop,
+  1838→          elementW: bboxW,
+  1839→          elementH: bboxH,
+  1840→        },
+  1841→        multiResizeData: {
+  1842→          bbox: { x: bboxLeft, y: bboxTop, width: bboxW, height: bboxH },
+  1843→          elements: elementsData,
+  1844→        },
+  1845→      });
+  1846→      return;
+  1847→    }
+  1848→
+  1849→    // ── Single-element resize (original behavior) ───────────────────────
+  1850→    const newSelection = [id];
+  1851→    set({
+  1852→      isResizing: true,
+  1853→      resizeHandle: handle,
+  1854→      selectedElementIds: newSelection,
+  1855→      selectedElementId: id,
+  1856→      resizeStart: {
+  1857→        x,
+  1858→        y,
+  1859→        elementX: element.x,
+  1860→        elementY: element.y,
+  1861→        elementW: element.width,
+  1862→        elementH: element.height,
+  1863→        originalChildren: element.type === 'group' && element.children
+  1864→          ? structuredClone(element.children)
+  1865→          : undefined,
+  1866→        // Snapshot original corner points so deformed rectangles scale with normal resize
+  1867→        origCornerPoints: element.cornerPoints
+  1868→          ? element.cornerPoints.map((p) => ({ x: p.x, y: p.y }))
+  1869→          : undefined,
+  1870→      },
+  1871→      multiResizeData: null,
+  1872→    });
+  1873→  },
+  1874→
+  1875→  stopResizing: () => {
+  1876→    // Undo was already pushed in startResizing, so just clear resize state
+  1877→    // Mark as dirty since size changed during the resize
+  1878→    set({ isResizing: false, resizeHandle: null, resizeStart: null, multiResizeData: null, alignmentGuidelines: [], isDirty: true });
+  1879→  },
+  1880→
+  1881→  updateResize: (x, y) => {
+  1882→    const state = get();
+  1883→    if (!state.resizeStart || !state.resizeHandle) return;
+  1884→    const screenDx = (x - state.resizeStart.x) / state.zoom;
+  1885→    const screenDy = (y - state.resizeStart.y) / state.zoom;
+  1886→    let handle = state.resizeHandle;
+  1887→    const start = state.resizeStart;
+  1888→
+  1889→    // ── Rotation-aware resize for rectangles ──────────────────────────────
+  1890→    // A rotated rectangle is rendered with `transform: rotate(θ)` and
+  1891→    // `transform-origin: center`, so it pivots around its CENTER, which lives
+  1892→    // at (element.x + W/2, element.y + H/2) in screen space.
+  1893→    //
+  1894→    // The previous implementation only transformed the mouse delta into the
+  1895→    // rectangle's local space and then ran standard axis-aligned bbox math
+  1896→    // (e.g. for 'e': keep start.elementX fixed, grow width). That is WRONG for
+  1897→    // a rotated rectangle: keeping the LOCAL left edge fixed moves the CENTER
+  1898→    // in local space whenever the width changes, and — because the rotation
+  1899→    // pivots around the center — that center shift rotates into screen space.
+  1900→    // The result was that the "fixed" opposite edge drifted on screen, the
+  1901→    // element's screen position jumped even though only size was meant to
+  1902→    // change, the dragged handle moved at the wrong speed (factor
+  1903→    // (1+cosθ)/2), and behavior varied wildly per angle with a hard
+  1904→    // discontinuity at the cosθ < -0.5 remap threshold.
+  1905→    //
+  1906→    // The correct approach keeps the OPPOSITE edge/corner fixed in SCREEN
+  1907→    // space (not local space). Algorithm:
+  1908→    //   1. Project the mouse delta onto the rectangle's local east axis
+  1909→    //      (cos, sin) and south axis (-sin, cos) → deltaE, deltaS.
+  1910→    //   2. New size: moving edge follows its projected delta.
+  1911→    //   3. The center shifts by half the size change along the moving edge's
+  1912→    //      axis (toward the moving edge), so the anchor edge/corner stays
+  1913→    //      fixed in screen space.
+  1914→    // This yields a single unified formula valid for ALL angles (0°–360°)
+  1915→    // with no remapping and no discontinuities. At θ=0 it collapses exactly
+  1916→    // to the axis-aligned math (anchor = local opposite edge, center shift is
+  1917→    // zero in the perpendicular direction). The dragged handle follows the
+  1918→    // mouse 1:1 in screen space at every angle.
+  1919→    //
+  1920→    // Only rectangles support rotation. Non-rectangle elements and multi-
+  1921→    // element proportional resize use the raw screen delta (no transformation).
+  1922→    const primaryId = state.selectedElementIds[0];
+  1923→    let dx = screenDx;
+  1924→    let dy = screenDy;
+  1925→
+  1926→    // ── Calculate raw (unsnapped) resize bounds ──
+  1927→    let rawX = start.elementX;
+  1928→    let rawY = start.elementY;
+  1929→    let rawW = start.elementW;
+  1930→    let rawH = start.elementH;
+  1931→
+  1932→    // For rotated DEFORMED rectangles, the corner points are computed up-front
+  1933→    // in screen space (see resizeRotatedCornerPoints). The bbox is then derived
+  1934→    // from those corners, and this precomputed corners array is committed
+  1935→    // directly (skipping the resizeCornerPointsByEdges call further below).
+  1936→    // Snapping may adjust the bbox; in that case the precomputed corners are
+  1937→    // proportionally rescaled to the snapped bbox (a minor adjustment).
+  1938→    let precomputedCorners: { x: number; y: number }[] | null = null;
+  1939→
+  1940→    // Whether the rotation-aware bbox math was applied (skips the axis-aligned
+  1941→    // block below for rotated rectangles).
+  1942→    let rotationAwareApplied = false;
+  1943→    if (primaryId && !state.multiResizeData) {
+  1944→      const primaryEl = state.elements.find((el) => el.id === primaryId);
+  1945→      if (primaryEl && primaryEl.type === 'rectangle') {
+  1946→        const rotation = getRectRotation(primaryEl);
+  1947→        if (rotation !== 0) {
+  1948→          // ── Rotated DEFORMED rectangle: screen-space corner resize ──
+  1949→          // resizeCornerPointsByEdges keeps the opposite corner fixed in LOCAL
+  1950→          // space, but for a rotated rect that corner still drifts VISUALLY
+  1951→          // because the bbox center (rotation pivot) shifts. resizeRotatedCornerPoints
+  1952→          // works in screen space so the opposite corner stays visually fixed,
+  1953→          // and the result is self-consistent with transform-origin: center.
+  1954→          if (start.origCornerPoints) {
+  1955→            const result = resizeRotatedCornerPoints(
+  1956→              start.origCornerPoints,
+  1957→              rotation,
+  1958→              handle,
+  1959→              screenDx,
+  1960→              screenDy,
+  1961→            );
+  1962→            precomputedCorners = result.corners;
+  1963→            rawX = result.bbox.x;
+  1964→            rawY = result.bbox.y;
+  1965→            rawW = result.bbox.width;
+  1966→            rawH = result.bbox.height;
+  1967→            rotationAwareApplied = true;
+  1968→          } else {
+  1969→            // ── Rotated NON-deformed rectangle: anchor-fixed bbox math ──
+  1970→            const rad = (rotation * Math.PI) / 180;
+  1971→            const cos = Math.cos(rad);
+  1972→            const sin = Math.sin(rad);
+  1973→            // Project the screen-space mouse delta onto the rectangle's local
+  1974→            // east axis (cos, sin) and south axis (-sin, cos). These are how far
+  1975→            // the dragged handle moved along each local axis.
+  1976→            const deltaE = screenDx * cos + screenDy * sin;
+  1977→            const deltaS = -screenDx * sin + screenDy * cos;
+  1978→
+  1979→            // New width/height: the moving edge follows its projected delta.
+  1980→            // 'e' grows width (right edge moves +east), 'w' shrinks (left edge
+  1981→            // moves +east). Same sign convention for 's'/'n' with the south axis.
+  1982→            let newW = start.elementW;
+  1983→            let newH = start.elementH;
+  1984→            if (handle.includes('e')) newW = start.elementW + deltaE;
+  1985→            if (handle.includes('w')) newW = start.elementW - deltaE;
+  1986→            if (handle.includes('s')) newH = start.elementH + deltaS;
+  1987→            if (handle.includes('n')) newH = start.elementH - deltaS;
+  1988→
+  1989→            // Min-size clamp. When clamped, the moving edge simply stops at the
+  1990→            // min distance from the anchor — the anchor stays fixed regardless.
+  1991→            const MIN_W = 20;
+  1992→            const MIN_H = 10;
+  1993→            newW = Math.max(MIN_W, newW);
+  1994→            newH = Math.max(MIN_H, newH);
+  1995→
+  1996→            const dW = newW - start.elementW;
+  1997→            const dH = newH - start.elementH;
+  1998→
+  1999→            // Center shift: the anchor (opposite edge/corner) stays fixed in
+  2000→            // screen space, so the center moves by half the size change along
+
+[showing lines 1-2000 of 5168; use offset=2001 with limit to continue reading]

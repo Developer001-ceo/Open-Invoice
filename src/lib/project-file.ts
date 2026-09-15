@@ -414,6 +414,13 @@ export function migrateProject(file: ProjectFile): ProjectFile {
     console.warn(
       `Project file version ${fileVersion} is newer than app version ${APP_VERSION}. Loading with best-effort compatibility.`
     );
+    // Security: version-specific migrations are skipped, but sanitization is
+    // NOT a migration — it's the trust boundary for every innerHTML sink
+    // downstream (canvas, preview, PDF export). A file claiming a newer
+    // appVersion is still untrusted input and must never bypass it.
+    if (result.elements) {
+      walkElements(result.elements, (el) => sanitizeElement(el));
+    }
     return result;
   }
 

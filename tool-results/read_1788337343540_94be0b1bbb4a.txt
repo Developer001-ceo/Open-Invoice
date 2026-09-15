@@ -1,0 +1,1022 @@
+     1→'use client';
+     2→
+     3→import { CanvasElement, TextProperties, TableProperties, ImageProperties, LineProperties, RectangleProperties, EllipseProperties, RectangleEffects, DEFAULT_EFFECTS, buildGradientCSS, buildShadowCSS, buildGlowCSS, buildPictureFillCSS, resolveCornerRadius, resolveRectBorderRadius, getRectRotation } from '@/lib/element-types';
+     4→import { getCellBg, getCellColor, getCellFontWeight, getCellFontFamily, getCellFontSize, getCellPadding, getCellTextAlign, getCellVerticalAlign, getCellTextTransform, getCellRotation, getCellBorderTop, getCellBorderBottom, getCellBorderLeft, getCellBorderRight, normalizeTableProps, ensureColWidths, ensureRowHeights } from '@/lib/table-helpers';
+     5→import {
+     6→  hasCustomCorners,
+     7→  getRectCornerPoints,
+     8→  buildRoundedPolygonPath,
+     9→  buildSvgFillDescriptor,
+    10→  buildSvgFilterCSS,
+    11→  svgStrokeDasharray,
+    12→  bboxOfPoints,
+    13→  CORNER_HANDLE_MAP,
+    14→} from '@/lib/rectangle-corners';
+    15→import { properCapitalize } from '@/lib/utils';
+    16→import { getResizeCursor } from '@/lib/resize-cursor';
+    17→import { useDesignerStore } from '@/store/designer-store';
+    18→import { useRef, useState, useCallback, useEffect, useMemo, memo } from 'react';
+    19→import { Upload, Info } from 'lucide-react';
+    20→import { motion } from 'framer-motion';
+    21→import { RichTextRenderer, CanvasTextEditor } from '@/components/designer/rich-text-editor';
+    22→
+    23→// ── Constants defined outside components to avoid re-allocation ────────────────
+    24→
+    25→// Resize handle positions — static constant to avoid array recreation on every render
+    26→const RESIZE_HANDLES = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'] as const;
+    27→
+    28→// Reflection mask lookup — avoids function call per render
+    29→const REFLECTION_MASKS: Record<string, string> = {
+    30→  soft: 'linear-gradient(to bottom, black 0%, transparent 80%)',
+    31→  tight: 'linear-gradient(to bottom, black 0%, transparent 50%)',
+    32→  fade: 'linear-gradient(to bottom, black 0%, transparent 100%)',
+    33→  mirror: 'linear-gradient(to bottom, black 0%, transparent 60%, transparent 100%)',
+    34→};
+    35→
+    36→const DEFAULT_REFLECTION_MASK = 'linear-gradient(to bottom, black 0%, transparent 100%)';
+    37→
+    38→function getReflectionMask(preset: string): string {
+    39→  return REFLECTION_MASKS[preset] ?? DEFAULT_REFLECTION_MASK;
+    40→}
+    41→
+    42→// Resize handle component
+    43→function ResizeHandle({ position, rotation, onResizeStart }: { position: string; rotation: number; onResizeStart: (handle: string, e: React.MouseEvent) => void }) {
+    44→  const isCorner = position.length === 2;
+    45→  const size = isCorner ? 'w-2.5 h-2.5' : 'w-2 h-2';
+    46→
+    47→  // Rotation-aware cursor: at 0° (and 45° increments) this returns the native
+    48→  // built-in CSS cursor; at other angles it generates a custom SVG double-arrow
+    49→  // rotated to the handle's visual screen direction. See src/lib/resize-cursor.ts.
+    50→  const cursor = getResizeCursor(position, rotation);
+    51→
+    52→  const getPositionStyle = () => {
+    53→    const offset = -5;
+    54→    switch (position) {
+    55→      case 'nw': return { top: offset, left: offset };
+    56→      case 'n': return { top: offset, left: '50%', transform: 'translateX(-50%)' };
+    57→      case 'ne': return { top: offset, right: offset };
+    58→      case 'e': return { top: '50%', right: offset, transform: 'translateY(-50%)' };
+    59→      case 'se': return { bottom: offset, right: offset };
+    60→      case 's': return { bottom: offset, left: '50%', transform: 'translateX(-50%)' };
+    61→      case 'sw': return { bottom: offset, left: offset };
+    62→      case 'w': return { top: '50%', left: offset, transform: 'translateY(-50%)' };
+    63→      default: return {};
+    64→    }
+    65→  };
+    66→
+    67→  // Accessible label for screen readers + arrow-key nudging for keyboard users.
+    68→  const ariaLabel = `${position} resize handle`;
+    69→  const handleKeyDown = (e: React.KeyboardEvent) => {
+    70→    if (e.key === 'Enter' || e.key === ' ') {
+    71→      e.preventDefault();
+    72→      // Keyboard users can't drag, but Enter/Space focuses the element for
+    73→      // subsequent arrow-key nudging handled by the canvas keyboard layer.
+    74→    }
+    75→  };
+    76→
+    77→  return (
+    78→    <div
+    79→      data-resize-handle
+    80→      role="button"
+    81→      tabIndex={0}
+    82→      aria-label={ariaLabel}
+    83→      className={`absolute ${size} bg-white border-2 border-primary rounded-sm hover:bg-primary hover:border-primary transition-colors focus:outline-none focus:ring-2 focus:ring-primary/60`}
+    84→      style={{ ...getPositionStyle() as React.CSSProperties, cursor, zIndex: 10000, pointerEvents: 'auto' }}
+    85→      onMouseDown={(e) => {
+    86→        if (e.button === 1) {
+    87→          e.preventDefault();
+    88→          useDesignerStore.getState().startPanning(e.clientX, e.clientY);
+    89→          return;
+    90→        }
+    91→        if (e.button !== 0) return;
+    92→        e.stopPropagation();
+    93→        onResizeStart(position, e);
+    94→      }}
+    95→      onKeyDown={handleKeyDown}
+    96→    />
+    97→  );
+    98→}
+    99→
+   100→// Endpoint handle for line elements
+   101→function EndpointHandle({
+   102→  x,
+   103→  y,
+   104→  endpoint,
+   105→  onEndpointDragStart,
+   106→}: {
+   107→  x: number;
+   108→  y: number;
+   109→  endpoint: 'start' | 'end';
+   110→  onEndpointDragStart: (endpoint: 'start' | 'end', e: React.MouseEvent) => void;
+   111→}) {
+   112→  const ariaLabel = `${endpoint} endpoint handle`;
+   113→  const handleKeyDown = (e: React.KeyboardEvent) => {
+   114→    if (e.key === 'Enter' || e.key === ' ') {
+   115→      e.preventDefault();
+   116→    }
+   117→  };
+   118→  return (
+   119→    <div
+   120→      role="button"
+   121→      tabIndex={0}
+   122→      aria-label={ariaLabel}
+   123→      className="absolute focus:outline-none"
+   124→      style={{
+   125→        left: x - 7,
+   126→        top: y - 7,
+   127→        width: 14,
+   128→        height: 14,
+   129→        cursor: 'crosshair',
+   130→        zIndex: 10000,
+   131→        pointerEvents: 'auto',
+   132→      }}
+   133→      onMouseDown={(e) => {
+   134→        if (e.button === 1) {
+   135→          e.preventDefault();
+   136→          useDesignerStore.getState().startPanning(e.clientX, e.clientY);
+   137→          return;
+   138→        }
+   139→        if (e.button !== 0) return;
+   140→        e.stopPropagation();
+   141→        onEndpointDragStart(endpoint, e);
+   142→      }}
+   143→      onKeyDown={handleKeyDown}
+   144→    >
+   145→      {/* Outer circle */}
+   146→      <div className="w-3.5 h-3.5 rounded-full bg-white border-2 border-primary hover:bg-primary hover:border-primary transition-colors absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2" />
+   147→    </div>
+   148→  );
+   149→}
+   150→
+   151→// Rectangle corner handle — appears at each of the 4 corner points of a
+   152→// selected rectangle. Behavior is ALT-gated:
+   153→//  - Alt+drag  → individual corner deformation (the corner moves independently,
+   154→//    the other 3 stay fixed). On a fresh axis-aligned rect this lazily
+   155→//    converts it to a polygon; on an already-deformed rect it just moves the
+   156→//    dragged corner.
+   157→//  - Plain drag (no Alt) → standard corner resize (nw/ne/se/sw). For a normal
+   158→//    rect this preserves the axis-aligned box; for a deformed rect the polygon
+   159→//    resizes per-edge (the opposite corner stays fixed).
+   160→// Alignment modifiers (held during an Alt+drag). The DRAGGED corner is the one
+   161→// that moves into alignment; the partner corner(s) stay fixed:
+   162→//  - Alt+Shift             → horizontal align (dragged corner's Y snaps to its
+   163→//                            horizontal partner's Y).
+   164→//  - Alt+Ctrl              → vertical align (dragged corner's X snaps to its
+   165→//                            vertical partner's X).
+   166→//  - Alt+Shift+Ctrl        → both (dragged corner snaps to (vPartner.X, hPartner.Y)).
+   167→function CornerHandle({
+   168→  x,
+   169→  y,
+   170→  cornerIndex,
+   171→  isCustom,
+   172→  rotation,
+   173→  onCornerMouseDown,
+   174→}: {
+   175→  x: number;
+   176→  y: number;
+   177→  cornerIndex: number; // 0=TL, 1=TR, 2=BR, 3=BL
+   178→  isCustom: boolean; // whether the rectangle already has deformed corners
+   179→  rotation: number; // rectangle rotation in degrees (for rotation-aware cursor)
+   180→  onCornerMouseDown: (cornerIndex: number, altHeld: boolean, e: React.MouseEvent) => void;
+   181→}) {
+   182→  // Rotation-aware cursor: maps corner index to its handle position (nw/ne/se/sw)
+   183→  // and generates a cursor rotated to the visual screen direction. At 0° this
+   184→  // returns the native nwse/nesw built-in; at other angles a custom SVG arrow.
+   185→  const handlePos = CORNER_HANDLE_MAP[cornerIndex];
+   186→  const cursor = getResizeCursor(handlePos, rotation);
+   187→  return (
+   188→    <div
+   189→      data-resize-handle
+   190→      data-corner-handle
+   191→      className={`absolute w-2.5 h-2.5 rounded-sm transition-colors ${
+   192→        isCustom
+   193→          ? 'bg-white border-2 border-purple-500 hover:bg-purple-500 hover:border-purple-500'
+   194→          : 'bg-white border-2 border-primary hover:bg-primary hover:border-primary'
+   195→      }`}
+   196→      style={{
+   197→        left: x - 5,
+   198→        top: y - 5,
+   199→        cursor,
+   200→        zIndex: 10000,
+   201→        pointerEvents: 'auto',
+   202→      }}
+   203→      title={isCustom ? 'Alt+drag to move corner · Alt+Shift horizontal align · Alt+Ctrl vertical align · Alt+Shift+Ctrl both' : 'Alt+drag to move corner independently'}
+   204→      onMouseDown={(e) => {
+   205→        if (e.button === 1) {
+   206→          e.preventDefault();
+   207→          useDesignerStore.getState().startPanning(e.clientX, e.clientY);
+   208→          return;
+   209→        }
+   210→        if (e.button !== 0) return;
+   211→        e.stopPropagation();
+   212→        onCornerMouseDown(cornerIndex, e.altKey, e);
+   213→      }}
+   214→    />
+   215→  );
+   216→}
+   217→
+   218→// Text Element Renderer — displays formatted HTML content on the canvas.
+   219→// Double-clicking opens an inline TipTap editor directly on the canvas.
+   220→// Formatting controls live in the properties panel / floating card.
+   221→const TextElementRenderer = memo(function TextElementRenderer({ element }: { element: CanvasElement }) {
+   222→  const props = (element.properties as { type: 'text'; data: TextProperties }).data;
+   223→  const editingTextElementId = useDesignerStore((s) => s.editingTextElementId);
+   224→  const setEditingTextElement = useDesignerStore((s) => s.setEditingTextElement);
+   225→  const selectElement = useDesignerStore((s) => s.selectElement);
+   226→  const updateElementProperties = useDesignerStore((s) => s.updateElementProperties);
+   227→
+   228→  const isEditing = editingTextElementId === element.id;
+   229→
+   230→  const handleDoubleClick = useCallback((e: React.MouseEvent) => {
+   231→    e.stopPropagation();
+   232→    // Select the element and open the inline text editor on canvas
+   233→    selectElement(element.id);
+   234→    setEditingTextElement(element.id);
+   235→
+   236→    // Auto-open the Formatting floating card so the user has access to
+   237→    // formatting tools while editing (keyboard shortcuts like Shift+S
+   238→    // produce characters instead of triggering shortcuts in edit mode).
+   239→    const store = useDesignerStore.getState();
+   240→    const cardId = `${element.id}-text-content`;
+   241→    const alreadyFloating = store.floatingCards.some(c => c.id === cardId);
+   242→    if (!alreadyFloating) {
+   243→      const CARD_WIDTH = 320;
+   244→      const PANEL_WIDTH = 288;
+   245→      const PANEL_GAP = 24;
+   246→      const RIGHT_MARGIN = 90;
+   247→      const TOP_OFFSET = 160;
+   248→      const CARD_STACK_GAP = 40;
+   249→
+   250→      const propertyDisplayMode = store.propertyDisplayMode;
+   251→      const targetX = propertyDisplayMode !== 'floating'
+   252→        ? window.innerWidth - PANEL_WIDTH - CARD_WIDTH - PANEL_GAP
+   253→        : window.innerWidth - CARD_WIDTH - RIGHT_MARGIN;
+   254→
+   255→      const existingCards = store.floatingCards.length;
+   256→      const targetY = TOP_OFFSET + existingCards * CARD_STACK_GAP;
+   257→
+   258→      store.addFloatingCard({
+   259→        id: cardId,
+   260→        sectionLabel: 'Formatting',
+   261→        x: targetX,
+   262→        y: targetY,
+   263→        minimized: false,
+   264→        zIndex: Date.now(),
+   265→      });
+   266→    }
+   267→  }, [element.id, selectElement, setEditingTextElement]);
+   268→
+   269→  const handleContentChange = useCallback((html: string) => {
+   270→    const currentProps = (element.properties as { type: 'text'; data: TextProperties }).data;
+   271→    updateElementProperties(element.id, {
+   272→      type: 'text',
+   273→      data: { ...currentProps, content: html },
+   274→    });
+   275→  }, [element.id, element.properties, updateElementProperties]);
+   276→
+   277→  const handleFinishEditing = useCallback(() => {
+   278→    // Capture current scroll position before exiting, so the display
+   279→    // renderer can start there and animate back to top smoothly.
+   280→    const tiptapEl = document.querySelector('.tiptap.ProseMirror') as HTMLElement | null;
+   281→    if (tiptapEl) {
+   282→      _lastTextScrollTop = tiptapEl.scrollTop;
+   283→    }
+   284→    setEditingTextElement(null);
+   285→  }, [setEditingTextElement]);
+   286→
+   287→  return (
+   288→    <div
+   289→      className={`w-full h-full outline-none overflow-hidden ${
+   290→        isEditing
+   291→          ? 'ring-2 ring-primary/50 rounded cursor-default'
+   292→          : ''
+   293→      }`}
+   294→      onDoubleClick={handleDoubleClick}
+   295→    >
+   296→      {isEditing ? (
+   297→        <CanvasTextEditor
+   298→          elementId={element.id}
+   299→          props={props}
+   300→          onContentChange={handleContentChange}
+   301→          onFinishEditing={handleFinishEditing}
+   302→        />
+   303→      ) : (
+   304→        <RichTextRenderer props={props} initialScrollTop={_lastTextScrollTop} />
+   305→      )}
+   306→    </div>
+   307→  );
+   308→});
+   309→
+   310→// Table Element Renderer — uses CSS Grid for fixed row heights
+   311→const TableElementRenderer = memo(function TableElementRenderer({ element }: { element: CanvasElement }) {
+   312→  const rawProps = (element.properties as { type: 'table'; data: TableProperties }).data;
+   313→  const updateElementProperties = useDesignerStore((s) => s.updateElementProperties);
+   314→
+   315→  // Alt-key cell selection state from the store
+   316→  const altHeld = useDesignerStore((s) => s.altHeld);
+   317→  const selectedTableCells = useDesignerStore((s) => s.selectedTableCells);
+   318→  const hoveredTableCell = useDesignerStore((s) => s.hoveredTableCell);
+   319→  const isTableCellSelecting = useDesignerStore((s) => s.isTableCellSelecting);
+   320→  // The table that owns the current cell selection. The selection is scoped
+   321→  // to this table only — other tables on the canvas must NOT highlight cells
+   322→  // just because they share the same {row, col} coordinates.
+   323→  const tableCellSelectTableId = useDesignerStore((s) => s.tableCellSelectTableId);
+   324→  const isTableSelected = useDesignerStore(
+   325→    useCallback((s) => s.selectedElementIds.includes(element.id), [element.id])
+   326→  );
+   327→  // Whether this table is the active owner of the cell selection.
+   328→  const selectionOwnsTable = tableCellSelectTableId === element.id;
+   329→
+   330→  // Normalize legacy table properties using shared helper
+   331→  const props: TableProperties = normalizeTableProps(rawProps);
+   332→  const [editingCell, setEditingCell] = useState<{ r: number; c: number } | null>(null);
+   333→  const [editValue, setEditValue] = useState('');
+   334→
+   335→  const handleCellDoubleClick = (r: number, c: number) => {
+   336→    // Entering edit mode — clear any cell selection first
+   337→    useDesignerStore.getState().clearTableCellSelection();
+   338→    setEditingCell({ r, c });
+   339→    setEditValue(props.cellData[r]?.[c] || '');
+   340→  };
+   341→
+   342→  const handleCellBlur = () => {
+   343→    if (editingCell) {
+   344→      const newCellData = props.cellData.map((row) => [...row]);
+   345→      newCellData[editingCell.r][editingCell.c] = editValue;
+   346→      updateElementProperties(element.id, {
+   347→        type: 'table',
+   348→        data: { ...props, cellData: newCellData },
+   349→      });
+   350→      setEditingCell(null);
+   351→    }
+   352→  };
+   353→
+   354→  // ── Alt-key cell selection handlers ──────────────────────────────────────
+   355→  const handleCellMouseEnter = useCallback((r: number, c: number) => {
+   356→    if (!altHeld) return;
+   357→    const state = useDesignerStore.getState();
+   358→    state.setHoveredTableCell({ row: r, col: c, tableId: element.id });
+   359→
+   360→    // If currently dragging (Alt+drag multi-select), update the selection range
+   361→    if (state.isTableCellSelecting) {
+   362→      state.updateTableCellSelecting(r, c);
+   363→    }
+   364→  }, [altHeld, element.id]);
+   365→
+   366→  const handleCellMouseLeave = useCallback(() => {
+   367→    if (!altHeld) return;
+   368→    useDesignerStore.getState().setHoveredTableCell(null);
+   369→  }, [altHeld]);
+   370→
+   371→  const handleCellContextMenu = useCallback((e: React.MouseEvent, r: number, c: number) => {
+   372→    if (!altHeld) return;
+   373→    e.preventDefault();
+   374→    e.stopPropagation();
+   375→    const state = useDesignerStore.getState();
+   376→    // Alt+right-click always toggles the cell selection
+   377→    state.selectTableCell(element.id, r, c, true);
+   378→  }, [altHeld, element.id]);
+   379→
+   380→  const handleCellPointerDown = useCallback((e: React.PointerEvent, r: number, c: number) => {
+   381→    if (e.button !== 0) return;
+   382→    const state = useDesignerStore.getState();
+   383→
+   384→    if (altHeld) {
+   385→      e.stopPropagation();
+   386→      e.preventDefault();
+   387→      if (!state.isTableCellSelecting) {
+   388→        state.startTableCellSelecting(element.id, r, c, state.selectedTableCells);
+   389→      }
+   390→    } else {
+   391→      // Non-Alt click — only deselect if clicking an unselected cell
+   392→      // Clicking a selected cell keeps the selection (double-click enters edit mode instead)
+   393→      if (state.selectedTableCells.length > 0) {
+   394→        const cellKey = `${r}-${c}`;
+   395→        const isAlreadySelected = state.selectedTableCells.some(c => `${c.row}-${c.col}` === cellKey);
+   396→        if (!isAlreadySelected) {
+   397→          e.stopPropagation();
+   398→          e.preventDefault();
+   399→          state.clearTableCellSelection();
+   400→        }
+   401→      }
+   402→    }
+   403→  }, [altHeld, element.id]);
+   404→
+   405→  const handleCellPointerUp = useCallback(() => {
+   406→    const state = useDesignerStore.getState();
+   407→    if (state.isTableCellSelecting) {
+   408→      state.finishTableCellSelecting();
+   409→    }
+   410→  }, []);
+   411→
+   412→  // Cell styling and border helpers are now imported from table-helpers.ts
+   413→  // They are used as: getCellBg(r, c, props), getCellBorderTop(r, c, props), etc.
+   414→
+   415→  const bw = props.borderWidth;
+   416→  const borderStyleValue = props.borderStyle;
+   417→  const borderColorValue = props.borderColor;
+   418→  // Collapsed border model: each shared edge is drawn only ONCE.
+   419→  // Every cell draws its top and left borders.
+   420→  // Only the last row draws bottom borders; only the last column draws right borders.
+   421→  // This guarantees exactly one border per edge, all at the same thickness.
+   422→  const borderStr = `${bw}px ${borderStyleValue} ${borderColorValue}`;
+   423→
+   424→  // Use colWidths/rowHeights fractions for grid template.
+   425→  // We convert fractions to EXPLICIT PIXEL values rather than using CSS `fr`
+   426→  // units. With `fr`, the browser redistributes all track sizes whenever any
+   427→  // fraction changes, and sub-pixel rounding can cause other rows/columns to
+   428→  // shift by ~1px during a resize drag. With explicit `px` values, each
+   429→  // track's size is computed independently and stays stable when other tracks
+   430→  // change — only the two resizing tracks actually change size. The last
+   431→  // track absorbs any rounding remainder so the grid fills the element exactly.
+   432→  const cw = ensureColWidths(props.cols, props.colWidths);
+   433→  const rh = ensureRowHeights(props.rows, props.rowHeights);
+   434→  const totalColFr = cw.reduce((a, b) => a + b, 0) || 1;
+   435→  const visibleRowHeights = props.showHeader ? rh : rh.slice(1);
+   436→  const totalRowFr = (visibleRowHeights.length > 0 ? visibleRowHeights : [1]).reduce((a, b) => a + b, 0) || 1;
+   437→
+   438→  // Compute explicit pixel sizes; the last track gets the remainder to avoid
+   439→  // gaps/overflow from rounding.
+   440→  const computeTrackSizes = (fracs: number[], total: number, totalFr: number): string[] => {
+   441→    if (fracs.length === 0) return ['100%'];
+   442→    const sizes = fracs.map(f => (f / totalFr) * total);
+   443→    // Last track absorbs the rounding difference
+   444→    const allocated = sizes.slice(0, -1).reduce((a, b) => a + b, 0);
+   445→    sizes[sizes.length - 1] = total - allocated;
+   446→    return sizes.map(s => `${s}px`);
+   447→  };
+   448→
+   449→  const gridTemplateColumns = computeTrackSizes(cw, element.width, totalColFr).join(' ');
+   450→  const gridTemplateRows = computeTrackSizes(
+   451→    visibleRowHeights.length > 0 ? visibleRowHeights : [1],
+   452→    element.height,
+   453→    totalRowFr
+   454→  ).join(' ');
+   455→
+   456→  // Build a Set of selected cell keys for quick lookup.
+   457→  // IMPORTANT: only include cells when THIS table is the owner of the
+   458→  // selection (tableCellSelectTableId === element.id). Without this guard,
+   459→  // every table on the canvas would highlight cells at the same {row, col}
+   460→  // as the selected ones, making it look like all tables got selected.
+   461→  const selectedCellSet = useMemo(() => {
+   462→    const set = new Set<string>();
+   463→    if (!selectionOwnsTable) return set;
+   464→    for (const cell of selectedTableCells) {
+   465→      set.add(`${cell.row}-${cell.col}`);
+   466→    }
+   467→    return set;
+   468→  }, [selectedTableCells, selectionOwnsTable]);
+   469→
+   470→  // Render all visible cells as grid children
+   471→  const renderCells = () => {
+   472→    const cells: React.ReactNode[] = [];
+   473→
+   474→    for (let r = 0; r < props.rows; r++) {
+   475→      // Skip header row if hidden
+   476→      if (r === 0 && !props.showHeader) continue;
+   477→
+   478→      const gridRow = props.showHeader ? r + 1 : r; // 1-based grid row
+   479→
+   480→      for (let c = 0; c < props.cols; c++) {
+   481→        const padding = getCellPadding(r, c, props);
+   482→        const bgColor = getCellBg(r, c, props);
+   483→        const textColor = getCellColor(r, c, props);
+   484→        const fontFamily = getCellFontFamily(r, c, props);
+   485→        const fontWeight = getCellFontWeight(r, c, props);
+   486→        const fontSize = getCellFontSize(r, c, props);
+   487→        const textAlign = getCellTextAlign(r, c, props);
+   488→        const verticalAlign = getCellVerticalAlign(r, c, props);
+   489→        const textTransform = getCellTextTransform(r, c, props);
+   490→        const rotation = getCellRotation(r, c, props);
+   491→
+   492→        // ── Alt-key cell selection visual feedback ──────────────────────────
+   493→        const cellKey = `${r}-${c}`;
+   494→        const isSelected = selectedCellSet.has(cellKey);
+   495→        const isHovered = altHeld && hoveredTableCell?.row === r && hoveredTableCell?.col === c && hoveredTableCell?.tableId === element.id;
+   496→
+   497→        // Collapsed border model:
+   498→        // - Every cell draws top & left borders (handles outer + inner edges)
+   499→        // - Only last row draws bottom border (outer bottom edge)
+   500→        // - Only last column draws right border (outer right edge)
+   501→        // This avoids double-thick inner borders since each edge is drawn exactly once.
+   502→        // For selected cells, borders stay normal — only the dim overlay marks selection.
+   503→        const borderTop = getCellBorderTop(r, c, props) ? borderStr : 'none';
+   504→        const borderLeft = getCellBorderLeft(r, c, props) ? borderStr : 'none';
+   505→        const borderBottom = (r === props.rows - 1 && getCellBorderBottom(r, c, props)) ? borderStr : 'none';
+   506→        const borderRight = (c === props.cols - 1 && getCellBorderRight(r, c, props)) ? borderStr : 'none';
+   507→
+   508→        // Corner radius: apply to corner cells so borders follow the curve
+   509→        const isFirstVisibleRow = props.showHeader ? r === 0 : r === 1;
+   510→        const isLastRow = r === props.rows - 1;
+   511→        const isFirstCol = c === 0;
+   512→        const isLastCol = c === props.cols - 1;
+   513→        const cellBorderRadius = `${isFirstVisibleRow && isFirstCol ? radii.topLeft : 0}px ${isFirstVisibleRow && isLastCol ? radii.topRight : 0}px ${isLastRow && isLastCol ? radii.bottomRight : 0}px ${isLastRow && isFirstCol ? radii.bottomLeft : 0}px`;
+   514→
+   515→        // Vertical alignment via flexbox
+   516→        const justifyContent = verticalAlign === 'top'
+   517→          ? 'flex-start'
+   518→          : verticalAlign === 'bottom'
+   519→            ? 'flex-end'
+   520→            : 'center';
+   521→
+   522→        // For 'capitalize', we apply proper title case via JS (first letter uppercase, rest lowercase)
+   523→        // because CSS text-transform: capitalize only uppercases first letters without lowercasing the rest.
+   524→        const effectiveTextTransform = textTransform === 'capitalize' ? 'none' : textTransform;
+   525→        const cellText = props.cellData[r]?.[c] || '';
+   526→        const displayText = textTransform === 'capitalize' ? properCapitalize(cellText) : cellText;
+   527→
+   528→        cells.push(
+   529→          <div
+   530→            key={`${r}-${c}`}
+   531→            className="overflow-hidden"
+   532→            style={{
+   533→              gridRow,
+   534→              gridColumn: c + 1,
+   535→              padding: `${padding}px`,
+   536→              backgroundColor: bgColor,
+   537→              color: textColor,
+   538→              fontFamily,
+   539→              fontWeight,
+   540→              fontSize: `${fontSize}px`,
+   541→              textAlign: textAlign as 'left' | 'center' | 'right' | 'justify',
+   542→              ...(textAlign === 'justify' ? { textAlignLast: 'left' as const, textJustify: 'inter-character' as const, hyphens: 'auto' as const } : {}),
+   543→              textTransform: effectiveTextTransform as 'none' | 'uppercase' | 'lowercase',
+   544→              borderTop,
+   545→              borderBottom,
+   546→              borderLeft,
+   547→              borderRight,
+   548→              borderRadius: cellBorderRadius,
+   549→              boxSizing: 'border-box',
+   550→              // Use flexbox for vertical alignment, prevent content from expanding the cell
+   551→              display: 'flex',
+   552→              alignItems: justifyContent,
+   553→              minHeight: 0, // critical: allows grid to shrink below content size
+   554→              minWidth: 0,
+   555→              ...(rotation ? { transform: `rotate(${rotation}deg)` } : {}),
+   556→              position: 'relative',
+   557→              cursor: altHeld && isTableSelected ? 'pointer' : undefined,
+   558→            }}
+   559→            onDoubleClick={() => handleCellDoubleClick(r, c)}
+   560→            onMouseEnter={() => handleCellMouseEnter(r, c)}
+   561→            onMouseLeave={handleCellMouseLeave}
+   562→            onContextMenu={(e) => handleCellContextMenu(e, r, c)}
+   563→            onPointerDown={(e) => handleCellPointerDown(e, r, c)}
+   564→            onPointerUp={handleCellPointerUp}
+   565→          >
+   566→            {/* Alt-hover dim overlay — only when the table itself is selected */}
+   567→            {isHovered && !isSelected && isTableSelected && (
+   568→              <div
+   569→                className="absolute inset-0 pointer-events-none"
+   570→                style={{ backgroundColor: 'rgba(0, 0, 0, 0.08)', zIndex: 1 }}
+   571→              />
+   572→            )}
+   573→            {/* Selected cell dim overlay */}
+   574→            {isSelected && (
+   575→              <div
+   576→                className="absolute inset-0 pointer-events-none"
+   577→                style={{ backgroundColor: 'rgba(0, 0, 0, 0.06)', zIndex: 1 }}
+   578→              />
+   579→            )}
+   580→            {editingCell?.r === r && editingCell?.c === c ? (
+   581→              <input
+   582→                autoFocus
+   583→                value={editValue}
+   584→                onChange={(e) => setEditValue(e.target.value)}
+   585→                onBlur={handleCellBlur}
+   586→                onKeyDown={(e) => e.key === 'Enter' && handleCellBlur()}
+   587→                className="w-full bg-transparent outline-none border-none p-0 m-0"
+   588→                style={{
+   589→                  fontSize: 'inherit',
+   590→                  fontWeight: 'inherit',
+   591→                  color: 'inherit',
+   592→                  textAlign: 'inherit',
+   593→                  lineHeight: 1.2,
+   594→                }}
+   595→              />
+   596→            ) : (
+   597→              <span
+   598→                style={{
+   599→                  display: 'block',
+   600→                  width: '100%',
+   601→                  overflow: 'hidden',
+   602→                  textOverflow: 'ellipsis',
+   603→                  whiteSpace: 'nowrap',
+   604→                  lineHeight: 1.2,
+   605→                  position: 'relative',
+   606→                  zIndex: 2,
+   607→                }}
+   608→              >
+   609→                {displayText}
+   610→              </span>
+   611→            )}
+   612→          </div>
+   613→        );
+   614→      }
+   615→    }
+   616→
+   617→    return cells;
+   618→  };
+   619→
+   620→  const radii = resolveCornerRadius(props.cornerRadius);
+   621→
+   622→  return (
+   623→    <div
+   624→      className="w-full h-full"
+   625→      style={{
+   626→        opacity: props.opacity,
+   627→        borderRadius: `${radii.topLeft}px ${radii.topRight}px ${radii.bottomRight}px ${radii.bottomLeft}px`,
+   628→      }}
+   629→    >
+   630→      <div
+   631→        style={{
+   632→          display: 'grid',
+   633→          gridTemplateRows,
+   634→          gridTemplateColumns,
+   635→          width: '100%',
+   636→          height: '100%',
+   637→          fontSize: `${props.fontSize}px`,
+   638→          overflow: 'hidden',
+   639→          position: 'relative',
+   640→          userSelect: altHeld && isTableSelected ? 'none' : undefined,
+   641→        }}
+   642→      >
+   643→        {renderCells()}
+   644→      </div>
+   645→    </div>
+   646→  );
+   647→});
+   648→
+   649→// Image Element Renderer
+   650→const ImageElementRenderer = memo(function ImageElementRenderer({ element }: { element: CanvasElement }) {
+   651→  const props = (element.properties as { type: 'image'; data: ImageProperties }).data;
+   652→  const updateElementProperties = useDesignerStore((s) => s.updateElementProperties);
+   653→  const fileInputRef = useRef<HTMLInputElement>(null);
+   654→
+   655→  const effects: RectangleEffects = props.effects ?? { ...DEFAULT_EFFECTS };
+   656→
+   657→  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+   658→    const file = e.target.files?.[0];
+   659→    if (file) {
+   660→      const reader = new FileReader();
+   661→      reader.onload = (ev) => {
+   662→        const src = ev.target?.result as string;
+   663→        updateElementProperties(element.id, {
+   664→          type: 'image',
+   665→          data: { ...props, src },
+   666→        });
+   667→      };
+   668→      reader.readAsDataURL(file);
+   669→    }
+   670→  };
+   671→
+   672→  // Compute combined box shadow (glow + shadow)
+   673→  const combinedBoxShadow = useMemo(() => {
+   674→    const glowBoxShadow = buildGlowCSS(effects.glow).boxShadow as string | undefined;
+   675→    const shadowBoxShadow = buildShadowCSS(effects.shadow, props.borderRadius).boxShadow as string | undefined;
+   676→    if (glowBoxShadow && shadowBoxShadow) return `${glowBoxShadow}, ${shadowBoxShadow}`;
+   677→    if (glowBoxShadow) return glowBoxShadow;
+   678→    if (shadowBoxShadow) return shadowBoxShadow;
+   679→    return undefined;
+   680→  }, [effects.glow, effects.shadow, props.borderRadius]);
+   681→
+   682→  const reflectionMask = effects.reflection.enabled ? getReflectionMask(effects.reflection.preset) : undefined;
+   683→
+   684→  if (!props.src) {
+   685→    return (
+   686→      <div
+   687→        className="w-full h-full flex flex-col items-center justify-center bg-muted/30 border-2 border-dashed border-muted-foreground/30 rounded cursor-pointer hover:bg-muted/50 transition-colors"
+   688→        onClick={() => fileInputRef.current?.click()}
+   689→        style={{ borderRadius: `${props.borderRadius}px`, opacity: props.opacity, boxShadow: combinedBoxShadow }}
+   690→      >
+   691→        <Upload className="h-8 w-8 text-muted-foreground/50 mb-2" />
+   692→        <span className="text-xs text-muted-foreground/50">Click to upload</span>
+   693→        <input
+   694→          ref={fileInputRef}
+   695→          type="file"
+   696→          accept="image/*"
+   697→          className="hidden"
+   698→          onChange={handleImageUpload}
+   699→        />
+   700→      </div>
+   701→    );
+   702→  }
+   703→
+   704→  return (
+   705→    <div style={{ position: 'relative', width: '100%', height: '100%', contain: 'layout style' }}>
+   706→      {/* Main image with glow + shadow */}
+   707→      <div
+   708→        className="w-full h-full overflow-hidden"
+   709→        style={{
+   710→          borderRadius: `${props.borderRadius}px`,
+   711→          border: props.borderWidth > 0 ? `${props.borderWidth}px solid ${props.borderColor}` : 'none',
+   712→          opacity: props.opacity,
+   713→          boxShadow: combinedBoxShadow,
+   714→          position: 'relative',
+   715→          zIndex: 2,
+   716→        }}
+   717→      >
+   718→        <img
+   719→          src={props.src}
+   720→          alt="Element"
+   721→          className="w-full h-full"
+   722→          style={{
+   723→            objectFit: props.objectFit,
+   724→            filter: `brightness(${props.brightness ?? 100}%) contrast(${props.contrast ?? 100}%) saturate(${props.saturation ?? 100}%) blur(${props.blur ?? 0}px)`,
+   725→          }}
+   726→          draggable={false}
+   727→        />
+   728→      </div>
+   729→
+   730→      {/* Reflection below */}
+   731→      {effects.reflection.enabled && (
+   732→        <div
+   733→          style={{
+   734→            position: 'absolute',
+   735→            top: `calc(100% + ${effects.reflection.distance}px)`,
+   736→            left: 0,
+   737→            width: '100%',
+   738→            height: `${effects.reflection.size}%`,
+   739→            overflow: 'hidden',
+   740→            zIndex: 1,
+   741→            pointerEvents: 'none',
+   742→            maskImage: reflectionMask,
+   743→            WebkitMaskImage: reflectionMask,
+   744→            borderRadius: `${props.borderRadius}px`,
+   745→          }}
+   746→        >
+   747→          <div style={{
+   748→            width: '100%',
+   749→            height: '100%',
+   750→            overflow: 'hidden',
+   751→            borderRadius: `${props.borderRadius}px`,
+   752→            border: props.borderWidth > 0 ? `${props.borderWidth}px solid ${props.borderColor}` : 'none',
+   753→            transform: 'scaleY(-1)',
+   754→            opacity: effects.reflection.opacity,
+   755→          }}>
+   756→            <img
+   757→              src={props.src}
+   758→              alt=""
+   759→              className="w-full h-full"
+   760→              style={{
+   761→                objectFit: props.objectFit,
+   762→                filter: `brightness(${props.brightness ?? 100}%) contrast(${props.contrast ?? 100}%) saturate(${props.saturation ?? 100}%) blur(${props.blur ?? 0}px)`,
+   763→              }}
+   764→              draggable={false}
+   765→            />
+   766→          </div>
+   767→        </div>
+   768→      )}
+   769→    </div>
+   770→  );
+   771→});
+   772→
+   773→// Line Element Renderer — uses absolute endpoint coordinates
+   774→const LineElementRenderer = memo(function LineElementRenderer({ element }: { element: CanvasElement }) {
+   775→  const props = (element.properties as { type: 'line'; data: LineProperties }).data;
+   776→
+   777→  // Get endpoint coordinates (absolute canvas position)
+   778→  const startX = element.lineStartX ?? element.x;
+   779→  const startY = element.lineStartY ?? (element.y + element.height / 2);
+   780→  const endX = element.lineEndX ?? (element.x + element.width);
+   781→  const endY = element.lineEndY ?? (element.y + element.height / 2);
+   782→
+   783→  // Convert to relative coordinates within the bounding box
+   784→  const relStartX = startX - element.x;
+   785→  const relStartY = startY - element.y;
+   786→  const relEndX = endX - element.x;
+   787→  const relEndY = endY - element.y;
+   788→
+   789→  const dashArray = props.strokeStyle === 'dashed' ? '8,4' : props.strokeStyle === 'dotted' ? '2,4' : 'none';
+   790→
+   791→  return (
+   792→    <svg
+   793→      className="w-full h-full"
+   794→      style={{ opacity: props.opacity, overflow: 'visible' }}
+   795→    >
+   796→      <path
+   797→        d={`M ${relStartX} ${relStartY} L ${relEndX} ${relEndY}`}
+   798→        stroke={props.strokeColor}
+   799→        strokeWidth={props.strokeWidth}
+   800→        strokeDasharray={dashArray}
+   801→        strokeLinecap={props.lineCap}
+   802→        fill="none"
+   803→      />
+   804→    </svg>
+   805→  );
+   806→});
+   807→
+   808→// Rectangle Element Renderer
+   809→const RectangleElementRenderer = memo(function RectangleElementRenderer({ element }: { element: CanvasElement }) {
+   810→  const props = (element.properties as { type: 'rectangle'; data: RectangleProperties }).data;
+   811→  const effects: RectangleEffects = props.effects ?? { ...DEFAULT_EFFECTS };
+   812→
+   813→  // ── All hooks MUST run before any conditional return (Rules of Hooks) ──────
+   814→  // Custom-corner (deformed) rectangle: render as an SVG polygon.
+   815→  const custom = hasCustomCorners(element);
+   816→  // Skip the expensive drop-shadow filter while THIS rectangle is being
+   817→  // corner-dragged. The CSS `filter: drop-shadow(...)` on an SVG polygon
+   818→  // forces the browser to re-rasterize the filtered region on every frame;
+   819→  // temporarily disabling it during the drag eliminates the main source of
+   820→  // lag during fast mouse movement. The filter is reapplied when the drag ends.
+   821→  // The selector returns true only for the one rectangle being dragged, so
+   822→  // all other rectangles are unaffected (no re-render).
+   823→  const isBeingCornerDragged = useDesignerStore(
+   824→    (s) => s.isCornerDragging && s.cornerDragStart?.elementId === element.id,
+   825→  );
+   826→  // During an active corner drag, read the LIVE preview corners from a
+   827→  // dedicated store field (cornerDragPreview) instead of element.cornerPoints.
+   828→  // This selector only returns a new reference when THIS element's preview
+   829→  // changes — so only the dragged rectangle re-renders, not the whole canvas.
+   830→  // (Mutating elements[] on every mousemove caused the entire <Canvas> to
+   831→  // re-render, which was the main source of lag.)
+   832→  const previewCorners = useDesignerStore((s) =>
+   833→    s.isCornerDragging && s.cornerDragPreview?.elementId === element.id
+   834→      ? s.cornerDragPreview.corners
+   835→      : null,
+   836→  );
+   837→  // Effective rotation: read directly from the element's stored properties.
+   838→  // Rotation is applied by the PARENT (CanvasElementComponentInner's content
+   839→  // div, which also carries the selection ring) — NOT inside this renderer.
+   840→  // This keeps the ring + shape + reflection all rotating together as a unit,
+   841→  // and avoids a compound rotation (parent rotates, then child rotates again)
+   842→  // which would visually be the same but wastes a transform layer.
+   843→  // Effective corners: live preview during drag, otherwise the element's stored corners.
+   844→  const effectiveCorners = previewCorners ?? (custom ? getRectCornerPoints(element) : null);
+   845→  const corners = effectiveCorners;
+   846→  // During a corner drag, element.x/y/width/height are stale (we don't mutate
+   847→  // elements[] during the drag). Compute the effective bbox from the preview
+   848→  // corners so the SVG viewBox and polygon points use the correct origin/size.
+   849→  const effectiveBbox = useMemo(() => {
+   850→    if (previewCorners) return bboxOfPoints(previewCorners);
+   851→    return { x: element.x, y: element.y, width: element.width, height: element.height };
+   852→  }, [previewCorners, element.x, element.y, element.width, element.height]);
+   853→  // Rounded path "d" for the deformed rectangle. Applies the per-corner
+   854→  // borderRadius so corner radius keeps working after Alt+drag deformation
+   855→  // (the straight-edged <polygon> ignored borderRadius entirely). When all
+   856→  // radii are 0 this is equivalent to the polygon points.
+   857→  const roundedPathD = useMemo(() => {
+   858→    if (!corners) return '';
+   859→    const radii = resolveRectBorderRadius(props.borderRadius);
+   860→    return buildRoundedPolygonPath(corners, radii, { x: effectiveBbox.x, y: effectiveBbox.y });
+   861→  }, [corners, props.borderRadius, effectiveBbox.x, effectiveBbox.y]);
+   862→  const svgIdPrefix = useMemo(() => `rect-${element.id}`, [element.id]);
+   863→  const svgFill = useMemo(
+   864→    () => (custom ? buildSvgFillDescriptor(effects.gradient, svgIdPrefix, props.fill) : null),
+   865→    [custom, effects.gradient, svgIdPrefix, props.fill],
+   866→  );
+   867→  const svgFilterCSS = useMemo(
+   868→    () => (custom ? buildSvgFilterCSS(effects) : ''),
+   869→    [custom, effects],
+   870→  );
+   871→  const svgDasharray = useMemo(
+   872→    () => (custom ? svgStrokeDasharray(props.borderStyle, props.borderWidth) : undefined),
+   873→    [custom, props.borderStyle, props.borderWidth],
+   874→  );
+   875→
+   876→  // Normal axis-aligned rectangle CSS computations
+   877→  const combinedBoxShadow = useMemo(() => {
+   878→    const glowBoxShadow = buildGlowCSS(effects.glow).boxShadow as string | undefined;
+   879→    const radii = resolveRectBorderRadius(props.borderRadius);
+   880→    const shadowBoxShadow = buildShadowCSS(effects.shadow, typeof props.borderRadius === 'number' ? props.borderRadius : radii.topLeft).boxShadow as string | undefined;
+   881→    if (glowBoxShadow && shadowBoxShadow) return `${glowBoxShadow}, ${shadowBoxShadow}`;
+   882→    if (glowBoxShadow) return glowBoxShadow;
+   883→    if (shadowBoxShadow) return shadowBoxShadow;
+   884→    return undefined;
+   885→  }, [effects.glow, effects.shadow, props.borderRadius]);
+   886→
+   887→  const fillStyles = useMemo(() => {
+   888→    if (effects.gradient.type === 'transparent') {
+   889→      return {} as React.CSSProperties;
+   890→    }
+   891→    if (effects.gradient.type === 'gradient') {
+   892→      const gradientCSS = buildGradientCSS(effects.gradient, element.width, element.height);
+   893→      if (gradientCSS) {
+   894→        return { backgroundImage: gradientCSS } as React.CSSProperties;
+   895→      }
+   896→    }
+   897→    if (effects.gradient.type === 'picture' && effects.gradient.pictureSrc) {
+   898→      return {
+   899→        backgroundColor: props.fill,
+   900→        ...buildPictureFillCSS(effects.gradient),
+   901→      } as React.CSSProperties;
+   902→    }
+   903→    return { backgroundColor: props.fill } as React.CSSProperties;
+   904→  }, [effects.gradient, element.width, element.height, props.fill]);
+   905→
+   906→  const borderRadStr = useMemo(() => {
+   907→    const radii = resolveRectBorderRadius(props.borderRadius);
+   908→    return `${radii.topLeft}px ${radii.topRight}px ${radii.bottomRight}px ${radii.bottomLeft}px`;
+   909→  }, [props.borderRadius]);
+   910→
+   911→  // ── Custom-corner early return (all hooks already executed above) ─────────
+   912→  if (custom && corners && svgFill) {
+   913→    const borderStyleValue =
+   914→      props.borderStyle === 'dotted' ? 'dotted' : props.borderStyle === 'dashed' ? 'dashed' : 'solid';
+   915→    const reflectionMask = effects.reflection.enabled ? getReflectionMask(effects.reflection.preset) : undefined;
+   916→    return (
+   917→      <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+   918→        {/* Main polygon shape — drop-shadow filter follows the polygon alpha so
+   919→            shadows/glows conform to the custom quadrilateral automatically. */}
+   920→        <svg
+   921→          width="100%"
+   922→          height="100%"
+   923→          viewBox={`0 0 ${effectiveBbox.width} ${effectiveBbox.height}`}
+   924→          overflow="visible"
+   925→          style={{ position: 'relative', zIndex: 2, display: 'block', filter: (!isBeingCornerDragged && svgFilterCSS) ? svgFilterCSS : undefined, opacity: props.opacity, pointerEvents: 'none' }}
+   926→        >
+   927→          {svgFill.defs ? <g dangerouslySetInnerHTML={{ __html: svgFill.defs }} /> : null}
+   928→          <path
+   929→            d={roundedPathD}
+   930→            fill={svgFill.fill}
+   931→            stroke={props.borderColor}
+   932→            strokeWidth={props.borderWidth}
+   933→            strokeDasharray={svgDasharray}
+   934→            strokeLinejoin="round"
+   935→            strokeLinecap={borderStyleValue === 'dotted' ? 'round' : 'butt'}
+   936→          />
+   937→        </svg>
+   938→
+   939→        {/* Reflection below (mirrored polygon) */}
+   940→        {effects.reflection.enabled && (
+   941→          <div
+   942→            style={{
+   943→              position: 'absolute',
+   944→              top: `calc(100% + ${effects.reflection.distance}px)`,
+   945→              left: 0,
+   946→              width: '100%',
+   947→              height: `${effects.reflection.size}%`,
+   948→              overflow: 'hidden',
+   949→              zIndex: 1,
+   950→              pointerEvents: 'none',
+   951→              maskImage: reflectionMask,
+   952→              WebkitMaskImage: reflectionMask,
+   953→            }}
+   954→          >
+   955→            <svg
+   956→              width="100%"
+   957→              height="100%"
+   958→              viewBox={`0 0 ${effectiveBbox.width} ${effectiveBbox.height}`}
+   959→              overflow="visible"
+   960→              style={{ display: 'block', transform: 'scaleY(-1)', opacity: effects.reflection.opacity }}
+   961→            >
+   962→              {svgFill.defs ? <g dangerouslySetInnerHTML={{ __html: svgFill.defs }} /> : null}
+   963→              <path
+   964→                d={roundedPathD}
+   965→                fill={svgFill.fill}
+   966→                stroke={props.borderColor}
+   967→                strokeWidth={props.borderWidth}
+   968→                strokeDasharray={svgDasharray}
+   969→                strokeLinejoin="round"
+   970→              />
+   971→            </svg>
+   972→          </div>
+   973→        )}
+   974→      </div>
+   975→    );
+   976→  }
+   977→
+   978→  // ── Normal axis-aligned rectangle (original div-based renderer) ───────────
+   979→  const borderStyleValue = props.borderStyle === 'dotted'
+   980→    ? 'dotted'
+   981→    : props.borderStyle === 'dashed'
+   982→      ? 'dashed'
+   983→      : 'solid';
+   984→
+   985→  const shapeStyles: React.CSSProperties = {
+   986→    width: '100%',
+   987→    height: '100%',
+   988→    ...fillStyles,
+   989→    borderWidth: `${props.borderWidth}px`,
+   990→    borderColor: props.borderColor,
+   991→    borderStyle: borderStyleValue,
+   992→    borderRadius: borderRadStr,
+   993→    opacity: props.opacity,
+   994→    boxSizing: 'border-box',
+   995→  };
+   996→
+   997→  const reflectionShapeStyles: React.CSSProperties = {
+   998→    width: '100%',
+   999→    height: '100%',
+  1000→    ...fillStyles,
+  1001→    borderRadius: borderRadStr,
+  1002→    boxSizing: 'border-box',
+  1003→  };
+  1004→
+  1005→  const reflectionMask = effects.reflection.enabled ? getReflectionMask(effects.reflection.preset) : undefined;
+  1006→
+  1007→  return (
+  1008→    <div style={{ position: 'relative', width: '100%', height: '100%', contain: 'layout style' }}>
+  1009→      {/* Main shape with glow + shadow + fill + border */}
+  1010→      <div
+  1011→        style={{
+  1012→          ...shapeStyles,
+  1013→          position: 'relative',
+  1014→          zIndex: 2,
+  1015→          boxShadow: combinedBoxShadow,
+  1016→        }}
+  1017→      />
+  1018→
+  1019→      {/* Reflection below */}
+  1020→      {effects.reflection.enabled && (
+
+[showing lines 1-1020 of 2022; use offset=1021 with limit to continue reading]

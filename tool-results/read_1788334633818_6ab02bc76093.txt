@@ -1,0 +1,802 @@
+     1→     1→import { create } from 'zustand';
+     2→     2→import { v4 as uuidv4 } from 'uuid';
+     3→     3→import {
+     4→     4→  CanvasElement,
+     5→     5→  ElementType,
+     6→     6→  getDefaultProperties,
+     7→     7→  getDefaultSize,
+     8→     8→  getDefaultName,
+     9→     9→  ElementProperties,
+    10→    10→  computeLineBounds,
+    11→    11→  TableProperties,
+    12→    12→  RectangleProperties,
+    13→    13→  getRectRotation,
+    14→    14→  normalizeAngle,
+    15→    15→} from '@/lib/element-types';
+    16→    16→import { ensureColWidths, ensureRowHeights } from '@/lib/table-helpers';
+    17→    17→import {
+    18→    18→  hasCustomCorners,
+    19→    19→  getRectCornerPoints,
+    20→    20→  initRectCornerPointsFromBBox,
+    21→    21→  bboxOfPoints,
+    22→    22→  scaleCornerPoints,
+    23→    23→  resizeCornerPointsByEdges,
+    24→    24→  resizeRotatedCornerPoints,
+    25→    25→  translateCornerPoints,
+    26→    26→  CORNER_HANDLE_MAP,
+    27→    27→  horizontalAlignPartnerIndex,
+    28→    28→  verticalAlignPartnerIndex,
+    29→    29→  type Point,
+    30→    30→} from '@/lib/rectangle-corners';
+    31→    31→import { PREDEFINED_BLOCKS } from '@/lib/predefined-blocks';
+    32→    32→import { AlignmentGuide, calculateSnapForPosition, calculateSnapForResize, calculateSnapForEndpointDrag, flattenElementsForSnap, invalidateSnapCache, getElementBorderWidth } from '@/lib/snapping';
+    33→    33→import {
+    34→    34→  serializeProject,
+    35→    35→  deserializeProject,
+    36→    36→  saveProjectToFile,
+    37→    37→  saveProjectAsWithDialog,
+    38→    38→  saveProjectToHandle,
+    39→    39→  openProjectWithDialog,
+    40→    40→  loadProjectFromFile,
+    41→    41→  ProjectFile,
+    42→    42→  APP_VERSION,
+    43→    43→} from '@/lib/project-file';
+    44→    44→import { clearAutosave } from '@/lib/autosave';
+    45→    45→import { toast } from '@/hooks/use-toast';
+    46→    46→
+    47→    47→const VIEWPORT_PADDING = 40;
+    48→    48→
+    49→    49→// Module-level timers for the store's fire-and-forget UI animations (auto-pan
+    50→    50→// flag clear, alignment-guideline clear). Tracked so a new invocation cancels
+    51→    51→// any pending one from the previous invocation — prevents timer accumulation
+    52→    52→// when actions are triggered rapidly (e.g. repeated alignment clicks).
+    53→    53→let autoPanTimer: ReturnType<typeof setTimeout> | null = null;
+    54→    54→let alignmentGuidelineTimer: ReturnType<typeof setTimeout> | null = null;
+    55→    55→
+    56→    56→// Horizontal centering ratio for fit-to-page. Instead of dead-center (0.5), the
+    57→    57→// page is centered at 45% of the viewport width so it nudges slightly toward
+    58→    58→// the left tool panel — leaving a little more room on the right for the
+    59→    59→// shortcuts overlay. Vertical centering stays at 0.5.
+    60→    60→const HORIZONTAL_CENTER_RATIO = 0.45;
+    61→    61→
+    62→    62→// ── Re-ID element helper ────────────────────────────────────────────────────
+    63→    63→// When duplicating/pasting an element (especially a group), we must assign new
+    64→    64→// UUIDs to the element AND all of its children to avoid duplicate IDs in the
+    65→    65→// element tree.  Duplicate IDs cause lookups (findElementById, findParentGroup)
+    66→    66→// to return the wrong element.
+    67→    67→function reIdElement(element: CanvasElement): CanvasElement {
+    68→    68→  const result: CanvasElement = {
+    69→    69→    ...element,
+    70→    70→    id: uuidv4(),
+    71→    71→    // Deep-copy cornerPoints so duplicates/pastes have independent corners
+    72→    72→    // (a shallow copy would share the array reference with the source).
+    73→    73→    ...(element.cornerPoints
+    74→    74→      ? { cornerPoints: element.cornerPoints.map((p) => ({ x: p.x, y: p.y })) }
+    75→    75→      : {}),
+    76→    76→  };
+    77→    77→  if (result.type === 'group' && result.children) {
+    78→    78→    result.children = result.children.map((c) => reIdElement(c));
+    79→    79→  }
+    80→    80→  return result;
+    81→    81→}
+    82→    82→
+    83→    83→// ── Line–Rectangle intersection ────────────────────────────────────────────
+    84→    84→// Used by marquee selection to accurately test whether a line element
+    85→    85→// intersects the selection rectangle, rather than relying on the line's
+    86→    86→// bounding box which can be much larger than the visible line itself.
+    87→    87→
+    88→    88→/** Check if point (px, py) lies inside the axis-aligned rect [l,t,r,b]. */
+    89→    89→function pointInRect(px: number, py: number, l: number, t: number, r: number, b: number): boolean {
+    90→    90→  return px >= l && px <= r && py >= t && py <= b;
+    91→    91→}
+    92→    92→
+    93→    93→/** Return the cross product of vectors (p1→p2) × (p1→p3). */
+    94→    94→function cross(p1x: number, p1y: number, p2x: number, p2y: number, p3x: number, p3y: number): number {
+    95→    95→  return (p2x - p1x) * (p3y - p1y) - (p2y - p1y) * (p3x - p1x);
+    96→    96→}
+    97→    97→
+    98→    98→/**
+    99→    99→ * Check whether the line segment (x1,y1)→(x2,y2) intersects the
+   100→   100→ * axis-aligned rectangle [left, top, right, bottom].
+   101→   101→ *
+   102→   102→ * Algorithm:
+   103→   103→ *  1. If either endpoint is inside the rect → intersect.
+   104→   104→ *  2. Test intersection of the segment against each of the 4 rectangle
+   105→   105→ *     edges using the separating-axis (cross-product) test.
+   106→   106→ */
+   107→   107→function lineIntersectsRect(
+   108→   108→  x1: number, y1: number, x2: number, y2: number,
+   109→   109→  left: number, top: number, right: number, bottom: number,
+   110→   110→): boolean {
+   111→   111→  // Quick check: either endpoint inside the rect
+   112→   112→  if (pointInRect(x1, y1, left, top, right, bottom)) return true;
+   113→   113→  if (pointInRect(x2, y2, left, top, right, bottom)) return true;
+   114→   114→
+   115→   115→  // Check intersection with each of the 4 edges of the rectangle
+   116→   116→  // Top edge: (left,top)→(right,top)
+   117→   117→  if (segmentsIntersect(x1, y1, x2, y2, left, top, right, top)) return true;
+   118→   118→  // Bottom edge: (left,bottom)→(right,bottom)
+   119→   119→  if (segmentsIntersect(x1, y1, x2, y2, left, bottom, right, bottom)) return true;
+   120→   120→  // Left edge: (left,top)→(left,bottom)
+   121→   121→  if (segmentsIntersect(x1, y1, x2, y2, left, top, left, bottom)) return true;
+   122→   122→  // Right edge: (right,top)→(right,bottom)
+   123→   123→  if (segmentsIntersect(x1, y1, x2, y2, right, top, right, bottom)) return true;
+   124→   124→
+   125→   125→  return false;
+   126→   126→}
+   127→   127→
+   128→   128→/**
+   129→   129→ * Check whether two line segments (ax1,ay1)→(ax2,ay2) and
+   130→   130→ * (bx1,by1)→(bx2,by2) properly intersect (crossing each other,
+   131→   131→ * not just touching at endpoints).
+   132→   132→ */
+   133→   133→function segmentsIntersect(
+   134→   134→  ax1: number, ay1: number, ax2: number, ay2: number,
+   135→   135→  bx1: number, by1: number, bx2: number, by2: number,
+   136→   136→): boolean {
+   137→   137→  const d1 = cross(bx1, by1, bx2, by2, ax1, ay1);
+   138→   138→  const d2 = cross(bx1, by1, bx2, by2, ax2, ay2);
+   139→   139→  const d3 = cross(ax1, ay1, ax2, ay2, bx1, by1);
+   140→   140→  const d4 = cross(ax1, ay1, ax2, ay2, bx2, by2);
+   141→   141→
+   142→   142→  if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+   143→   143→      ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) {
+   144→   144→    return true;
+   145→   145→  }
+   146→   146→
+   147→   147→  // Collinear / endpoint-touching cases — treat as non-intersecting for
+   148→   148→  // marquee selection purposes (the endpoint-inside-rect check above
+   149→   149→  // already handles the case where a line endpoint is inside the rect).
+   150→   150→  return false;
+   151→   151→}
+   152→   152→
+   153→   153→// ── Undo / Redo ────────────────────────────────────────────────────────────
+   154→   154→const MAX_UNDO_HISTORY = 50;
+   155→   155→
+   156→   156→/** Subset of store state that represents a "document" snapshot for undo/redo. */
+   157→   157→interface HistorySnapshot {
+   158→   158→  elements: CanvasElement[];
+   159→   159→  elementCounter: Record<ElementType, number>;
+   160→   160→  canvasSettings: CanvasSettings;
+   161→   161→}
+   162→   162→
+   163→   163→function takeSnapshot(state: {
+   164→   164→  elements: CanvasElement[];
+   165→   165→  elementCounter: Record<ElementType, number>;
+   166→   166→  canvasSettings: CanvasSettings;
+   167→   167→}): HistorySnapshot {
+   168→   168→  return {
+   169→   169→    elements: structuredClone(state.elements),
+   170→   170→    elementCounter: { ...state.elementCounter },
+   171→   171→    canvasSettings: structuredClone(state.canvasSettings),
+   172→   172→  };
+   173→   173→}
+   174→   174→
+   175→   175→// Debounce state for property update undo pushes.
+   176→   176→// Prevents flooding the undo stack when sliders or text inputs fire many rapid changes.
+   177→   177→let propertyUndoTimer: ReturnType<typeof setTimeout> | null = null;
+   178→   178→let pendingPropertySnapshot: HistorySnapshot | null = null;
+   179→   179→const PROPERTY_UNDO_DEBOUNCE_MS = 400;
+   180→   180→
+   181→   181→/** Internal helper: push a snapshot onto the undo stack and clear redo. */
+   182→   182→function commitSnapshotToUndo(snapshot: HistorySnapshot) {
+   183→   183→  const current = useDesignerStore.getState();
+   184→   184→  const newUndoStack = [...current.undoStack, snapshot];
+   185→   185→  if (newUndoStack.length > MAX_UNDO_HISTORY) newUndoStack.shift();
+   186→   186→  useDesignerStore.setState({
+   187→   187→    undoStack: newUndoStack,
+   188→   188→    redoStack: [],
+   189→   189→    canUndo: true,
+   190→   190→    canRedo: false,
+   191→   191→  });
+   192→   192→}
+   193→   193→
+   194→   194→/** Push a debounced undo snapshot for property changes.
+   195→   195→ *  The first call captures the "before" state, immediately clears the redo
+   196→   196→ *  stack and updates canUndo/canRedo so the UI stays consistent. Subsequent
+   197→   197→ *  calls within the debounce window are absorbed. When the timer fires, the
+   198→   198→ *  snapshot is pushed onto the undo stack. */
+   199→   199→function debouncedPropertyPushUndo(
+   200→   200→  state: { elements: CanvasElement[]; elementCounter: Record<ElementType, number>; canvasSettings: CanvasSettings },
+   201→   201→) {
+   202→   202→  if (propertyUndoTimer === null) {
+   203→   203→    // First call in a new interaction — capture the BEFORE state immediately
+   204→   204→    pendingPropertySnapshot = takeSnapshot(state);
+   205→   205→    // Immediately clear redo stack & update flags so the UI is consistent
+   206→   206→    // from the moment the first property change happens.
+   207→   207→    useDesignerStore.setState({
+   208→   208→      redoStack: [],
+   209→   209→      canRedo: false,
+   210→   210→      canUndo: true, // the pending snapshot guarantees at least one undo step
+   211→   211→    });
+   212→   212→  }
+   213→   213→  // Reset the debounce timer
+   214→   214→  if (propertyUndoTimer) clearTimeout(propertyUndoTimer);
+   215→   215→  propertyUndoTimer = setTimeout(() => {
+   216→   216→    if (pendingPropertySnapshot !== null) {
+   217→   217→      // Push the captured "before" snapshot
+   218→   218→      commitSnapshotToUndo(pendingPropertySnapshot);
+   219→   219→      pendingPropertySnapshot = null;
+   220→   220→    }
+   221→   221→    propertyUndoTimer = null;
+   222→   222→  }, PROPERTY_UNDO_DEBOUNCE_MS);
+   223→   223→}
+   224→   224→
+   225→   225→/** Immediately flush any pending debounced undo entry (call before non-debounced actions).
+   226→   226→ *  Returns true if a pending snapshot was committed. */
+   227→   227→function flushPropertyUndo(): boolean {
+   228→   228→  if (propertyUndoTimer !== null) {
+   229→   229→    clearTimeout(propertyUndoTimer);
+   230→   230→    if (pendingPropertySnapshot !== null) {
+   231→   231→      commitSnapshotToUndo(pendingPropertySnapshot);
+   232→   232→      pendingPropertySnapshot = null;
+   233→   233→    }
+   234→   234→    propertyUndoTimer = null;
+   235→   235→    return true;
+   236→   236→  }
+   237→   237→  return false;
+   238→   238→}
+   239→   239→
+   240→   240→/** Cancel any pending debounced undo entry WITHOUT committing it.
+   241→   241→ *  Used when undo/redo is invoked — the pending "before" state is already
+   242→   242→ *  what the user wants to go back to, so we don't need to push it. */
+   243→   243→function cancelPropertyUndo() {
+   244→   244→  if (propertyUndoTimer !== null) {
+   245→   245→    clearTimeout(propertyUndoTimer);
+   246→   246→    pendingPropertySnapshot = null;
+   247→   247→    propertyUndoTimer = null;
+   248→   248→  }
+   249→   249→}
+   250→   250→
+   251→   251→/**
+   252→   252→ * Pure recursive helper: returns a NEW elements tree with the properties of the
+   253→   253→ * element identified by `id` replaced. Searches both top-level elements and the
+   254→   254→ * `children` arrays of groups (arbitrarily deep, matching `findElementById`).
+   255→   255→ *
+   256→   256→ * Unlike the `updateElementProperties` store action, this is side-effect-free —
+   257→   257→ * no undo snapshot is captured — so it is safe to call on every mousemove of a
+   258→   258→ * drag whose undo entry was already pushed at drag start (e.g. table resize).
+   259→   259→ */
+   260→   260→function setElementPropertiesInTree(
+   261→   261→  elements: CanvasElement[],
+   262→   262→  id: string,
+   263→   263→  properties: ElementProperties,
+   264→   264→): CanvasElement[] {
+   265→   265→  const updateChildren = (children: CanvasElement[]): CanvasElement[] => {
+   266→   266→    const idx = children.findIndex((c) => c.id === id);
+   267→   267→    if (idx !== -1) {
+   268→   268→      const next = [...children];
+   269→   269→      next[idx] = { ...next[idx], properties };
+   270→   270→      return next;
+   271→   271→    }
+   272→   272→    // Recurse into nested groups (groups are normally single-level here, but
+   273→   273→    // recurse anyway to stay consistent with findElementById).
+   274→   274→    let changed = false;
+   275→   275→    const maybeDeeper = children.map((c) => {
+   276→   276→      if (c.type === 'group' && c.children) {
+   277→   277→        const newGrand = updateChildren(c.children);
+   278→   278→        if (newGrand !== c.children) {
+   279→   279→          changed = true;
+   280→   280→          return { ...c, children: newGrand };
+   281→   281→        }
+   282→   282→      }
+   283→   283→      return c;
+   284→   284→    });
+   285→   285→    return changed ? maybeDeeper : children;
+   286→   286→  };
+   287→   287→
+   288→   288→  let changed = false;
+   289→   289→  const result = elements.map((el) => {
+   290→   290→    if (el.id === id) {
+   291→   291→      changed = true;
+   292→   292→      return { ...el, properties };
+   293→   293→    }
+   294→   294→    if (el.type === 'group' && el.children) {
+   295→   295→      const newChildren = updateChildren(el.children);
+   296→   296→      if (newChildren !== el.children) {
+   297→   297→        changed = true;
+   298→   298→        return { ...el, children: newChildren };
+   299→   299→      }
+   300→   300→    }
+   301→   301→    return el;
+   302→   302→  });
+   303→   303→  return changed ? result : elements;
+   304→   304→}
+   305→   305→// ────────────────────────────────────────────────────────────────────────────
+   306→   306→
+   307→   307→// Page size presets
+   308→   308→export interface PageSizePreset {
+   309→   309→  label: string;
+   310→   310→  width: number;
+   311→   311→  height: number;
+   312→   312→}
+   313→   313→
+   314→   314→export const PAGE_SIZE_PRESETS: PageSizePreset[] = [
+   315→   315→  { label: 'A4 (210 × 297 mm)', width: 794, height: 1123 },
+   316→   316→  { label: 'A5 (148 × 210 mm)', width: 559, height: 794 },
+   317→   317→  { label: 'Letter (8.5 × 11 in)', width: 816, height: 1056 },
+   318→   318→  { label: 'Legal (8.5 × 14 in)', width: 816, height: 1344 },
+   319→   319→  { label: 'Custom', width: 794, height: 1123 },
+   320→   320→];
+   321→   321→
+   322→   322→// Margin presets
+   323→   323→export type MarginPreset = 'none' | 'narrow' | 'normal' | 'wide' | 'custom';
+   324→   324→
+   325→   325→export const MARGIN_PRESETS: Record<Exclude<MarginPreset, 'custom'>, { top: number; bottom: number; left: number; right: number }> = {
+   326→   326→  none: { top: 0, bottom: 0, left: 0, right: 0 },
+   327→   327→  narrow: { top: 25, bottom: 25, left: 25, right: 25 },
+   328→   328→  normal: { top: 50, bottom: 50, left: 50, right: 50 },
+   329→   329→  wide: { top: 80, bottom: 80, left: 80, right: 80 },
+   330→   330→};
+   331→   331→
+   332→   332→export interface MarginGuidelineSettings {
+   333→   333→  show: boolean;
+   334→   334→  color: string;
+   335→   335→  thickness: number;
+   336→   336→  style: 'solid' | 'dashed';
+   337→   337→  opacity: number;
+   338→   338→}
+   339→   339→
+   340→   340→export interface CanvasSettings {
+   341→   341→  pageWidth: number;
+   342→   342→  pageHeight: number;
+   343→   343→  pageBackgroundColor: string;
+   344→   344→  marginPreset: MarginPreset;
+   345→   345→  marginTop: number;
+   346→   346→  marginBottom: number;
+   347→   347→  marginLeft: number;
+   348→   348→  marginRight: number;
+   349→   349→  marginGuideline: MarginGuidelineSettings;
+   350→   350→}
+   351→   351→
+   352→   352→// Zoom step presets (in percentage points)
+   353→   353→export const ZOOM_STEP_PRESETS = [
+   354→   354→  { label: '1%', value: 1 },
+   355→   355→  { label: '5%', value: 5 },
+   356→   356→  { label: '10%', value: 10 },
+   357→   357→  { label: '20%', value: 20 },
+   358→   358→  { label: '50%', value: 50 },
+   359→   359→];
+   360→   360→
+   361→   361→// Multi-drag start info — stores initial positions of elements for multi-element drag
+   362→   362→export interface DragStartInfo {
+   363→   363→  x: number;
+   364→   364→  y: number;
+   365→   365→  lineStartX?: number;
+   366→   366→  lineStartY?: number;
+   367→   367→  lineEndX?: number;
+   368→   368→  lineEndY?: number;
+   369→   369→  // Snapshot of rectangle corner points (absolute) at drag start, so the
+   370→   370→  // whole deformed shape translates together with the element during drag.
+   371→   371→  cornerPoints?: { x: number; y: number }[];
+   372→   372→}
+   373→   373→
+   374→   374→interface DesignerState {
+   375→   375→  elements: CanvasElement[];
+   376→   376→  selectedElementIds: string[];
+   377→   377→  /** @deprecated Backward-compatible getter — returns selectedElementIds[0] or null */
+   378→   378→  selectedElementId: string | null;
+   379→   379→  zoom: number;
+   380→   380→  panX: number;
+   381→   381→  panY: number;
+   382→   382→  isPanning: boolean;
+   383→   383→  isAutoPanning: boolean;
+   384→   384→  panStart: { x: number; y: number } | null;
+   385→   385→  isDragging: boolean;
+   386→   386→  dragStart: { x: number; y: number; elementX: number; elementY: number } | null;
+   387→   387→  dragMoved: boolean; // tracks whether mouse actually moved during drag (vs. click)
+   388→   388→  dragClickedElementId: string | null; // the element clicked to start the drag (for click-to-deselect)
+   389→   389→  isResizing: boolean;
+   390→   390→  resizeHandle: string | null;
+   391→   391→  resizeStart: { x: number; y: number; elementX: number; elementY: number; elementW: number; elementH: number; originalChildren?: CanvasElement[]; origCornerPoints?: { x: number; y: number }[] } | null;
+   392→   392→  // Multi-element resize state — stores the unified bounding box and per-element
+   393→   393→  // offset ratios so that resizing proportionally scales all selected elements.
+   394→   394→  multiResizeData: {
+   395→   395→    bbox: { x: number; y: number; width: number; height: number }; // original unified bbox
+   396→   396→    elements: Array<{
+   397→   397→      id: string;
+   398→   398→      origX: number; origY: number; origW: number; origH: number;
+   399→   399→      // Ratio of element's position relative to bbox (0 = left/top edge, 1 = right/bottom edge)
+   400→   400→      rx: number; ry: number; rw: number; rh: number;
+   401→   401→      // Line endpoint offsets (for line elements)
+   402→   402→      lineStartX?: number; lineStartY?: number; lineEndX?: number; lineEndY?: number;
+   403→   403→      // Original corner points (absolute) for deformed rectangles
+   404→   404→      origCornerPoints?: { x: number; y: number }[];
+   405→   405→      // Original children for group elements
+   406→   406→      originalChildren?: CanvasElement[];
+   407→   407→    }>;
+   408→   408→  } | null;
+   409→   409→
+   410→   410→  // Endpoint dragging (for line elements)
+   411→   411→  isEndpointDragging: boolean;
+   412→   412→  draggingEndpoint: 'start' | 'end' | null;
+   413→   413→  endpointDragStart: { x: number; y: number; startX: number; startY: number; endX: number; endY: number } | null;
+   414→   414→
+   415→   415→  // ── Rectangle corner dragging (independent corner manipulation) ────────────
+   416→   416→  // When the user Alt-drags a corner handle of a selected rectangle, that
+   417→   417→  // corner moves independently while the other three stay fixed, producing a
+   418→   418→  // custom quadrilateral. Alt+Shift constrains movement to horizontal/vertical.
+   419→   419→  isCornerDragging: boolean;
+   420→   420→  draggingCornerIndex: number | null; // 0=TL, 1=TR, 2=BR, 3=BL
+   421→   421→  cornerDragStart: {
+   422→   422→    x: number; // mouse start (client)
+   423→   423→    y: number;
+   424→   424→    elementId: string;
+   425→   425→    // Snapshot of all 4 corner points (absolute) at drag start
+   426→   426→    origCorners: { x: number; y: number }[];
+   427→   427→    // The original bbox at drag start (element.x/y/w/h) — used to recompute bbox
+   428→   428→    origBbox: { x: number; y: number; width: number; height: number };
+   429→   429→    // The rectangle's rotation in degrees at drag start. The corner points are
+   430→   430→    // stored in UNROTATED (local) space and the renderer applies rotate(θ) on
+   431→   431→    // top — so a screen-space mouse delta must be transformed by R(-θ) before
+   432→   432→    // being added to a corner point, otherwise the visual corner moves at the
+   433→   433→    // wrong angle (e.g. a horizontal drag moves the corner at 45° when θ=45°).
+   434→   434→    rotation: number;
+   435→   435→  } | null;
+   436→   436→  // Live preview of corner points during an active corner drag — updated on
+   437→   437→  // every mousemove WITHOUT mutating the elements array. This lets the dragged
+   438→   438→  // rectangle's renderer subscribe to just this field (via a selector) so only
+   439→   439→  // THAT rectangle re-renders, instead of the whole canvas re-rendering on
+   440→   440→  // every elements-array change. The final position is committed to elements[]
+   441→   441→  // in stopCornerDrag.
+   442→   442→  cornerDragPreview: { elementId: string; corners: { x: number; y: number }[] } | null;
+   443→   443→
+   444→   444→  // Table column/row resize dragging
+   445→   445→  isTableColResizing: boolean;
+   446→   446→  isTableRowResizing: boolean;
+   447→   447→  tableResizeData: {
+   448→   448→    elementId: string;
+   449→   449→    type: 'col' | 'row';
+   450→   450→    index: number;  // the index of the col/row BEFORE the border
+   451→   451→    initialMousePos: number;  // clientX for col, clientY for row
+   452→   452→    initialSizes: number[];  // initial colWidths or rowHeights
+   453→   453→    initialTotalSize: number;  // element.width for col, element.height for row
+   454→   454→  } | null;
+   455→   455→
+   456→   456→  // Shift-held state for angle snapping during endpoint drag
+   457→   457→  shiftHeld: boolean;
+   458→   458→
+   459→   459→  // Ctrl-held state for vertical corner alignment during Alt+Ctrl corner drag.
+   460→   460→  // Mirrors shiftHeld (which drives Alt+Shift horizontal alignment). Set by a
+   461→   461→  // window-level keydown/keyup listener in canvas.tsx.
+   462→   462→  ctrlHeld: boolean;
+   463→   463→
+   464→   464→  // ── Alt-held state for table cell multi-selection ──────────────────────────
+   465→   465→  // When Alt is held and the selected element is a table, the user can
+   466→   466→  // right-click to select individual cells or click-drag to select a
+   467→   467→  // rectangular range of cells on the canvas.
+   468→   468→  altHeld: boolean;
+   469→   469→  selectedTableCells: { row: number; col: number }[];
+   470→   470→  hoveredTableCell: { row: number; col: number; tableId: string } | null;
+   471→   471→  isTableCellSelecting: boolean; // true while Alt+dragging on a table
+   472→   472→  tableCellSelectStart: { row: number; col: number } | null; // drag start cell
+   473→   473→  tableCellSelectEnd: { row: number; col: number } | null; // current drag end cell
+   474→   474→  tableCellSelectTableId: string | null; // which table is being selected on
+   475→   475→  tableCellSelectBaseline: { row: number; col: number }[]; // snapshot of selection before drag started (for toggle-in-drag)
+   476→   476→
+   477→   477→  // Angle snap visual feedback (null when not snapping)
+   478→   478→  angleSnapInfo: { angle: number; label: string } | null;
+   479→   479→
+   480→   480→  // Multi-element selection state
+   481→   481→  isSelecting: boolean;
+   482→   482→  selectionRect: { x: number; y: number; width: number; height: number } | null;
+   483→   483→  selectionAdditive: boolean; // true when Shift was held when rubber-band selection started
+   484→   484→  multiDragStart: Record<string, DragStartInfo>;
+   485→   485→
+   486→   486→  elementCounter: Record<ElementType, number>;
+   487→   487→  clipboardElement: CanvasElement | null; // single-element clipboard (deprecated — kept for backward compat)
+   488→   488→  clipboardElements: CanvasElement[]; // multi-element clipboard
+   489→   489→
+   490→   490→  // ── Group Edit Mode ──────────────────────────────────────────────────────
+   491→   491→  // When a group is being edited (double-clicked into), this stores the
+   492→   492→  // group element's ID. Null means we are at root level.
+   493→   493→  editingGroupId: string | null;
+   494→   494→
+   495→   495→  // ── Text Editing ──────────────────────────────────────────────────────
+   496→   496→  // When a text element is being edited (double-clicked), this stores the
+   497→   497→  // element's ID. Null means no text element is being edited.
+   498→   498→  // The TipTap editor renders inline on the canvas when editing.
+   499→   499→  // Formatting controls live in the properties panel / floating card.
+   500→   500→  editingTextElementId: string | null;
+   501→   501→  setEditingTextElement: (id: string | null) => void;
+   502→   502→  // Reference to the active TipTap Editor instance on the canvas.
+   503→   503→  // This allows the panel/floating-card formatting toolbar to control
+   504→   504→  // the canvas editor (apply bold, italic, etc. to selected text).
+   505→   505→  // Use `any` to avoid importing TipTap types in the store.
+   506→   506→  activeTextEditor: any; // TipTap Editor instance or null
+   507→   507→  setActiveTextEditor: (editor: any) => void;
+   508→   508→
+   509→   509→  // Group child drag state
+   510→   510→  isGroupChildDragging: boolean;
+   511→   511→  groupChildDragStart: { x: number; y: number; originalGroupX: number; originalGroupY: number } | null;
+   512→   512→  groupChildMultiDragStart: Record<string, DragStartInfo>;
+   513→   513→
+   514→   514→  // Group child resize state
+   515→   515→  isGroupChildResizing: boolean;
+   516→   516→  groupChildResizeStart: { x: number; y: number; childX: number; childY: number; childW: number; childH: number; groupX: number; groupY: number; originalChildren: CanvasElement[] } | null;
+   517→   517→
+   518→   518→  // ── Spotlight Property Picker (Shift+S) ────────────────────────────────────
+   519→   519→  spotlightOpen: boolean;
+   520→   520→  floatingCards: FloatingCardData[];
+   521→   521→  propertyDisplayMode: PropertyDisplayMode;
+   522→   522→  spotlightHintShown: number; // counts how many times the Shift+S hint has been shown
+   523→   523→
+   524→   524→  // ── Panel collapse state (responsive — desktop collapsible panels) ──────
+   525→   525→  // When collapsed, a side panel animates to width 0 (still mounted) so the
+   526→   526→  // canvas reclaims the space. Toggled from header buttons.
+   527→   527→  toolPaletteCollapsed: boolean;
+   528→   528→  propsPanelCollapsed: boolean;
+   529→   529→
+   530→   530→  // ── Predefined Blocks Picker (Shift+Q) ────────────────────────────────────
+   531→   531→  predefinedBlocksOpen: boolean;
+   532→   532→
+   533→   533→  // ── Context Menu ────────────────────────────────────────────────────────
+   534→   534→  contextMenu: { x: number; y: number; canvasX: number; canvasY: number } | null;
+   535→   535→
+   536→   536→  canvasSettings: CanvasSettings;
+   537→   537→  settingsOpen: boolean;
+   538→   538→  newProjectOpen: boolean;
+   539→   539→  registerIconOpen: boolean;
+   540→   540→  exportPdfOpen: boolean;
+   541→   541→  // Whether the welcome (create/open project) modal is currently showing.
+   542→   542→  // Feature shortcuts (Shift+S spotlight, Shift+Q predefined blocks) are
+   543→   543→  // disabled while this is true — the user has no project yet, so opening
+   544→   544→  // those overlays over the modal would be confusing.
+   545→   545→  welcomeModalOpen: boolean;
+   546→   546→
+   547→   547→  // PDF preview modal
+   548→   548→  largePreviewOpen: boolean;
+   549→   549→
+   550→   550→  // Zoom step (in percent: 1, 5, 10, 20, 50, or custom)
+   551→   551→  zoomStep: number;
+   552→   552→
+   553→   553→  // Snapping settings
+   554→   554→  snapEnabled: boolean;
+   555→   555→  snapToGrid: boolean;
+   556→   556→  snapToElements: boolean;
+   557→   557→  snapUnit: number; // grid unit in px
+   558→   558→
+   559→   559→  // Alignment guidelines (rendered on canvas during drag/arrow move)
+   560→   560→  alignmentGuidelines: AlignmentGuide[];
+   561→   561→
+   562→   562→  // Undo / Redo
+   563→   563→  undoStack: HistorySnapshot[];
+   564→   564→  redoStack: HistorySnapshot[];
+   565→   565→  canUndo: boolean;
+   566→   566→  canRedo: boolean;
+   567→   567→
+   568→   568→  // Last added element ID (for drop animation)
+   569→   569→  lastAddedElementId: string | null;
+   570→   570→  clearLastAddedElementId: () => void;
+   571→   571→
+   572→   572→  // Actions
+   573→   573→  addElement: (type: ElementType, x: number, y: number) => void;
+   574→   574→  removeElement: (id: string) => void;
+   575→   575→  updateElement: (id: string, updates: Partial<CanvasElement>) => void;
+   576→   576→  updateElementProperties: (id: string, properties: ElementProperties) => void;
+   577→   577→  selectElement: (id: string | null) => void;
+   578→   578→  addToSelection: (id: string) => void;
+   579→   579→  toggleInSelection: (id: string) => void;
+   580→   580→  clearSelection: () => void;
+   581→   581→  selectAll: () => void;
+   582→   582→  startSelection: (x: number, y: number, additive?: boolean) => void;
+   583→   583→  updateSelection: (x: number, y: number) => void;
+   584→   584→  finishSelection: () => void;
+   585→   585→  getSelectedElement: () => CanvasElement | null;
+   586→   586→  duplicateElement: (id: string) => void;
+   587→   587→  moveElement: (id: string, x: number, y: number) => void;
+   588→   588→  resizeElement: (id: string, width: number, height: number) => void;
+   589→   589→  setZoom: (zoom: number) => void;
+   590→   590→  setPan: (x: number, y: number) => void;
+   591→   591→  panToElement: (elementId: string) => void;
+   592→   592→  startPanning: (x: number, y: number) => void;
+   593→   593→  stopPanning: () => void;
+   594→   594→  updatePan: (x: number, y: number) => void;
+   595→   595→  startDragging: (id: string, x: number, y: number) => void;
+   596→   596→  stopDragging: () => void;
+   597→   597→  updateDrag: (x: number, y: number) => void;
+   598→   598→  startResizing: (id: string, handle: string, x: number, y: number) => void;
+   599→   599→  stopResizing: () => void;
+   600→   600→  updateResize: (x: number, y: number) => void;
+   601→   601→  startEndpointDrag: (id: string, endpoint: 'start' | 'end', x: number, y: number) => void;
+   602→   602→  updateEndpointDrag: (x: number, y: number, shiftHeld: boolean) => void;
+   603→   603→  stopEndpointDrag: () => void;
+   604→   604→  setShiftHeld: (held: boolean) => void;
+   605→   605→  setCtrlHeld: (held: boolean) => void;
+   606→   606→
+   607→   607→  // Rectangle corner manipulation (independent corner deformation)
+   608→   608→  startCornerDrag: (id: string, cornerIndex: number, x: number, y: number) => void;
+   609→   609→  updateCornerDrag: (x: number, y: number, shiftHeld: boolean, ctrlHeld?: boolean) => void;
+   610→   610→  stopCornerDrag: () => void;
+   611→   611→  /** Reset a deformed rectangle back to its axis-aligned bounding box. */
+   612→   612→  resetRectCorners: (id: string) => void;
+   613→   613→
+   614→   614→  // ── Rectangle rotation ─────────────────────────────────────────────────
+   615→   615→  // Only rectangles support rotation (per spec). Rotation is set directly
+   616→   616→  // from the properties panel / floating card (slider + numeric input) via
+   617→   617→  // setRectRotation — there is no canvas rotation handle. The angle is
+   618→   618→  // normalized to [-180, 180] on write so the displayed value stays bounded.
+   619→   619→  /** Set a rectangle's rotation directly (used by the properties panel). */
+   620→   620→  setRectRotation: (id: string, angle: number) => void;
+   621→   621→
+   622→   622→  // Alt-held & table cell selection actions
+   623→   623→  setAltHeld: (held: boolean) => void;
+   624→   624→  setHoveredTableCell: (cell: { row: number; col: number; tableId: string } | null) => void;
+   625→   625→  selectTableCell: (tableId: string, row: number, col: number, toggle?: boolean) => void;
+   626→   626→  selectTableCellsRange: (tableId: string, startRow: number, startCol: number, endRow: number, endCol: number) => void;
+   627→   627→  startTableCellSelecting: (tableId: string, row: number, col: number, baseline?: { row: number; col: number }[]) => void;
+   628→   628→  updateTableCellSelecting: (row: number, col: number) => void;
+   629→   629→  finishTableCellSelecting: () => void;
+   630→   630→  clearTableCellSelection: () => void;
+   631→   631→
+   632→   632→  // Table column/row resize actions
+   633→   633→  startTableColResize: (elementId: string, colIndex: number, clientX: number) => void;
+   634→   634→  startTableRowResize: (elementId: string, rowIndex: number, clientY: number) => void;
+   635→   635→  updateTableResize: (clientX: number, clientY: number) => void;
+   636→   636→  stopTableResize: () => void;
+   637→   637→  bringToFront: (id: string) => void;
+   638→   638→  sendToBack: (id: string) => void;
+   639→   639→  copyElement: () => void;
+   640→   640→  pasteElement: () => void;
+   641→   641→  cutElement: () => void;
+   642→   642→  pasteElementInPlace: () => void;
+   643→   643→  zoomIn: () => void;
+   644→   644→  zoomOut: () => void;
+   645→   645→  resetZoom: () => void;
+   646→   646→  zoomAtPoint: (newZoom: number, pivotX: number, pivotY: number) => void;
+   647→   647→  toggleLock: (id: string) => void;
+   648→   648→  toggleVisibility: (id: string) => void;
+   649→   649→  updateCanvasSettings: (settings: Partial<CanvasSettings>) => void;
+   650→   650→  setSettingsOpen: (open: boolean) => void;
+   651→   651→  setZoomStep: (step: number) => void;
+   652→   652→  setSnapEnabled: (enabled: boolean) => void;
+   653→   653→  setSnapToGrid: (enabled: boolean) => void;
+   654→   654→  setSnapToElements: (enabled: boolean) => void;
+   655→   655→  setSnapUnit: (unit: number) => void;
+   656→   656→  setAlignmentGuidelines: (guides: AlignmentGuide[]) => void;
+   657→   657→  clearAlignmentGuidelines: () => void;
+   658→   658→  moveElementByKeys: (dx: number, dy: number, skipSnap?: boolean) => void;
+   659→   659→  alignElementHorizontalCenter: (id: string) => void;
+   660→   660→  alignElementVerticalCenter: (id: string) => void;
+   661→   661→  /**
+   662→   662→   * Align a GROUP of elements to the page center as a block — preserves the
+   663→   663→   * relative positions of all selected elements (shifts them all by the same
+   664→   664→   * delta) rather than collapsing each element's center to the page center.
+   665→   665→   * Mirrors how a grouped element aligns.
+   666→   666→   */
+   667→   667→  alignElementsHorizontalCenter: (ids: string[]) => void;
+   668→   668→  alignElementsVerticalCenter: (ids: string[]) => void;
+   669→   669→  /** Set the top-level opacity on multiple elements at once (multi-select & groups). */
+   670→   670→  setElementsOpacity: (ids: string[], opacity: number) => void;
+   671→   671→  reorderElement: (fromIndex: number, toIndex: number) => void;
+   672→   672→  undo: () => void;
+   673→   673→  redo: () => void;
+   674→   674→  /** Push current state onto undo stack (call before mutating document state). */
+   675→   675→  pushUndo: () => void;
+   676→   676→  /** Flush any pending debounced property undo entry immediately. */
+   677→   677→  flushPropertyUndo: () => void;
+   678→   678→
+   679→   679→  // Multi-select alignment actions
+   680→   680→  alignElementsLeft: () => void;
+   681→   681→  alignElementsRight: () => void;
+   682→   682→  alignElementsTop: () => void;
+   683→   683→  alignElementsBottom: () => void;
+   684→   684→  alignElementsCenterH: () => void;
+   685→   685→  alignElementsCenterV: () => void;
+   686→   686→  distributeElementsH: () => void;
+   687→   687→  distributeElementsV: () => void;
+   688→   688→
+   689→   689→  // View
+   690→   690→  showMiniPreview: boolean;
+   691→   691→  setShowMiniPreview: (show: boolean) => void;
+   692→   692→  // On-canvas shortcuts overlay (the muted instruction text on the right side
+   693→   693→  // of the workspace). Toggled from the footer.
+   694→   694→  shortcutsOverlayVisible: boolean;
+   695→   695→  setShortcutsOverlayVisible: (visible: boolean) => void;
+   696→   696→  // Per-element "ⓘ" info icons shown above dropped tools on the canvas.
+   697→   697→  // Toggled from the footer. Clicking an icon opens ToolInfoDialog.
+   698→   698→  toolInfoIconsVisible: boolean;
+   699→   699→  setToolInfoIconsVisible: (visible: boolean) => void;
+   700→   700→  // Which tool type's info dialog is currently open (null = closed).
+   701→   701→  toolInfoElementType: ElementType | null;
+   702→   702→  setToolInfoElementType: (type: ElementType | null) => void;
+   703→   703→  fitToPage: (viewportWidth: number, viewportHeight: number) => void;
+   704→   704→
+   705→   705→  // Project save/load
+   706→   706→  projectName: string;
+   707→   707→  lastSaveFilename: string | null;
+   708→   708→  fileHandle: FileSystemFileHandle | null;
+   709→   709→  isDirty: boolean;
+   710→   710→  saveProject: () => Promise<void>;
+   711→   711→  saveProjectAs: () => Promise<void>;
+   712→   712→  loadProject: () => Promise<boolean>;
+   713→   713→  newProject: (options?: { projectName?: string; canvasSettings?: CanvasSettings }) => void;
+   714→   714→  setNewProjectOpen: (open: boolean) => void;
+   715→   715→  setRegisterIconOpen: (open: boolean) => void;
+   716→   716→  setProjectName: (name: string) => void;
+   717→   717→  loadProjectFromFileData: (file: ProjectFile) => boolean;
+   718→   718→  setExportPdfOpen: (open: boolean) => void;
+   719→   719→  setLargePreviewOpen: (open: boolean) => void;
+   720→   720→  setWelcomeModalOpen: (open: boolean) => void;
+   721→   721→
+   722→   722→  // ── Group Actions ─────────────────────────────────────────────────────────
+   723→   723→  /** Group all currently selected elements into a new group container. */
+   724→   724→  groupSelected: () => void;
+   725→   725→  /** Ungroup the currently selected group, moving children back to root. */
+   726→   726→  ungroupSelected: () => void;
+   727→   727→  /** Enter group edit mode for the given group — allows selecting children. */
+   728→   728→  enterGroup: (groupId: string) => void;
+   729→   729→  /** Exit group edit mode — returns to root-level selection. */
+   730→   730→  exitGroup: () => void;
+   731→   731→  /** Show the context menu at the given screen/canvas position. */
+   732→   732→  setContextMenu: (menu: { x: number; y: number; canvasX: number; canvasY: number } | null) => void;
+   733→   733→  /** Clear the context menu. */
+   734→   734→  clearContextMenu: () => void;
+   735→   735→  /** Find the group element that contains a child with the given ID. */
+   736→   736→  findParentGroup: (childId: string) => CanvasElement | null;
+   737→   737→  /** Find any element by ID, including children nested inside groups. */
+   738→   738→  findElementById: (elementId: string) => CanvasElement | null;
+   739→   739→  /** Check whether a given element ID belongs to a group (not at root level). */
+   740→   740→  isGroupChild: (elementId: string) => boolean;
+   741→   741→  /** Check whether the current selection can be grouped. */
+   742→   742→  canGroup: () => boolean;
+   743→   743→  /** Check whether the current selection can be ungrouped. */
+   744→   744→  canUngroup: () => boolean;
+   745→   745→
+   746→   746→  // ── Group Child Drag Actions ─────────────────────────────────────────────
+   747→   747→  /** Start dragging a child element within a group in edit mode. */
+   748→   748→  startGroupChildDrag: (childId: string, x: number, y: number) => void;
+   749→   749→  /** Update the position of a child element being dragged within a group. */
+   750→   750→  updateGroupChildDrag: (x: number, y: number) => void;
+   751→   751→  /** Stop dragging a child element within a group. */
+   752→   752→  stopGroupChildDrag: () => void;
+   753→   753→  /** Recalculate group bounds based on current children positions. */
+   754→   754→  recalculateGroupBounds: (groupId: string) => void;
+   755→   755→
+   756→   756→  // ── Group Child Resize Actions ─────────────────────────────────────────────
+   757→   757→  /** Start resizing a child element within a group in edit mode. */
+   758→   758→  startGroupChildResize: (childId: string, handle: string, x: number, y: number) => void;
+   759→   759→  /** Update the size of a child element being resized within a group. */
+   760→   760→  updateGroupChildResize: (x: number, y: number) => void;
+   761→   761→  /** Stop resizing a child element within a group. */
+   762→   762→  stopGroupChildResize: () => void;
+   763→   763→
+   764→   764→  // ── Spotlight / Floating Cards Actions ────────────────────────────────────
+   765→   765→  openSpotlight: () => void;
+   766→   766→  closeSpotlight: () => void;
+   767→   767→  addFloatingCard: (card: FloatingCardData) => void;
+   768→   768→  removeFloatingCard: (cardId: string) => void;
+   769→   769→
+   770→   770→  // Predefined Blocks
+   771→   771→  openPredefinedBlocks: () => void;
+   772→   772→  closePredefinedBlocks: () => void;
+   773→   773→  addPredefinedBlock: (blockId: string) => void;
+   774→   774→  clearFloatingCards: () => void;
+   775→   775→  setPropertyDisplayMode: (mode: PropertyDisplayMode) => void;
+   776→   776→  setToolPaletteCollapsed: (collapsed: boolean) => void;
+   777→   777→  setPropsPanelCollapsed: (collapsed: boolean) => void;
+   778→   778→  setSpotlightHintShown: (shown: number) => void;
+   779→   779→  clearCardInitialPosition: (cardId: string) => void;
+   780→   780→}
+   781→   781→
+   782→   782→// ── Spotlight / Floating Cards Types ────────────────────────────────────────
+   783→   783→export type PropertyDisplayMode = 'panel' | 'floating' | 'both';
+   784→   784→
+   785→   785→export interface FloatingCardData {
+   786→   786→  id: string;
+   787→   787→  sectionLabel: string; // e.g. 'Position', 'Typography', 'Fill', etc.
+   788→   788→  x: number;
+   789→   789→  y: number;
+   790→   790→  minimized: boolean;
+   791→   791→  zIndex: number;
+   792→   792→  initialX?: number; // Starting X for fly-in animation from spotlight
+   793→   793→  initialY?: number; // Starting Y for fly-in animation from spotlight
+   794→   794→}
+   795→   795→
+   796→   796→export const DEFAULT_CANVAS_SETTINGS: CanvasSettings = {
+   797→   797→  pageWidth: 794,
+   798→   798→  pageHeight: 1123,
+   799→   799→  pageBackgroundColor: '#ffffff',
+   800→   800→  marginPreset: 'normal',
+   801→
+   802→[showing lines 1-800 of 5296; use offset=801 with limit to continue reading]

@@ -1,0 +1,785 @@
+    55→    55→    55→  EyeOff,
+    56→    56→    56→  ZoomIn,
+    57→    57→    57→  ZoomOut,
+    58→    58→    58→  Maximize,
+    59→    59→    59→  Grid3x3,
+    60→    60→    60→  Magnet,
+    61→    61→    61→  Ruler,
+    62→    62→    62→  AlignStartVertical,
+    63→    63→    63→  AlignEndVertical,
+    64→    64→    64→  AlignCenterVertical,
+    65→    65→    65→  AlignStartHorizontal,
+    66→    66→    66→  AlignEndHorizontal,
+    67→    67→    67→  AlignCenterHorizontal,
+    68→    68→    68→  AlignHorizontalSpaceAround,
+    69→    69→    69→  AlignVerticalSpaceAround,
+    70→    70→    70→  ChevronLeft,
+    71→    71→    71→  ChevronRight,
+    72→    72→    72→} from 'lucide-react';
+    73→    73→    73→import { ShortcutsBar } from '@/components/designer/shortcuts-bar';
+    74→    74→    74→import { Button } from '@/components/ui/button';
+    75→    75→    75→import {
+    76→    76→    76→  DropdownMenu,
+    77→    77→    77→  DropdownMenuContent,
+    78→    78→    78→  DropdownMenuItem,
+    79→    79→    79→  DropdownMenuSeparator,
+    80→    80→    80→  DropdownMenuTrigger,
+    81→    81→    81→  DropdownMenuCheckboxItem,
+    82→    82→    82→  DropdownMenuShortcut,
+    83→    83→    83→} from '@/components/ui/dropdown-menu';
+    84→    84→    84→import { useDesignerStore } from '@/store/designer-store';
+    85→    85→    85→import { useState, useEffect } from 'react';
+    86→    86→    86→import { useIsMobile } from '@/hooks/use-mobile';
+    87→    87→    87→import { MobileNotSupported } from '@/components/designer/mobile-not-supported';
+    88→    88→    88→import {
+    89→    89→    89→  buildProjectSnapshot,
+    90→    90→    90→  saveAutosave,
+    91→    91→    91→  loadAutosave,
+    92→    92→    92→  clearAutosave,
+    93→    93→    93→  formatAutosaveAge,
+    94→    94→    94→  type AutosaveSnapshot,
+    95→    95→    95→} from '@/lib/autosave';
+    96→    96→    96→import {
+    97→    97→    97→  Dialog,
+    98→    98→    98→  DialogContent,
+    99→    99→    99→  DialogDescription,
+   100→   100→   100→  DialogFooter,
+   101→   101→   101→  DialogHeader,
+   102→   102→   102→  DialogTitle,
+   103→   103→   103→} from '@/components/ui/dialog';
+   104→   104→   104→import { RotateCcw, FileX2, History } from 'lucide-react';
+   105→   105→   105→
+   106→   106→   106→export default function DesignerPage() {
+   107→   107→   107→  // Loading screen state — tracks whether the app has finished initial render
+   108→   108→   108→  const [appReady, setAppReady] = useState(false);
+   109→   109→   109→  // Welcome modal open state — controlled from parent so it opens immediately
+   110→   110→   110→  // when the loading screen finishes, without an extra effect in the modal.
+   111→   111→   111→  const [welcomeOpen, setWelcomeOpen] = useState(false);
+   112→   112→   112→  // Crash-recovery: if a previous session left an auto-saved draft, prompt the
+   113→   113→   113→  // user to restore it instead of (or before) the welcome modal. Null = no
+   114→   114→   114→  // draft / not prompting.
+   115→   115→   115→  const [recoverySnapshot, setRecoverySnapshot] = useState<AutosaveSnapshot | null>(null);
+   116→   116→   116→
+   117→   117→   117→  useEffect(() => {
+   118→   118→   118→    // Keep the loading screen visible for at least 3 seconds so the MJC
+   119→   119→   119→    // spinner animation plays fully before the app appears.
+   120→   120→   120→    let cancelled = false;
+   121→   121→   121→    const timer = setTimeout(() => {
+   122→   122→   122→      if (!cancelled) {
+   123→   123→   123→        setAppReady(true);
+   124→   124→   124→        // Check for an auto-saved draft from a previous (possibly crashed)
+   125→   125→   125→        // session. If one exists with content, offer to restore it instead of
+   126→   126→   126→        // showing the welcome modal. If there's no draft (or it's empty), fall
+   127→   127→   127→        // through to the normal welcome flow.
+   128→   128→   128→        const draft = loadAutosave();
+   129→   129→   129→        if (draft && draft.project.elements && draft.project.elements.length > 0) {
+   130→   130→   130→          setRecoverySnapshot(draft);
+   131→   131→   131→        } else {
+   132→   132→   132→          setWelcomeOpen(true);
+   133→   133→   133→        }
+   134→   134→   134→      }
+   135→   135→   135→    }, 3000);
+   136→   136→   136→    return () => {
+   137→   137→   137→      cancelled = true;
+   138→   138→   138→      clearTimeout(timer);
+   139→   139→   139→    };
+   140→   140→   140→  }, []);
+   141→   141→   141→
+   142→   142→   142→  const setSettingsOpen = useDesignerStore((s) => s.setSettingsOpen);
+   143→   143→   143→  const saveProject = useDesignerStore((s) => s.saveProject);
+   144→   144→   144→  const saveProjectAs = useDesignerStore((s) => s.saveProjectAs);
+   145→   145→   145→  const setNewProjectOpen = useDesignerStore((s) => s.setNewProjectOpen);
+   146→   146→   146→  const setWelcomeModalOpen = useDesignerStore((s) => s.setWelcomeModalOpen);
+   147→   147→   147→  const propertyDisplayMode = useDesignerStore((s) => s.propertyDisplayMode);
+   148→   148→   148→  // Panel collapse state — desktop collapsible side panels
+   149→   149→   149→  const toolPaletteCollapsed = useDesignerStore((s) => s.toolPaletteCollapsed);
+   150→   150→   150→  const setToolPaletteCollapsed = useDesignerStore((s) => s.setToolPaletteCollapsed);
+   151→   151→   151→  const propsPanelCollapsed = useDesignerStore((s) => s.propsPanelCollapsed);
+   152→   152→   152→  const setPropsPanelCollapsed = useDesignerStore((s) => s.setPropsPanelCollapsed);
+   153→   153→   153→  // Whether the docked properties panel is currently visible (panel/both mode
+   154→   154→   154→  // and not collapsed). In 'floating' mode the docked panel is hidden.
+   155→   155→   155→  const rightPanelVisible = !propsPanelCollapsed && propertyDisplayMode !== 'floating';
+   156→   156→   156→  // Responsive — below 768px (phones/small tablets) show a desktop-required screen
+   157→   157→   157→  const isMobile = useIsMobile();
+   158→   158→   158→  const projectName = useDesignerStore((s) => s.projectName);
+   159→   159→   159→  const isDirty = useDesignerStore((s) => s.isDirty);
+   160→   160→   160→  const loadProject = useDesignerStore((s) => s.loadProject);
+   161→   161→   161→  const setExportPdfOpen = useDesignerStore((s) => s.setExportPdfOpen);
+   162→   162→   162→  const setLargePreviewOpen = useDesignerStore((s) => s.setLargePreviewOpen);
+   163→   163→   163→
+   164→   164→   164→  // Edit menu actions
+   165→   165→   165→  const undo = useDesignerStore((s) => s.undo);
+   166→   166→   166→  const redo = useDesignerStore((s) => s.redo);
+   167→   167→   167→  const canUndo = useDesignerStore((s) => s.canUndo);
+   168→   168→   168→  const canRedo = useDesignerStore((s) => s.canRedo);
+   169→   169→   169→  const cutElement = useDesignerStore((s) => s.cutElement);
+   170→   170→   170→  const copyElement = useDesignerStore((s) => s.copyElement);
+   171→   171→   171→  const pasteElement = useDesignerStore((s) => s.pasteElement);
+   172→   172→   172→  const pasteElementInPlace = useDesignerStore((s) => s.pasteElementInPlace);
+   173→   173→   173→  const selectAll = useDesignerStore((s) => s.selectAll);
+   174→   174→   174→  const selectedElementIds = useDesignerStore((s) => s.selectedElementIds);
+   175→   175→   175→  const removeElement = useDesignerStore((s) => s.removeElement);
+   176→   176→   176→  const duplicateElement = useDesignerStore((s) => s.duplicateElement);
+   177→   177→   177→  const bringToFront = useDesignerStore((s) => s.bringToFront);
+   178→   178→   178→  const sendToBack = useDesignerStore((s) => s.sendToBack);
+   179→   179→   179→  const toggleLock = useDesignerStore((s) => s.toggleLock);
+   180→   180→   180→  const toggleVisibility = useDesignerStore((s) => s.toggleVisibility);
+   181→   181→   181→  const elements = useDesignerStore((s) => s.elements);
+   182→   182→   182→  const clipboardElement = useDesignerStore((s) => s.clipboardElement);
+   183→   183→   183→
+   184→   184→   184→  // View menu actions
+   185→   185→   185→  const zoomIn = useDesignerStore((s) => s.zoomIn);
+   186→   186→   186→  const zoomOut = useDesignerStore((s) => s.zoomOut);
+   187→   187→   187→  const resetZoom = useDesignerStore((s) => s.resetZoom);
+   188→   188→   188→  const fitToPage = useDesignerStore((s) => s.fitToPage);
+   189→   189→   189→  const snapToGrid = useDesignerStore((s) => s.snapToGrid);
+   190→   190→   190→  const setSnapToGrid = useDesignerStore((s) => s.setSnapToGrid);
+   191→   191→   191→  const snapEnabled = useDesignerStore((s) => s.snapEnabled);
+   192→   192→   192→  const setSnapEnabled = useDesignerStore((s) => s.setSnapEnabled);
+   193→   193→   193→  const marginShow = useDesignerStore((s) => s.canvasSettings.marginGuideline.show);
+   194→   194→   194→  const updateCanvasSettings = useDesignerStore((s) => s.updateCanvasSettings);
+   195→   195→   195→  const showMiniPreview = useDesignerStore((s) => s.showMiniPreview);
+   196→   196→   196→  const setShowMiniPreview = useDesignerStore((s) => s.setShowMiniPreview);
+   197→   197→   197→
+   198→   198→   198→  // Derive state for menu items
+   199→   199→   199→  const hasSelection = selectedElementIds.length > 0;
+   200→   200→   200→  const firstSelectedId = selectedElementIds[0];
+   201→   201→   201→  const firstSelectedElement = firstSelectedId
+   202→   202→   202→    ? elements.find((el) => el.id === firstSelectedId)
+   203→   203→   203→    : null;
+   204→   204→   204→  const canPaste = clipboardElement !== null;
+   205→   205→   205→
+   206→   206→   206→  const handleDeleteSelected = () => {
+   207→   207→   207→    for (const id of [...selectedElementIds]) {
+   208→   208→   208→      removeElement(id);
+   209→   209→   209→    }
+   210→   210→   210→  };
+   211→   211→   211→
+   212→   212→   212→  const handleDuplicateSelected = () => {
+   213→   213→   213→    if (firstSelectedId) {
+   214→   214→   214→      duplicateElement(firstSelectedId);
+   215→   215→   215→    }
+   216→   216→   216→  };
+   217→   217→   217→
+   218→   218→   218→  const handleBringToFront = () => {
+   219→   219→   219→    if (firstSelectedId) {
+   220→   220→   220→      bringToFront(firstSelectedId);
+   221→   221→   221→    }
+   222→   222→   222→  };
+   223→   223→   223→
+   224→   224→   224→  const handleSendToBack = () => {
+   225→   225→   225→    if (firstSelectedId) {
+   226→   226→   226→      sendToBack(firstSelectedId);
+   227→   227→   227→    }
+   228→   228→   228→  };
+   229→   229→   229→
+   230→   230→   230→  // Multi-select alignment actions
+   231→   231→   231→  const alignElementsLeft = useDesignerStore((s) => s.alignElementsLeft);
+   232→   232→   232→  const alignElementsRight = useDesignerStore((s) => s.alignElementsRight);
+   233→   233→   233→  const alignElementsTop = useDesignerStore((s) => s.alignElementsTop);
+   234→   234→   234→  const alignElementsBottom = useDesignerStore((s) => s.alignElementsBottom);
+   235→   235→   235→  const alignElementsCenterH = useDesignerStore((s) => s.alignElementsCenterH);
+   236→   236→   236→  const alignElementsCenterV = useDesignerStore((s) => s.alignElementsCenterV);
+   237→   237→   237→  const distributeElementsH = useDesignerStore((s) => s.distributeElementsH);
+   238→   238→   238→  const distributeElementsV = useDesignerStore((s) => s.distributeElementsV);
+   239→   239→   239→  const hasMultiSelect = selectedElementIds.length >= 2;
+   240→   240→   240→  const hasDistributeSelect = selectedElementIds.length >= 3;
+   241→   241→   241→
+   242→   242→   242→  const handleToggleLock = () => {
+   243→   243→   243→    if (firstSelectedId) {
+   244→   244→   244→      toggleLock(firstSelectedId);
+   245→   245→   245→    }
+   246→   246→   246→  };
+   247→   247→   247→
+   248→   248→   248→  const handleToggleVisibility = () => {
+   249→   249→   249→    if (firstSelectedId) {
+   250→   250→   250→      toggleVisibility(firstSelectedId);
+   251→   251→   251→    }
+   252→   252→   252→  };
+   253→   253→   253→
+   254→   254→   254→  // Sync the welcome modal's open state into the store so the canvas's global
+   255→   255→   255→  // keydown handler can disable feature shortcuts (Shift+S spotlight, Shift+Q
+   256→   256→   256→  // predefined blocks) while the welcome modal is showing — the user has no
+   257→   257→   257→  // project yet, so those overlays shouldn't be openable.
+   258→   258→   258→  useEffect(() => {
+   259→   259→   259→    setWelcomeModalOpen(welcomeOpen);
+   260→   260→   260→  }, [welcomeOpen, setWelcomeModalOpen]);
+   261→   261→   261→
+   262→   262→   262→  // Warn the user before closing/reloading the tab when there are unsaved
+   263→   263→   263→  // changes. Reads isDirty fresh from the store inside the handler (rather than
+   264→   264→   264→  // from the closure) so the listener only registers once and always reflects
+   265→   265→   265→  // the latest dirty state. Browsers ignore the custom message and show a
+   266→   266→   266→  // generic prompt — that's expected and unavoidable.
+   267→   267→   267→  useEffect(() => {
+   268→   268→   268→    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+   269→   269→   269→      if (useDesignerStore.getState().isDirty) {
+   270→   270→   270→        e.preventDefault();
+   271→   271→   271→        // returnValue must be set to trigger the prompt in most browsers.
+   272→   272→   272→        e.returnValue = '';
+   273→   273→   273→      }
+   274→   274→   274→    };
+   275→   275→   275→    window.addEventListener('beforeunload', handleBeforeUnload);
+   276→   276→   276→    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+   277→   277→   277→  }, []);
+   278→   278→   278→
+   279→   279→   279→  // Auto-save (crash recovery). Debounced: 5s after the last change, serialize
+   280→   280→   280→  // the current project to localStorage. Only runs once the app is ready (not
+   281→   281→   281→  // during the loading screen) and only when there's actually something to save
+   282→   282→   282→  // (elements present + dirty). Best-effort — quota/private-mode failures are
+   283→   283→   283→  // swallowed inside saveAutosave so the editor is never blocked.
+   284→   284→   284→  //
+   285→   285→   285→  // We depend on BOTH isDirty AND the elements array reference. isDirty alone
+   286→   286→   286→  // only transitions false→true once per save cycle, so subsequent edits (which
+   287→   287→   287→  // keep isDirty true) wouldn't re-trigger the effect. The elements array is
+   288→   288→   288→  // reassigned on every content edit (add/move/resize/delete), so including it
+   289→   289→   289→  // in the deps guarantees the debounce re-arms after every edit — not just the
+   290→   290→   290→  // first one. getState() inside the timeout reads the freshest state.
+   291→   291→   291→  useEffect(() => {
+   292→   292→   292→    if (!appReady) return;
+   293→   293→   293→    if (!isDirty) return;
+   294→   294→   294→    // Don't auto-save while the recovery prompt is showing — the user hasn't
+   295→   295→   295→    // decided whether to keep the draft yet, and saving would overwrite it.
+   296→   296→   296→    if (recoverySnapshot) return;
+   297→   297→   297→
+   298→   298→   298→    const timer = setTimeout(() => {
+   299→   299→   299→      const s = useDesignerStore.getState();
+   300→   300→   300→      // Nothing to recover if the canvas is empty.
+   301→   301→   301→      if (s.elements.length === 0) return;
+   302→   302→   302→      try {
+   303→   303→   303→        const project = buildProjectSnapshot({
+   304→   304→   304→          elements: s.elements,
+   305→   305→   305→          elementCounter: s.elementCounter,
+   306→   306→   306→          canvasSettings: s.canvasSettings,
+   307→   307→   307→          snapEnabled: s.snapEnabled,
+   308→   308→   308→          snapToGrid: s.snapToGrid,
+   309→   309→   309→          snapToElements: s.snapToElements,
+   310→   310→   310→          snapUnit: s.snapUnit,
+   311→   311→   311→          zoomStep: s.zoomStep,
+   312→   312→   312→          projectName: s.projectName,
+   313→   313→   313→        });
+   314→   314→   314→        saveAutosave(project);
+   315→   315→   315→      } catch (err) {
+   316→   316→   316→        // Autosave is best-effort — never block the editor. Log so it's
+   317→   317→   317→        // visible during debugging but don't surface to the user.
+   318→   318→   318→        console.warn('[autosave] Failed to build/save snapshot:', err);
+   319→   319→   319→      }
+   320→   320→   320→    }, 5000);
+   321→   321→   321→    return () => clearTimeout(timer);
+   322→   322→   322→  }, [appReady, isDirty, elements, recoverySnapshot]);
+   323→   323→   323→
+   324→   324→   324→  // ── Crash-recovery handlers ──────────────────────────────────────────────
+   325→   325→   325→  const loadProjectFromFileData = useDesignerStore((s) => s.loadProjectFromFileData);
+   326→   326→   326→
+   327→   327→   327→  const handleRestoreDraft = () => {
+   328→   328→   328→    if (!recoverySnapshot) return;
+   329→   329→   329→    try {
+   330→   330→   330→      // loadProjectFromFileData calls deserializeProject internally, so we
+   331→   331→   331→      // pass the raw ProjectFile from the snapshot.
+   332→   332→   332→      loadProjectFromFileData(recoverySnapshot.project);
+   333→   333→   333→      // Mark non-dirty so the user isn't immediately prompted on close — the
+   334→   334→   334→      // restored state IS the saved state (matches loadProject's behaviour).
+   335→   335→   335→      useDesignerStore.setState({ isDirty: false });
+   336→   336→   336→    } catch (err) {
+   337→   337→   337→      console.error('[autosave] Failed to restore draft:', err);
+   338→   338→   338→      clearAutosave();
+   339→   339→   339→    }
+   340→   340→   340→    setRecoverySnapshot(null);
+   341→   341→   341→    setWelcomeOpen(false);
+   342→   342→   342→  };
+   343→   343→   343→
+   344→   344→   344→  const handleDiscardDraft = () => {
+   345→   345→   345→    clearAutosave();
+   346→   346→   346→    setRecoverySnapshot(null);
+   347→   347→   347→    // Show the normal welcome flow now that the draft is gone.
+   348→   348→   348→    setWelcomeOpen(true);
+   349→   349→   349→  };
+   350→   350→   350→
+   351→   351→   351→  const handleFitToPage = () => {
+   352→   352→   352→    const viewport = document.querySelector('.canvas-viewport') as HTMLElement | null;
+   353→   353→   353→    if (viewport) {
+   354→   354→   354→      fitToPage(viewport.clientWidth, viewport.clientHeight);
+   355→   355→   355→    }
+   356→   356→   356→  };
+   357→   357→   357→
+   358→   358→   358→  const handleToggleMarginGuides = () => {
+   359→   359→   359→    const current = useDesignerStore.getState().canvasSettings.marginGuideline;
+   360→   360→   360→    updateCanvasSettings({
+   361→   361→   361→      marginGuideline: { ...current, show: !current.show },
+   362→   362→   362→    });
+   363→   363→   363→  };
+   364→   364→   364→
+   365→   365→   365→  // Responsive — on phones/small tablets (below 768px) the precision editor is
+   366→   366→   366→  // not usable, so show a friendly desktop-required screen instead of a broken
+   367→   367→   367→  // layout. The loading screen still renders on top during init (branded
+   368→   368→   368→  // animation), then fades to reveal the message. The welcome modal is
+   369→   369→   369→  // intentionally NOT shown on mobile — it would prompt the user to create a
+   370→   370→   370→  // project they can't edit, which is confusing.
+   371→   371→   371→  if (isMobile) {
+   372→   372→   372→    return (
+   373→   373→   373→      <div className="h-screen w-screen overflow-hidden bg-background">
+   374→   374→   374→        <MobileNotSupported />
+   375→   375→   375→        {/* Loading screen overlay — fades out after app hydrates */}
+   376→   376→   376→        <LoadingScreen isLoading={!appReady} />
+   377→   377→   377→      </div>
+   378→   378→   378→    );
+   379→   379→   379→  }
+   380→   380→   380→
+   381→   381→   381→  return (
+   382→   382→   382→    <div
+   383→   383→   383→      className="h-screen w-screen flex flex-col overflow-hidden bg-background"
+   384→   384→   384→      onDragOver={(e) => {
+   385→   385→   385→        if (e.dataTransfer.types.includes('element-type')) {
+   386→   386→   386→          e.preventDefault();
+   387→   387→   387→          e.dataTransfer.dropEffect = 'copy';
+   388→   388→   388→        }
+   389→   389→   389→      }}
+   390→   390→   390→    >
+   391→   391→   391→      {/* Loading screen overlay — fades out after app hydrates */}
+   392→   392→   392→      <LoadingScreen isLoading={!appReady} />
+   393→   393→   393→      {/* Welcome Modal — shows immediately after loading screen finishes */}
+   394→   394→   394→      <WelcomeModal open={welcomeOpen} onOpenChange={setWelcomeOpen} />
+   395→   395→   395→      {/* Crash-recovery dialog — if a previous session left an auto-saved
+   396→   396→   396→          draft, offer to restore it (or discard and start fresh). */}
+   397→   397→   397→      <Dialog
+   398→   398→   398→        open={recoverySnapshot !== null}
+   399→   399→   399→        onOpenChange={(open) => {
+   400→   400→   400→          if (!open) handleDiscardDraft();
+   401→   401→   401→        }}
+   402→   402→   402→      >
+   403→   403→   403→        <DialogContent className="sm:max-w-[440px]">
+   404→   404→   404→          <DialogHeader>
+   405→   405→   405→            <div className="flex items-center gap-2 mb-1">
+   406→   406→   406→              <div className="flex items-center justify-center h-9 w-9 rounded-lg bg-primary/10 text-primary">
+   407→   407→   407→                <History className="h-5 w-5" />
+   408→   408→   408→              </div>
+   409→   409→   409→              <DialogTitle className="text-base">Unsaved work found</DialogTitle>
+   410→   410→   410→            </div>
+   411→   411→   411→            <DialogDescription className="text-sm leading-relaxed">
+   412→   412→   412→              We recovered an unsaved project from your last session
+   413→   413→   413→              {recoverySnapshot ? ` (${formatAutosaveAge(recoverySnapshot.savedAt)})` : ''}.
+   414→   414→   414→              Restore it to pick up where you left off, or start fresh.
+   415→   415→   415→            </DialogDescription>
+   416→   416→   416→          </DialogHeader>
+   417→   417→   417→          {recoverySnapshot && (
+   418→   418→   418→            <div className="rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+   419→   419→   419→              <span className="font-medium text-foreground">
+   420→   420→   420→                {recoverySnapshot.project.projectName || 'Untitled Project'}
+   421→   421→   421→              </span>
+   422→   422→   422→              {' · '}
+   423→   423→   423→              {recoverySnapshot.project.elements.length} element{recoverySnapshot.project.elements.length === 1 ? '' : 's'}
+   424→   424→   424→            </div>
+   425→   425→   425→          )}
+   426→   426→   426→          <DialogFooter className="gap-2 sm:gap-2">
+   427→   427→   427→            <Button
+   428→   428→   428→              variant="outline"
+   429→   429→   429→              size="sm"
+   430→   430→   430→              onClick={handleDiscardDraft}
+   431→   431→   431→              className="gap-1.5"
+   432→   432→   432→            >
+   433→   433→   433→              <FileX2 className="h-4 w-4" />
+   434→   434→   434→              Start fresh
+   435→   435→   435→            </Button>
+   436→   436→   436→            <Button
+   437→   437→   437→              size="sm"
+   438→   438→   438→              onClick={handleRestoreDraft}
+   439→   439→   439→              className="gap-1.5"
+   440→   440→   440→            >
+   441→   441→   441→              <RotateCcw className="h-4 w-4" />
+   442→   442→   442→              Restore work
+   443→   443→   443→            </Button>
+   444→   444→   444→          </DialogFooter>
+   445→   445→   445→        </DialogContent>
+   446→   446→   446→      </Dialog>
+   447→   447→   447→      {/* App Header */}
+   448→   448→   448→      <header data-tour="header" className="h-12 border-b border-border bg-card flex items-center px-4 gap-3 shrink-0">
+   449→   449→   449→        <div className="flex items-center gap-2">
+   450→   450→   450→          <img src="/Logo.png" alt="Open Invoice" className="w-7 h-7 rounded-md object-contain" />
+   451→   451→   451→          <h1 className="text-sm font-bold text-foreground tracking-tight">
+   452→   452→   452→            Open Invoice<sup className="text-[0.5em] font-semibold tracking-wider leading-none">MJC</sup>
+   453→   453→   453→          </h1>
+   454→   454→   454→        </div>
+   455→   455→   455→
+   456→   456→   456→        <div className="h-4 w-px bg-border" />
+   457→   457→   457→
+   458→   458→   458→        {/* File Menu */}
+   459→   459→   459→        <DropdownMenu>
+   460→   460→   460→          <DropdownMenuTrigger asChild>
+   461→   461→   461→            <button className="nav-btn-pink text-xs text-muted-foreground px-2 py-1 rounded">
+   462→   462→   462→              File
+   463→   463→   463→            </button>
+   464→   464→   464→          </DropdownMenuTrigger>
+   465→   465→   465→          <DropdownMenuContent align="start" className="w-56">
+   466→   466→   466→            <DropdownMenuItem onClick={() => setNewProjectOpen(true)}>
+   467→   467→   467→              <FilePlus className="mr-2 h-4 w-4" />
+   468→   468→   468→              New Project
+   469→   469→   469→              <DropdownMenuShortcut>⌘N</DropdownMenuShortcut>
+   470→   470→   470→            </DropdownMenuItem>
+   471→   471→   471→            <DropdownMenuSeparator />
+   472→   472→   472→            <DropdownMenuItem onClick={() => { void loadProject(); }}>
+   473→   473→   473→              <FolderOpen className="mr-2 h-4 w-4" />
+   474→   474→   474→              Open Project
+   475→   475→   475→              <DropdownMenuShortcut>⌘O</DropdownMenuShortcut>
+   476→   476→   476→            </DropdownMenuItem>
+   477→   477→   477→            <DropdownMenuSeparator />
+   478→   478→   478→            <DropdownMenuItem onClick={() => { void saveProject(); }}>
+   479→   479→   479→              <Save className="mr-2 h-4 w-4" />
+   480→   480→   480→              Save
+   481→   481→   481→              <DropdownMenuShortcut>⌘S</DropdownMenuShortcut>
+   482→   482→   482→            </DropdownMenuItem>
+   483→   483→   483→            <DropdownMenuItem onClick={() => { void saveProjectAs(); }}>
+   484→   484→   484→              <SaveAll className="mr-2 h-4 w-4" />
+   485→   485→   485→              Save As...
+   486→   486→   486→              <DropdownMenuShortcut>⇧⌘S</DropdownMenuShortcut>
+   487→   487→   487→            </DropdownMenuItem>
+   488→   488→   488→            <DropdownMenuSeparator />
+   489→   489→   489→            <DropdownMenuItem onClick={() => setExportPdfOpen(true)}>
+   490→   490→   490→              <FileDown className="mr-2 h-4 w-4" />
+   491→   491→   491→              Export as PDF
+   492→   492→   492→              <DropdownMenuShortcut>⇧⌘E</DropdownMenuShortcut>
+   493→   493→   493→            </DropdownMenuItem>
+   494→   494→   494→          </DropdownMenuContent>
+   495→   495→   495→        </DropdownMenu>
+   496→   496→   496→
+   497→   497→   497→        {/* Edit Menu */}
+   498→   498→   498→        <DropdownMenu>
+   499→   499→   499→          <DropdownMenuTrigger asChild>
+   500→   500→   500→            <button className="nav-btn-pink text-xs text-muted-foreground px-2 py-1 rounded">
+   501→   501→   501→              Edit
+   502→   502→   502→            </button>
+   503→   503→   503→          </DropdownMenuTrigger>
+   504→   504→   504→          <DropdownMenuContent align="start" className="w-56">
+   505→   505→   505→            <DropdownMenuItem onClick={undo} disabled={!canUndo}>
+   506→   506→   506→              <Undo2 className="mr-2 h-4 w-4" />
+   507→   507→   507→              Undo
+   508→   508→   508→              <DropdownMenuShortcut>⌘Z</DropdownMenuShortcut>
+   509→   509→   509→            </DropdownMenuItem>
+   510→   510→   510→            <DropdownMenuItem onClick={redo} disabled={!canRedo}>
+   511→   511→   511→              <Redo2 className="mr-2 h-4 w-4" />
+   512→   512→   512→              Redo
+   513→   513→   513→              <DropdownMenuShortcut>⇧⌘Z</DropdownMenuShortcut>
+   514→   514→   514→            </DropdownMenuItem>
+   515→   515→   515→            <DropdownMenuSeparator />
+   516→   516→   516→            <DropdownMenuItem onClick={cutElement} disabled={!hasSelection}>
+   517→   517→   517→              <Scissors className="mr-2 h-4 w-4" />
+   518→   518→   518→              Cut
+   519→   519→   519→              <DropdownMenuShortcut>⌘X</DropdownMenuShortcut>
+   520→   520→   520→            </DropdownMenuItem>
+   521→   521→   521→            <DropdownMenuItem onClick={copyElement} disabled={!hasSelection}>
+   522→   522→   522→              <Copy className="mr-2 h-4 w-4" />
+   523→   523→   523→              Copy
+   524→   524→   524→              <DropdownMenuShortcut>⌘C</DropdownMenuShortcut>
+   525→   525→   525→            </DropdownMenuItem>
+   526→   526→   526→            <DropdownMenuItem onClick={pasteElement} disabled={!canPaste}>
+   527→   527→   527→              <ClipboardPaste className="mr-2 h-4 w-4" />
+   528→   528→   528→              Paste
+   529→   529→   529→              <DropdownMenuShortcut>⌘V</DropdownMenuShortcut>
+   530→   530→   530→            </DropdownMenuItem>
+   531→   531→   531→            <DropdownMenuItem onClick={pasteElementInPlace} disabled={!canPaste}>
+   532→   532→   532→              <ClipboardPaste className="mr-2 h-4 w-4" />
+   533→   533→   533→              Paste in Place
+   534→   534→   534→              <DropdownMenuShortcut>⇧⌘V</DropdownMenuShortcut>
+   535→   535→   535→            </DropdownMenuItem>
+   536→   536→   536→            <DropdownMenuSeparator />
+   537→   537→   537→            <DropdownMenuItem onClick={selectAll}>
+   538→   538→   538→              <CopyPlus className="mr-2 h-4 w-4" />
+   539→   539→   539→              Select All
+   540→   540→   540→              <DropdownMenuShortcut>⌘A</DropdownMenuShortcut>
+   541→   541→   541→            </DropdownMenuItem>
+   542→   542→   542→            <DropdownMenuItem onClick={handleDeleteSelected} disabled={!hasSelection}>
+   543→   543→   543→              <Trash2 className="mr-2 h-4 w-4" />
+   544→   544→   544→              Delete
+   545→   545→   545→              <DropdownMenuShortcut>Del</DropdownMenuShortcut>
+   546→   546→   546→            </DropdownMenuItem>
+   547→   547→   547→            <DropdownMenuItem onClick={handleDuplicateSelected} disabled={!hasSelection}>
+   548→   548→   548→              <CopyPlus className="mr-2 h-4 w-4" />
+   549→   549→   549→              Duplicate
+   550→   550→   550→              <DropdownMenuShortcut>⌘D</DropdownMenuShortcut>
+   551→   551→   551→            </DropdownMenuItem>
+   552→   552→   552→            <DropdownMenuSeparator />
+   553→   553→   553→            <DropdownMenuItem onClick={handleBringToFront} disabled={!hasSelection}>
+   554→   554→   554→              <BringToFront className="mr-2 h-4 w-4" />
+   555→   555→   555→              Bring to Front
+   556→   556→   556→              <DropdownMenuShortcut>⇧⌘]</DropdownMenuShortcut>
+   557→   557→   557→            </DropdownMenuItem>
+   558→   558→   558→            <DropdownMenuItem onClick={handleSendToBack} disabled={!hasSelection}>
+   559→   559→   559→              <SendToBack className="mr-2 h-4 w-4" />
+   560→   560→   560→              Send to Back
+   561→   561→   561→              <DropdownMenuShortcut>⇧⌘[</DropdownMenuShortcut>
+   562→   562→   562→            </DropdownMenuItem>
+   563→   563→   563→            <DropdownMenuSeparator />
+   564→   564→   564→            <DropdownMenuItem onClick={alignElementsLeft} disabled={!hasMultiSelect}>
+   565→   565→   565→              <AlignStartVertical className="mr-2 h-4 w-4" />
+   566→   566→   566→              Align Left
+   567→   567→   567→            </DropdownMenuItem>
+   568→   568→   568→            <DropdownMenuItem onClick={alignElementsRight} disabled={!hasMultiSelect}>
+   569→   569→   569→              <AlignEndVertical className="mr-2 h-4 w-4" />
+   570→   570→   570→              Align Right
+   571→   571→   571→            </DropdownMenuItem>
+   572→   572→   572→            <DropdownMenuItem onClick={alignElementsTop} disabled={!hasMultiSelect}>
+   573→   573→   573→              <AlignStartHorizontal className="mr-2 h-4 w-4" />
+   574→   574→   574→              Align Top
+   575→   575→   575→            </DropdownMenuItem>
+   576→   576→   576→            <DropdownMenuItem onClick={alignElementsBottom} disabled={!hasMultiSelect}>
+   577→   577→   577→              <AlignEndHorizontal className="mr-2 h-4 w-4" />
+   578→   578→   578→              Align Bottom
+   579→   579→   579→            </DropdownMenuItem>
+   580→   580→   580→            <DropdownMenuItem onClick={alignElementsCenterH} disabled={!hasMultiSelect}>
+   581→   581→   581→              <AlignCenterVertical className="mr-2 h-4 w-4" />
+   582→   582→   582→              Align Center H
+   583→   583→   583→            </DropdownMenuItem>
+   584→   584→   584→            <DropdownMenuItem onClick={alignElementsCenterV} disabled={!hasMultiSelect}>
+   585→   585→   585→              <AlignCenterHorizontal className="mr-2 h-4 w-4" />
+   586→   586→   586→              Align Center V
+   587→   587→   587→            </DropdownMenuItem>
+   588→   588→   588→            <DropdownMenuSeparator />
+   589→   589→   589→            <DropdownMenuItem onClick={distributeElementsH} disabled={!hasDistributeSelect}>
+   590→   590→   590→              <AlignHorizontalSpaceAround className="mr-2 h-4 w-4" />
+   591→   591→   591→              Distribute H
+   592→   592→   592→            </DropdownMenuItem>
+   593→   593→   593→            <DropdownMenuItem onClick={distributeElementsV} disabled={!hasDistributeSelect}>
+   594→   594→   594→              <AlignVerticalSpaceAround className="mr-2 h-4 w-4" />
+   595→   595→   595→              Distribute V
+   596→   596→   596→            </DropdownMenuItem>
+   597→   597→   597→            <DropdownMenuSeparator />
+   598→   598→   598→            <DropdownMenuItem onClick={handleToggleLock} disabled={!hasSelection}>
+   599→   599→   599→              {firstSelectedElement?.locked ? <Unlock className="mr-2 h-4 w-4" /> : <Lock className="mr-2 h-4 w-4" />}
+   600→   600→   600→              {firstSelectedElement?.locked ? 'Unlock' : 'Lock'}
+   601→   601→   601→            </DropdownMenuItem>
+   602→   602→   602→            <DropdownMenuItem onClick={handleToggleVisibility} disabled={!hasSelection}>
+   603→   603→   603→              {firstSelectedElement?.visible === false ? <Eye className="mr-2 h-4 w-4" /> : <EyeOff className="mr-2 h-4 w-4" />}
+   604→   604→   604→              {firstSelectedElement?.visible === false ? 'Show' : 'Hide'}
+   605→   605→   605→            </DropdownMenuItem>
+   606→   606→   606→          </DropdownMenuContent>
+   607→   607→   607→        </DropdownMenu>
+   608→   608→   608→
+   609→   609→   609→        {/* View Menu */}
+   610→   610→   610→        <DropdownMenu>
+   611→   611→   611→          <DropdownMenuTrigger asChild>
+   612→   612→   612→            <button className="nav-btn-pink text-xs text-muted-foreground px-2 py-1 rounded">
+   613→   613→   613→              View
+   614→   614→   614→            </button>
+   615→   615→   615→          </DropdownMenuTrigger>
+   616→   616→   616→          <DropdownMenuContent align="start" className="w-56">
+   617→   617→   617→            <DropdownMenuItem onClick={zoomIn}>
+   618→   618→   618→              <ZoomIn className="mr-2 h-4 w-4" />
+   619→   619→   619→              Zoom In
+   620→   620→   620→              <DropdownMenuShortcut>⌘+</DropdownMenuShortcut>
+   621→   621→   621→            </DropdownMenuItem>
+   622→   622→   622→            <DropdownMenuItem onClick={zoomOut}>
+   623→   623→   623→              <ZoomOut className="mr-2 h-4 w-4" />
+   624→   624→   624→              Zoom Out
+   625→   625→   625→              <DropdownMenuShortcut>⌘−</DropdownMenuShortcut>
+   626→   626→   626→            </DropdownMenuItem>
+   627→   627→   627→            <DropdownMenuItem onClick={resetZoom}>
+   628→   628→   628→              <Maximize className="mr-2 h-4 w-4" />
+   629→   629→   629→              Reset Zoom
+   630→   630→   630→              <DropdownMenuShortcut>⌘0</DropdownMenuShortcut>
+   631→   631→   631→            </DropdownMenuItem>
+   632→   632→   632→            <DropdownMenuItem onClick={handleFitToPage}>
+   633→   633→   633→              <Maximize className="mr-2 h-4 w-4" />
+   634→   634→   634→              Fit to Page
+   635→   635→   635→            </DropdownMenuItem>
+   636→   636→   636→            <DropdownMenuSeparator />
+   637→   637→   637→            <DropdownMenuCheckboxItem
+   638→   638→   638→              checked={snapToGrid}
+   639→   639→   639→              onCheckedChange={setSnapToGrid}
+   640→   640→   640→            >
+   641→   641→   641→              <Grid3x3 className="mr-2 h-4 w-4" />
+   642→   642→   642→              Show Grid
+   643→   643→   643→            </DropdownMenuCheckboxItem>
+   644→   644→   644→            <DropdownMenuCheckboxItem
+   645→   645→   645→              checked={snapEnabled}
+   646→   646→   646→              onCheckedChange={setSnapEnabled}
+   647→   647→   647→            >
+   648→   648→   648→              <Magnet className="mr-2 h-4 w-4" />
+   649→   649→   649→              Show Snap Guides
+   650→   650→   650→            </DropdownMenuCheckboxItem>
+   651→   651→   651→            <DropdownMenuCheckboxItem
+   652→   652→   652→              checked={marginShow}
+   653→   653→   653→              onCheckedChange={handleToggleMarginGuides}
+   654→   654→   654→            >
+   655→   655→   655→              <Ruler className="mr-2 h-4 w-4" />
+   656→   656→   656→              Show Margin Guides
+   657→   657→   657→            </DropdownMenuCheckboxItem>
+   658→   658→   658→            <DropdownMenuSeparator />
+   659→   659→   659→            <DropdownMenuCheckboxItem
+   660→   660→   660→              checked={showMiniPreview}
+   661→   661→   661→              onCheckedChange={setShowMiniPreview}
+   662→   662→   662→            >
+   663→   663→   663→              <Eye className="mr-2 h-4 w-4" />
+   664→   664→   664→              Show Mini Preview
+   665→   665→   665→            </DropdownMenuCheckboxItem>
+   666→   666→   666→            <DropdownMenuItem onClick={() => setLargePreviewOpen(true)}>
+   667→   667→   667→              <Eye className="mr-2 h-4 w-4" />
+   668→   668→   668→              Large Preview
+   669→   669→   669→              <DropdownMenuShortcut>⇧⌘P</DropdownMenuShortcut>
+   670→   670→   670→            </DropdownMenuItem>
+   671→   671→   671→          </DropdownMenuContent>
+   672→   672→   672→        </DropdownMenu>
+   673→   673→   673→
+   674→   674→   674→        {/* Project name indicator */}
+   675→   675→   675→        <span className="text-xs text-muted-foreground truncate max-w-[200px]" title={projectName}>
+   676→   676→   676→          {projectName}{isDirty ? ' •' : ''}
+   677→   677→   677→        </span>
+   678→   678→   678→
+   679→   679→   679→        <div className="flex-1" />
+   680→   680→   680→        <Button
+   681→   681→   681→          variant="outline"
+   682→   682→   682→          size="sm"
+   683→   683→   683→          className="h-8 gap-1.5 text-xs rounded-md"
+   684→   684→   684→          onClick={() => setLargePreviewOpen(true)}
+   685→   685→   685→        >
+   686→   686→   686→          <Eye className="h-3.5 w-3.5" />
+   687→   687→   687→          Preview
+   688→   688→   688→        </Button>
+   689→   689→   689→        <Button
+   690→   690→   690→          variant="outline"
+   691→   691→   691→          size="sm"
+   692→   692→   692→          className="h-8 gap-1.5 text-xs rounded-md"
+   693→   693→   693→          onClick={() => setSettingsOpen(true)}
+   694→   694→   694→        >
+   695→   695→   695→          <Settings className="h-3.5 w-3.5" />
+   696→   696→   696→          Settings
+   697→   697→   697→        </Button>
+   698→   698→   698→      </header>
+   699→   699→   699→
+   700→   700→   700→      {/* Main content area — dragover handler prevents 'not-allowed' cursor when dragging tools */}
+   701→   701→   701→      <div
+   702→   702→   702→        className="flex-1 flex overflow-hidden relative"
+   703→   703→   703→        onDragOver={(e) => {
+   704→   704→   704→          if (e.dataTransfer.types.includes('element-type')) {
+   705→   705→   705→            e.preventDefault();
+   706→   706→   706→            e.dataTransfer.dropEffect = 'copy';
+   707→   707→   707→          }
+   708→   708→   708→        }}
+   709→   709→   709→        onDrop={() => {
+   710→   710→   710→          // Only handle drops that aren't on the canvas — let canvas handle its own drops
+   711→   711→   711→          // If we reach here, the drop was outside the canvas, so we ignore it
+   712→   712→   712→          // (the canvas has its own onDrop handler that actually creates elements)
+   713→   713→   713→        }}
+   714→   714→   714→      >
+   715→   715→   715→        {/* Left: Tool Palette & Layers — collapses to width 0 when toggled off
+   716→   716→   716→            (header button). Stays mounted so the exit/enter animation plays. */}
+   717→   717→   717→        <div data-tour="tool-palette" className="contents">
+   718→   718→   718→          <motion.div
+   719→   719→   719→            initial={false}
+   720→   720→   720→            animate={{
+   721→   721→   721→              width: toolPaletteCollapsed ? 0 : 240,
+   722→   722→   722→              opacity: toolPaletteCollapsed ? 0 : 1,
+   723→   723→   723→            }}
+   724→   724→   724→            transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
+   725→   725→   725→            className="overflow-hidden h-full"
+   726→   726→   726→            style={{ pointerEvents: toolPaletteCollapsed ? 'none' : 'auto' }}
+   727→   727→   727→          >
+   728→   728→   728→            <ToolPalette />
+   729→   729→   729→          </motion.div>
+   730→   730→   730→        </div>
+   731→   731→   731→
+   732→   732→   732→        {/* Center: Canvas */}
+   733→   733→   733→        <Canvas />
+   734→   734→   734→
+   735→   735→   735→        {/* Right: Properties Panel — animated width/opacity transition when the
+   736→   736→   736→            property display mode changes OR when the panel is collapsed via the
+   737→   737→   737→            header button. In 'floating' mode the panel collapses to width 0
+   738→   738→   738→            (canvas expands to fill) and fades out; in 'panel'/'both' it expands
+   739→   739→   739→            back to 288px and fades in. The PropertiesPanel stays mounted
+   740→   740→   740→            throughout so the exit animation is visible (it no longer returns
+   741→   741→   741→            null for floating mode). */}
+   742→   742→   742→        <div data-tour="properties-panel" className="contents">
+   743→   743→   743→          <motion.div
+   744→   744→   744→            initial={false}
+   745→   745→   745→            animate={{
+   746→   746→   746→              width: propsPanelCollapsed || propertyDisplayMode === 'floating' ? 0 : 288,
+   747→   747→   747→              opacity: propsPanelCollapsed || propertyDisplayMode === 'floating' ? 0 : 1,
+   748→   748→   748→            }}
+   749→   749→   749→            transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
+   750→   750→   750→            className="overflow-hidden h-full"
+   751→   751→   751→            style={{ pointerEvents: propsPanelCollapsed || propertyDisplayMode === 'floating' ? 'none' : 'auto' }}
+   752→   752→   752→          >
+   753→   753→   753→            <PropertiesPanel />
+   754→   754→   754→          </motion.div>
+   755→   755→   755→        </div>
+   756→   756→   756→
+   757→   757→   757→        {/* Tool palette edge handle — sits on the left panel's right border,
+   758→   758→   758→            vertically centered. Slides to the screen edge when the panel
+   759→   759→   759→            collapses so the button is always reachable. The x offset (230)
+   760→   760→   760→            centers the 20px-wide handle on the 240px panel border. */}
+   761→   761→   761→        <div className="absolute top-1/2 left-0 -translate-y-1/2 z-30">
+   762→   762→   762→          <motion.button
+   763→   763→   763→            initial={false}
+   764→   764→   764→            animate={{ x: toolPaletteCollapsed ? 0 : 230 }}
+   765→   765→   765→            transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
+   766→   766→   766→            onClick={() => setToolPaletteCollapsed(!toolPaletteCollapsed)}
+   767→   767→   767→            className="flex items-center justify-center w-5 h-16 bg-card border border-border shadow-md hover:bg-accent hover:shadow-lg transition-colors rounded-r-lg text-muted-foreground hover:text-foreground"
+   768→   768→   768→            title={toolPaletteCollapsed ? 'Show tool palette' : 'Hide tool palette'}
+   769→   769→   769→            aria-label={toolPaletteCollapsed ? 'Show tool palette' : 'Hide tool palette'}
+   770→   770→   770→            aria-pressed={!toolPaletteCollapsed}
+   771→   771→   771→          >
+   772→   772→   772→            {toolPaletteCollapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronLeft className="h-4 w-4" />}
+   773→   773→   773→          </motion.button>
+   774→   774→   774→        </div>
+   775→   775→   775→
+   776→   776→   776→        {/* Properties panel edge handle — only shown when the property display
+   777→   777→   777→            mode is 'panel' or 'both'. In 'floating' mode the docked panel can
+   778→   778→   778→            never be toggled open, so the handle is removed entirely (not just
+   779→   779→   779→            parked at the edge). Sits on the right panel's left border,
+   780→   780→   780→            vertically centered, and slides to the screen edge when the panel
+   781→   781→   781→            collapses. The x offset (-278) centers the 20px-wide handle on the
+   782→   782→   782→            288px panel border. */}
+   783→   783→   783→        <AnimatePresence>
+   784→   784→   784→          {propertyDisplayMode !== 'floating' && (
+   785→   785→   785→            <motion.div
+   786→   786→   786→              key="props-edge-handle"
+   787→   787→   787→              className="absolute top-1/2 right-0 -translate-y-1/2 z-30"
+   788→   788→   788→              initial={{ opacity: 0 }}
+   789→   789→   789→              animate={{ opacity: 1 }}
+   790→   790→   790→              exit={{ opacity: 0 }}
+   791→   791→   791→              transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+   792→   792→   792→            >
+   793→   793→   793→              <motion.button
+   794→   794→   794→                initial={false}
+   795→   795→   795→                animate={{ x: rightPanelVisible ? -278 : 0 }}
+   796→   796→   796→                transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
+   797→   797→   797→                onClick={() => {
+   798→   798→   798→                  if (rightPanelVisible) {
+   799→   799→   799→                    setPropsPanelCollapsed(true);
+   800→   800→   800→                  } else {
+   801→   801→   801→                    setPropsPanelCollapsed(false);
+   802→   802→   802→                  }
+   803→   803→   803→                }}
+   804→   804→   804→                className="flex items-center justify-center w-5 h-16 bg-card border border-border shadow-md hover:bg-accent hover:shadow-lg transition-colors rounded-l-lg text-muted-foreground hover:text-foreground"
+   805→   805→   805→                title={rightPanelVisible ? 'Hide properties panel' : 'Show properties panel'}
+   806→   806→   806→                aria-label={rightPanelVisible ? 'Hide properties panel' : 'Show properties panel'}
+   807→   807→   807→                aria-pressed={rightPanelVisible}
+   808→   808→   808→              >
+   809→   809→   809→                {rightPanelVisible ? <ChevronRight className="h-4 w-4" /> : <ChevronLeft className="h-4 w-4" />}
+   810→   810→   810→              </motion.button>
+   811→   811→   811→            </motion.div>
+   812→   812→   812→          )}
+   813→   813→   813→        </AnimatePresence>
+   814→   814→   814→      </div>
+   815→   815→   815→
+   816→   816→   816→      {/* Bottom: Shortcuts Bar */}
+   817→   817→   817→      <div data-tour="shortcuts-bar">
+   818→   818→   818→        <ShortcutsBar />
+   819→   819→   819→      </div>
+   820→   820→   820→
+   821→   821→   821→      {/* Large PDF Preview Modal */}
+   822→   822→   822→      <LargePreviewModal />
+   823→   823→   823→
+   824→   824→   824→      {/* Settings Dialog */}
+   825→   825→   825→      <SettingsDialog />
+   826→   826→   826→
+   827→   827→   827→      {/* New Project Dialog */}
+   828→   828→   828→      <NewProjectDialog />
+   829→   829→   829→
+   830→   830→   830→      {/* Export PDF Dialog */}
+   831→   831→   831→      <ExportPdfDialog />
+   832→   832→   832→
+   833→   833→   833→      {/* Per-tool info dialog (opened by the "ⓘ" icons above elements) */}
+   834→   834→   834→      <ToolInfoDialog />
+   835→   835→   835→
+   836→   836→   836→    </div>
+   837→   837→   837→  );
+   838→   838→   838→}
+   839→   839→   839→

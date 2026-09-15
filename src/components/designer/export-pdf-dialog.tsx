@@ -1,6 +1,7 @@
 'use client';
 
 import { useDesignerStore } from '@/store/designer-store';
+import { toast } from '@/hooks/use-toast';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
@@ -40,7 +41,11 @@ export function ExportPdfDialog() {
         err instanceof Error && err.message
           ? err.message
           : 'PDF export failed. Please try again.';
-      alert(message);
+      toast({
+        title: 'PDF export failed',
+        description: message,
+        variant: 'destructive',
+      });
     } finally {
       setIsExporting(false);
     }

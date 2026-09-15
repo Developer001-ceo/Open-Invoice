@@ -1,0 +1,552 @@
+  1101→            <div
+  1102→              className="h-0.5 mt-0.5 rounded-full"
+  1103→              style={{ backgroundColor: data.color }}
+  1104→            />
+  1105→          </div>
+  1106→        </label>
+  1107→      </div>
+  1108→
+  1109→      {/* Row 2: Bold, Italic, Underline, Strikethrough | Align Left, Center, Right, Justify — wraps to prevent overflow */}
+  1110→      <div className="flex items-center gap-0.5 flex-wrap">
+  1111→        <StaticToolbarButton
+  1112→          active={data.fontWeight === 'bold' || data.fontWeight === '700'}
+  1113→          onClick={() => update({ fontWeight: (data.fontWeight === 'bold' || data.fontWeight === '700') ? 'normal' : 'bold' })}
+  1114→          title="Bold"
+  1115→        >
+  1116→          <Bold className="h-3.5 w-3.5" />
+  1117→        </StaticToolbarButton>
+  1118→
+  1119→        <StaticToolbarButton
+  1120→          active={data.fontStyle === 'italic'}
+  1121→          onClick={() => update({ fontStyle: data.fontStyle === 'italic' ? 'normal' : 'italic' })}
+  1122→          title="Italic"
+  1123→        >
+  1124→          <Italic className="h-3.5 w-3.5" />
+  1125→        </StaticToolbarButton>
+  1126→
+  1127→        <StaticToolbarButton
+  1128→          active={data.textDecoration === 'underline'}
+  1129→          onClick={() => update({ textDecoration: data.textDecoration === 'underline' ? 'none' : 'underline' })}
+  1130→          title="Underline"
+  1131→        >
+  1132→          <UnderlineIcon className="h-3.5 w-3.5" />
+  1133→        </StaticToolbarButton>
+  1134→
+  1135→        <StaticToolbarButton
+  1136→          active={data.textDecoration === 'line-through'}
+  1137→          onClick={() => update({ textDecoration: data.textDecoration === 'line-through' ? 'none' : 'line-through' })}
+  1138→          title="Strikethrough"
+  1139→        >
+  1140→          <Strikethrough className="h-3.5 w-3.5" />
+  1141→        </StaticToolbarButton>
+  1142→
+  1143→        <StaticToolbarDivider />
+  1144→
+  1145→        <StaticToolbarButton
+  1146→          active={data.textAlign === 'left'}
+  1147→          onClick={() => update({ textAlign: 'left' })}
+  1148→          title="Align Left"
+  1149→        >
+  1150→          <AlignLeft className="h-3.5 w-3.5" />
+  1151→        </StaticToolbarButton>
+  1152→        <StaticToolbarButton
+  1153→          active={data.textAlign === 'center'}
+  1154→          onClick={() => update({ textAlign: 'center' })}
+  1155→          title="Align Center"
+  1156→        >
+  1157→          <AlignCenter className="h-3.5 w-3.5" />
+  1158→        </StaticToolbarButton>
+  1159→        <StaticToolbarButton
+  1160→          active={data.textAlign === 'right'}
+  1161→          onClick={() => update({ textAlign: 'right' })}
+  1162→          title="Align Right"
+  1163→        >
+  1164→          <AlignRight className="h-3.5 w-3.5" />
+  1165→        </StaticToolbarButton>
+  1166→        <StaticToolbarButton
+  1167→          active={data.textAlign === 'justify'}
+  1168→          onClick={() => update({ textAlign: 'justify' })}
+  1169→          title="Justify"
+  1170→        >
+  1171→          <AlignJustify className="h-3.5 w-3.5" />
+  1172→        </StaticToolbarButton>
+  1173→      </div>
+  1174→    </div>
+  1175→  );
+  1176→}
+  1177→
+  1178→// Property content renderer - renders the actual form fields for each section
+  1179→// Exported so spotlight-overlay.tsx can reuse it for preview cards
+  1180→// Wrapped in React.memo to prevent re-renders when only the card position changes
+  1181→export const PropertyContent = memo(function PropertyContent({ sectionLabel, element, compact, multiSelectIds }: { sectionLabel: string; element: CanvasElement; compact?: boolean; multiSelectIds?: string[] }) {
+  1182→  const updateElement = useDesignerStore((s) => s.updateElement);
+  1183→  const updateElementProperties = useDesignerStore((s) => s.updateElementProperties);
+  1184→  const alignElementHorizontalCenter = useDesignerStore((s) => s.alignElementHorizontalCenter);
+  1185→  const alignElementVerticalCenter = useDesignerStore((s) => s.alignElementVerticalCenter);
+  1186→  // Multi-select block alignment — shifts all selected elements as a group,
+  1187→  // preserving their relative positions (mirrors grouped-element alignment).
+  1188→  const alignElementsHorizontalCenter = useDesignerStore((s) => s.alignElementsHorizontalCenter);
+  1189→  const alignElementsVerticalCenter = useDesignerStore((s) => s.alignElementsVerticalCenter);
+  1190→  // Multi-select & group opacity setter — subscribed (not getState()) so the
+  1191→  // callback identity is stable and the slider's onValueChange fires correctly.
+  1192→  const setElementsOpacity = useDesignerStore((s) => s.setElementsOpacity);
+  1193→  // Subscribe to editing state so the Formatting section re-renders
+  1194→  // when the user starts/stops editing a text element
+  1195→  const editingTextElementId = useDesignerStore((s) => s.editingTextElementId);
+  1196→  const activeTextEditor = useDesignerStore((s) => s.activeTextEditor);
+  1197→  // Rectangle rotation setter — used by the 'Transform' card section.
+  1198→  const setRectRotation = useDesignerStore((s) => s.setRectRotation);
+  1199→
+  1200→  // Helper to get props data based on element type
+  1201→  const getProps = () => {
+  1202→    return element.properties as { type: string; data: Record<string, unknown> };
+  1203→  };
+  1204→
+  1205→  const updateProps = (updates: Record<string, unknown>) => {
+  1206→    const props = getProps();
+  1207→    updateElementProperties(element.id, {
+  1208→      type: props.type as 'text' | 'table' | 'image' | 'line' | 'rectangle' | 'ellipse',
+  1209→      data: { ...props.data, ...updates },
+  1210→    } as unknown as ElementProperties);
+  1211→  };
+  1212→
+  1213→  // Render based on section label
+  1214→  switch (sectionLabel) {
+  1215→    // ─── COMMON: Position ──────────────────────────────────────────
+  1216→    case 'Position': {
+  1217→      if (element.type === 'line') return <div className="text-xs text-muted-foreground italic">Use Endpoints section</div>;
+  1218→      return (
+  1219→        <div className="grid grid-cols-2 gap-2">
+  1220→          <div>
+  1221→            <label className={labelCls}>X</label>
+  1222→            <input data-no-drag type="number" value={Math.round(element.x)} onChange={(e) => updateElement(element.id, { x: +e.target.value })} className={inputCls} />
+  1223→          </div>
+  1224→          <div>
+  1225→            <label className={labelCls}>Y</label>
+  1226→            <input data-no-drag type="number" value={Math.round(element.y)} onChange={(e) => updateElement(element.id, { y: +e.target.value })} className={inputCls} />
+  1227→          </div>
+  1228→        </div>
+  1229→      );
+  1230→    }
+  1231→
+  1232→    // ─── COMMON: Size ──────────────────────────────────────────────
+  1233→    case 'Size': {
+  1234→      return (
+  1235→        <div className="grid grid-cols-2 gap-2">
+  1236→          <div>
+  1237→            <label className={labelCls}>Width</label>
+  1238→            <input data-no-drag type="number" value={Math.round(element.width)} onChange={(e) => updateElement(element.id, { width: Math.max(10, +e.target.value) })} className={inputCls} />
+  1239→          </div>
+  1240→          <div>
+  1241→            <label className={labelCls}>Height</label>
+  1242→            <input data-no-drag type="number" value={Math.round(element.height)} onChange={(e) => updateElement(element.id, { height: Math.max(10, +e.target.value) })} className={inputCls} />
+  1243→          </div>
+  1244→        </div>
+  1245→      );
+  1246→    }
+  1247→
+  1248→    // ─── COMMON: Alignment ─────────────────────────────────────────
+  1249→    case 'Alignment': {
+  1250→      // When multiple elements are selected, align them as a BLOCK (preserving
+  1251→      // their relative positions) via the multi-select actions. Single element
+  1252→      // uses the standard single-element align.
+  1253→      const isMulti = !!(multiSelectIds && multiSelectIds.length > 1);
+  1254→      const ids = isMulti ? multiSelectIds! : [element.id];
+  1255→      const onHCenter = isMulti
+  1256→        ? () => alignElementsHorizontalCenter(ids)
+  1257→        : () => alignElementHorizontalCenter(element.id);
+  1258→      const onVCenter = isMulti
+  1259→        ? () => alignElementsVerticalCenter(ids)
+  1260→        : () => alignElementVerticalCenter(element.id);
+  1261→      return (
+  1262→        <div className="flex gap-1.5">
+  1263→          <button data-no-drag className="flex-1 h-7 text-[10px] border border-border rounded hover:bg-accent transition-colors" onClick={onHCenter}>H-Center</button>
+  1264→          <button data-no-drag className="flex-1 h-7 text-[10px] border border-border rounded hover:bg-accent transition-colors" onClick={onVCenter}>V-Center</button>
+  1265→        </div>
+  1266→      );
+  1267→    }
+  1268→
+  1269→    // ─── TEXT: Formatting ────────────────────────────────────────
+  1270→    case 'Formatting': {
+  1271→      if (element.type === 'text') {
+  1272→        const data = (element.properties as { type: 'text'; data: TextProperties }).data;
+  1273→        // Update function that handles textAlign changes in HTML content
+  1274→        // (same logic as the properties panel)
+  1275→        const update = (updates: Partial<TextProperties>) => {
+  1276→          let finalUpdates = updates;
+  1277→          if (updates.textAlign) {
+  1278→            if (activeTextEditor && editingTextElementId === element.id) {
+  1279→              // While editing: use TipTap's setTextAlign to update all paragraphs
+  1280→              activeTextEditor.chain().focus().setTextAlign(updates.textAlign).run();
+  1281→            } else {
+  1282→              // While not editing: update the HTML content directly to change/add
+  1283→              // text-align on all block-level elements
+  1284→              const align = updates.textAlign;
+  1285→              let updatedContent = data.content;
+  1286→              updatedContent = updatedContent.replace(
+  1287→                /(<(?:p|h[1-6]|li|div|blockquote)[^>]*?style=")([^"]*)(")/gi,
+  1288→                (_match: string, styleStart: string, styleContent: string, styleEnd: string) => {
+  1289→                  if (styleContent.includes('text-align')) {
+  1290→                    return `${styleStart}${styleContent.replace(/text-align:\s*[^;"]+/gi, `text-align: ${align}`)}${styleEnd}`;
+  1291→                  }
+  1292→                  const sep = styleContent && !styleContent.endsWith(';') ? ';' : '';
+  1293→                  return `${styleStart}${styleContent}${sep}text-align: ${align}${styleEnd}`;
+  1294→                }
+  1295→              );
+  1296→              updatedContent = updatedContent.replace(
+  1297→                /<(p|h[1-6]|li|div|blockquote)(\s[^>]*?)?>/gi,
+  1298→                (match: string, tag: string, attrs: string | undefined) => {
+  1299→                  if (attrs && attrs.includes('style=')) return match;
+  1300→                  return `<${tag}${attrs || ''} style="text-align: ${align}">`;
+  1301→                }
+  1302→              );
+  1303→              finalUpdates = { ...updates, content: updatedContent };
+  1304→            }
+  1305→          }
+  1306→          updateElementProperties(element.id, { type: 'text', data: { ...data, ...finalUpdates } });
+  1307→        };
+  1308→
+  1309→        if (activeTextEditor && editingTextElementId === element.id) {
+  1310→          // When actively editing: use the rich TipTap-connected toolbar
+  1311→          // for per-character/per-selection formatting
+  1312→          return <FormattingToolbar editor={activeTextEditor} baseProps={data} />;
+  1313→        }
+  1314→        // When NOT editing: show a static toolbar that modifies the
+  1315→        // element's base/default text properties directly
+  1316→        return <StaticFormattingToolbar data={data} update={update} />;
+  1317→      }
+  1318→      return (
+  1319→        <div className="text-xs text-muted-foreground italic">
+  1320→          Select a text element to apply formatting.
+  1321→        </div>
+  1322→      );
+  1323→    }
+  1324→
+  1325→    // ─── TEXT: Typography ──────────────────────────────────────────
+  1326→    case 'Typography': {
+  1327→      const data = (element.properties as { type: 'text'; data: TextProperties }).data;
+  1328→      const update = (updates: Partial<TextProperties>) => {
+  1329→        updateElementProperties(element.id, { type: 'text', data: { ...data, ...updates } });
+  1330→      };
+  1331→      return (
+  1332→        <div className="space-y-2">
+  1333→          <p className="text-[9px] text-muted-foreground">Base styles for all text. Use inline editor for per-character formatting.</p>
+  1334→          <Field label="Font Size">
+  1335→            <SliderField value={[data.fontSize]} min={6} max={100} step={1} unit="px" colorTheme="purple" onValueChange={([v]) => update({ fontSize: v })} compact />
+  1336→          </Field>
+  1337→          <Field label="Font Family">
+  1338→            <select data-no-drag value={data.fontFamily} onChange={(e) => update({ fontFamily: e.target.value })} className={selectCls}>
+  1339→              {FONT_FAMILIES_GROUPED.map((group) => (
+  1340→                <optgroup key={group.label} label={group.label}>
+  1341→                  {group.options.map((f) => (
+  1342→                    <option key={f.value} value={f.value} style={{ fontFamily: f.value }}>{f.label}</option>
+  1343→                  ))}
+  1344→                </optgroup>
+  1345→              ))}
+  1346→            </select>
+  1347→          </Field>
+  1348→          <Field label="Weight">
+  1349→            <select data-no-drag value={data.fontWeight} onChange={(e) => update({ fontWeight: e.target.value })} className={selectCls}>
+  1350→              <option value="normal">Normal</option>
+  1351→              <option value="bold">Bold</option>
+  1352→              <option value="lighter">Lighter</option>
+  1353→              <option value="100">100</option>
+  1354→              <option value="300">300</option>
+  1355→              <option value="500">500</option>
+  1356→              <option value="700">700</option>
+  1357→              <option value="900">900</option>
+  1358→            </select>
+  1359→          </Field>
+  1360→          <Field label="Style">
+  1361→            <select data-no-drag value={data.fontStyle} onChange={(e) => update({ fontStyle: e.target.value })} className={selectCls}>
+  1362→              <option value="normal">Normal</option>
+  1363→              <option value="italic">Italic</option>
+  1364→            </select>
+  1365→          </Field>
+  1366→          <Field label="Decoration">
+  1367→            <select data-no-drag value={data.textDecoration} onChange={(e) => update({ textDecoration: e.target.value })} className={selectCls}>
+  1368→              <option value="none">None</option>
+  1369→              <option value="underline">Underline</option>
+  1370→              <option value="line-through">Strikethrough</option>
+  1371→              <option value="overline">Overline</option>
+  1372→            </select>
+  1373→          </Field>
+  1374→          <Field label="Transform">
+  1375→            <select data-no-drag value={data.textTransform} onChange={(e) => update({ textTransform: e.target.value as 'none' | 'uppercase' | 'lowercase' | 'capitalize' })} className={selectCls}>
+  1376→              <option value="none">None</option>
+  1377→              <option value="uppercase">UPPERCASE</option>
+  1378→              <option value="lowercase">lowercase</option>
+  1379→              <option value="capitalize">Capitalize</option>
+  1380→            </select>
+  1381→          </Field>
+  1382→        </div>
+  1383→      );
+  1384→    }
+  1385→
+  1386→    // ─── TEXT: Alignment & Spacing ─────────────────────────────────
+  1387→    case 'Alignment & Spacing': {
+  1388→      const data = (element.properties as { type: 'text'; data: TextProperties }).data;
+  1389→      const update = (updates: Partial<TextProperties>) => {
+  1390→        let finalUpdates = updates;
+  1391→        // When textAlign is changed, apply it to the entire content
+  1392→        if (updates.textAlign) {
+  1393→          if (activeTextEditor && editingTextElementId === element.id) {
+  1394→            // While editing: use TipTap's setTextAlign to update all paragraphs
+  1395→            activeTextEditor.chain().focus().setTextAlign(updates.textAlign).run();
+  1396→          } else {
+  1397→            // While not editing: update the HTML content directly to change/add
+  1398→            // text-align on all block-level elements (p, h1-h6, li, etc.)
+  1399→            const align = updates.textAlign;
+  1400→            let updatedContent = data.content;
+  1401→            // Step 1: For tags with style="..." — replace or add text-align
+  1402→            updatedContent = updatedContent.replace(
+  1403→              /(<(?:p|h[1-6]|li|div|blockquote)[^>]*?style=")([^"]*)(")/gi,
+  1404→              (_match: string, styleStart: string, styleContent: string, styleEnd: string) => {
+  1405→                if (styleContent.includes('text-align')) {
+  1406→                  return `${styleStart}${styleContent.replace(/text-align:\s*[^;"]+/gi, `text-align: ${align}`)}${styleEnd}`;
+  1407→                }
+  1408→                const sep = styleContent && !styleContent.endsWith(';') ? ';' : '';
+  1409→                return `${styleStart}${styleContent}${sep}text-align: ${align}${styleEnd}`;
+  1410→              }
+  1411→            );
+  1412→            // Step 2: For tags without any style attribute — add style="text-align: X"
+  1413→            updatedContent = updatedContent.replace(
+  1414→              /<(p|h[1-6]|li|div|blockquote)(\s[^>]*?)?>/gi,
+  1415→              (match: string, tag: string, attrs: string | undefined) => {
+  1416→                if (attrs && attrs.includes('style=')) return match;
+  1417→                return `<${tag}${attrs || ''} style="text-align: ${align}">`;
+  1418→              }
+  1419→            );
+  1420→            finalUpdates = { ...updates, content: updatedContent };
+  1421→          }
+  1422→        }
+  1423→        updateElementProperties(element.id, { type: 'text', data: { ...data, ...finalUpdates } });
+  1424→      };
+  1425→      return (
+  1426→        <div className="space-y-2">
+  1427→          <Field label="Align">
+  1428→            <select data-no-drag value={data.textAlign} onChange={(e) => update({ textAlign: e.target.value as 'left' | 'center' | 'right' | 'justify' })} className={selectCls}>
+  1429→              <option value="left">Left</option>
+  1430→              <option value="center">Center</option>
+  1431→              <option value="right">Right</option>
+  1432→              <option value="justify">Justify</option>
+  1433→            </select>
+  1434→          </Field>
+  1435→          <Field label="Line Height">
+  1436→            <SliderField value={[Math.round(data.lineHeight * 100)]} min={80} max={300} step={10} unit="%" colorTheme="green" onValueChange={([v]) => update({ lineHeight: v / 100 })} compact />
+  1437→          </Field>
+  1438→          <Field label="Letter Spacing">
+  1439→            <SliderField value={[data.letterSpacing]} min={-5} max={20} step={0.5} unit="px" colorTheme="teal" onValueChange={([v]) => update({ letterSpacing: v })} compact />
+  1440→          </Field>
+  1441→        </div>
+  1442→      );
+  1443→    }
+  1444→
+  1445→    // ─── TEXT: Color ───────────────────────────────────────────────
+  1446→    case 'Color': {
+  1447→      const data = (element.properties as { type: 'text'; data: TextProperties }).data;
+  1448→      const update = (updates: Partial<TextProperties>) => {
+  1449→        updateElementProperties(element.id, { type: 'text', data: { ...data, ...updates } });
+  1450→      };
+  1451→      return (
+  1452→        <div className="space-y-2">
+  1453→          <Field label="Color">
+  1454→            <ColorInput value={data.color} onChange={(v) => update({ color: v })} noDrag />
+  1455→          </Field>
+  1456→          <Field label="Opacity">
+  1457→            <SliderField value={[Math.round(data.opacity * 100)]} min={0} max={100} step={1} unit="%" colorTheme="gray" onValueChange={([v]) => update({ opacity: v / 100 })} compact />
+  1458→          </Field>
+  1459→        </div>
+  1460→      );
+  1461→    }
+  1462→
+  1463→    // ─── TABLE: Structure ──────────────────────────────────────────
+  1464→    case 'Structure': {
+  1465→      const rawProps = (element.properties as { type: 'table'; data: TableProperties }).data;
+  1466→      const props: TableProperties = {
+  1467→        rows: rawProps.rows ?? 4,
+  1468→        cols: rawProps.cols ?? 3,
+  1469→        cellData: rawProps.cellData ?? [['', '', ''], ['', '', ''], ['', '', ''], ['', '', '']],
+  1470→        cellOverrides: rawProps.cellOverrides ?? {},
+  1471→        showHeader: rawProps.showHeader ?? true,
+  1472→        headerBg: rawProps.headerBg ?? '#f3f4f6',
+  1473→        headerColor: rawProps.headerColor ?? '#111827',
+  1474→        headerFontWeight: rawProps.headerFontWeight ?? 'bold',
+  1475→        cellBg: rawProps.cellBg ?? '#ffffff',
+  1476→        cellColor: rawProps.cellColor ?? '#374151',
+  1477→        cellPadding: rawProps.cellPadding ?? 8,
+  1478→        fontFamily: rawProps.fontFamily ?? 'Inter, sans-serif',
+  1479→        fontSize: rawProps.fontSize ?? 13,
+  1480→        rowBgColors: rawProps.rowBgColors ?? {},
+  1481→        colBgColors: rawProps.colBgColors ?? {},
+  1482→        borderWidth: rawProps.borderWidth ?? 1,
+  1483→        borderStyle: rawProps.borderStyle ?? 'solid',
+  1484→        borderColor: rawProps.borderColor ?? '#d1d5db',
+  1485→        showBorderTop: rawProps.showBorderTop ?? true,
+  1486→        showBorderRight: rawProps.showBorderRight ?? true,
+  1487→        showBorderBottom: rawProps.showBorderBottom ?? true,
+  1488→        showBorderLeft: rawProps.showBorderLeft ?? true,
+  1489→        showInnerBorders: rawProps.showInnerBorders ?? true,
+  1490→        cornerRadius: rawProps.cornerRadius ?? { mode: 'linked', all: 0, topLeft: 0, topRight: 0, bottomRight: 0, bottomLeft: 0 },
+  1491→        colWidths: rawProps.colWidths ?? Array(rawProps.cols ?? 3).fill(1),
+  1492→        rowHeights: rawProps.rowHeights ?? Array(rawProps.rows ?? 4).fill(1),
+  1493→        rowNames: rawProps.rowNames ?? Array.from({ length: rawProps.rows ?? 4 }, (_, i) => `Row ${i + 1}`),
+  1494→        colNames: rawProps.colNames ?? Array.from({ length: rawProps.cols ?? 3 }, (_, i) => `Column ${i + 1}`),
+  1495→        opacity: rawProps.opacity ?? 1,
+  1496→      };
+  1497→      const update = (updates: Partial<TableProperties>) => {
+  1498→        // Read latest data from store to avoid stale closure (e.g. after col/row resize)
+  1499→        const currentEl = useDesignerStore.getState().elements.find((el) => el.id === element.id);
+  1500→        const currentData = currentEl ? (currentEl.properties as { type: 'table'; data: TableProperties }).data : props;
+  1501→        updateElementProperties(element.id, { type: 'table', data: { ...currentData, ...updates } });
+  1502→      };
+  1503→
+  1504→      const addRow = () => {
+  1505→        // Read latest data from store to avoid stale closure issues
+  1506→        const currentEl = useDesignerStore.getState().elements.find((el) => el.id === element.id);
+  1507→        const currentData = currentEl ? (currentEl.properties as { type: 'table'; data: TableProperties }).data : props;
+  1508→        const newRow = Array(currentData.cols).fill('');
+  1509→        const newCellData = [...currentData.cellData.map((r) => [...r]), newRow];
+  1510→        const newRowHeights = [...(currentData.rowHeights ?? Array(currentData.rows).fill(1)), 1];
+  1511→        const newRowNames = [...(currentData.rowNames ?? Array.from({ length: currentData.rows }, (_, i) => `Row ${i + 1}`)), `Row ${currentData.rows + 1}`];
+  1512→        update({ rows: currentData.rows + 1, cellData: newCellData, rowHeights: newRowHeights, rowNames: newRowNames });
+  1513→      };
+  1514→
+  1515→      const addColumn = () => {
+  1516→        // Read latest data from store to avoid stale closure issues
+  1517→        const currentEl = useDesignerStore.getState().elements.find((el) => el.id === element.id);
+  1518→        const currentData = currentEl ? (currentEl.properties as { type: 'table'; data: TableProperties }).data : props;
+  1519→        const newCellData = currentData.cellData.map((row) => [...row, '']);
+  1520→        const newColWidths = [...(currentData.colWidths ?? Array(currentData.cols).fill(1)), 1];
+  1521→        const newColNames = [...(currentData.colNames ?? Array.from({ length: currentData.cols }, (_, i) => `Column ${i + 1}`)), `Column ${currentData.cols + 1}`];
+  1522→        update({ cols: currentData.cols + 1, cellData: newCellData, colWidths: newColWidths, colNames: newColNames });
+  1523→      };
+  1524→
+  1525→      return (
+  1526→        <div className="space-y-2">
+  1527→          <div className="grid grid-cols-2 gap-2">
+  1528→            <div>
+  1529→              <label className={labelCls}>Rows</label>
+  1530→              <input
+  1531→                data-no-drag
+  1532→                type="number"
+  1533→                min={1}
+  1534→                max={50}
+  1535→                value={props.rows}
+  1536→                onChange={(e) => {
+  1537→                  const newRows = Math.max(1, +e.target.value);
+  1538→                  const newCellData: string[][] = [];
+  1539→                  const newRowHeights: number[] = [];
+  1540→                  const newRowNames: string[] = [];
+  1541→                  const currentRowNames = props.rowNames ?? Array.from({ length: props.rows }, (_, i) => `Row ${i + 1}`);
+  1542→                  for (let r = 0; r < newRows; r++) {
+  1543→                    newCellData[r] = [];
+  1544→                    for (let c = 0; c < props.cols; c++) {
+  1545→                      newCellData[r][c] = props.cellData[r]?.[c] || '';
+  1546→                    }
+  1547→                    newRowHeights[r] = (props.rowHeights ?? Array(props.rows).fill(1))[r] ?? 1;
+  1548→                    newRowNames[r] = currentRowNames[r] ?? `Row ${r + 1}`;
+  1549→                  }
+  1550→                  update({ rows: newRows, cellData: newCellData, rowHeights: newRowHeights, rowNames: newRowNames });
+  1551→                }}
+  1552→                className={inputCls}
+  1553→              />
+  1554→            </div>
+  1555→            <div>
+  1556→              <label className={labelCls}>Columns</label>
+  1557→              <input
+  1558→                data-no-drag
+  1559→                type="number"
+  1560→                min={1}
+  1561→                max={20}
+  1562→                value={props.cols}
+  1563→                onChange={(e) => {
+  1564→                  const newCols = Math.max(1, +e.target.value);
+  1565→                  const newCellData = props.cellData.map((row) => {
+  1566→                    const newRow: string[] = [];
+  1567→                    for (let c = 0; c < newCols; c++) {
+  1568→                      newRow[c] = row[c] || '';
+  1569→                    }
+  1570→                    return newRow;
+  1571→                  });
+  1572→                  const newColWidths: number[] = [];
+  1573→                  const newColNames: string[] = [];
+  1574→                  const currentColNames = props.colNames ?? Array.from({ length: props.cols }, (_, i) => `Column ${i + 1}`);
+  1575→                  for (let c = 0; c < newCols; c++) {
+  1576→                    newColWidths[c] = (props.colWidths ?? Array(props.cols).fill(1))[c] ?? 1;
+  1577→                    newColNames[c] = currentColNames[c] ?? `Column ${c + 1}`;
+  1578→                  }
+  1579→                  update({ cols: newCols, cellData: newCellData, colWidths: newColWidths, colNames: newColNames });
+  1580→                }}
+  1581→                className={inputCls}
+  1582→              />
+  1583→            </div>
+  1584→          </div>
+  1585→          <div className="flex gap-1.5">
+  1586→            <button data-no-drag className="flex-1 h-7 text-[10px] border border-border rounded hover:bg-accent transition-colors" onClick={addRow}>+ Row</button>
+  1587→            <button data-no-drag className="flex-1 h-7 text-[10px] border border-border rounded hover:bg-accent transition-colors" onClick={addColumn}>+ Col</button>
+  1588→          </div>
+  1589→        </div>
+  1590→      );
+  1591→    }
+  1592→
+  1593→    // ─── TABLE: Header Row ─────────────────────────────────────────
+  1594→    case 'Header Row': {
+  1595→      const rawProps = (element.properties as { type: 'table'; data: TableProperties }).data;
+  1596→      const props: TableProperties = {
+  1597→        rows: rawProps.rows ?? 4,
+  1598→        cols: rawProps.cols ?? 3,
+  1599→        cellData: rawProps.cellData ?? [['', '', ''], ['', '', ''], ['', '', ''], ['', '', '']],
+  1600→        cellOverrides: rawProps.cellOverrides ?? {},
+  1601→        showHeader: rawProps.showHeader ?? true,
+  1602→        headerBg: rawProps.headerBg ?? '#f3f4f6',
+  1603→        headerColor: rawProps.headerColor ?? '#111827',
+  1604→        headerFontWeight: rawProps.headerFontWeight ?? 'bold',
+  1605→        cellBg: rawProps.cellBg ?? '#ffffff',
+  1606→        cellColor: rawProps.cellColor ?? '#374151',
+  1607→        cellPadding: rawProps.cellPadding ?? 8,
+  1608→        fontFamily: rawProps.fontFamily ?? 'Inter, sans-serif',
+  1609→        fontSize: rawProps.fontSize ?? 13,
+  1610→        rowBgColors: rawProps.rowBgColors ?? {},
+  1611→        colBgColors: rawProps.colBgColors ?? {},
+  1612→        borderWidth: rawProps.borderWidth ?? 1,
+  1613→        borderStyle: rawProps.borderStyle ?? 'solid',
+  1614→        borderColor: rawProps.borderColor ?? '#d1d5db',
+  1615→        showBorderTop: rawProps.showBorderTop ?? true,
+  1616→        showBorderRight: rawProps.showBorderRight ?? true,
+  1617→        showBorderBottom: rawProps.showBorderBottom ?? true,
+  1618→        showBorderLeft: rawProps.showBorderLeft ?? true,
+  1619→        showInnerBorders: rawProps.showInnerBorders ?? true,
+  1620→        cornerRadius: rawProps.cornerRadius ?? { mode: 'linked', all: 0, topLeft: 0, topRight: 0, bottomRight: 0, bottomLeft: 0 },
+  1621→        colWidths: rawProps.colWidths ?? Array(rawProps.cols ?? 3).fill(1),
+  1622→        rowHeights: rawProps.rowHeights ?? Array(rawProps.rows ?? 4).fill(1),
+  1623→        rowNames: rawProps.rowNames ?? Array.from({ length: rawProps.rows ?? 4 }, (_, i) => `Row ${i + 1}`),
+  1624→        colNames: rawProps.colNames ?? Array.from({ length: rawProps.cols ?? 3 }, (_, i) => `Column ${i + 1}`),
+  1625→        opacity: rawProps.opacity ?? 1,
+  1626→      };
+  1627→      const update = (updates: Partial<TableProperties>) => {
+  1628→        // Read latest data from store to avoid stale closure (e.g. after col/row resize)
+  1629→        const currentEl = useDesignerStore.getState().elements.find((el) => el.id === element.id);
+  1630→        const currentData = currentEl ? (currentEl.properties as { type: 'table'; data: TableProperties }).data : props;
+  1631→        updateElementProperties(element.id, { type: 'table', data: { ...currentData, ...updates } });
+  1632→      };
+  1633→      return (
+  1634→        <div className="space-y-2">
+  1635→          <CheckboxRow label="Show Header" checked={props.showHeader} onChange={(v) => update({ showHeader: v })} />
+  1636→          {props.showHeader && (
+  1637→            <>
+  1638→              <Field label="Header BG">
+  1639→                <ColorInput value={props.headerBg} onChange={(v) => update({ headerBg: v })} noDrag />
+  1640→              </Field>
+  1641→              <Field label="Header Color">
+  1642→                <ColorInput value={props.headerColor} onChange={(v) => update({ headerColor: v })} noDrag />
+  1643→              </Field>
+  1644→              <Field label="Header Weight">
+  1645→                <select data-no-drag value={props.headerFontWeight} onChange={(e) => update({ headerFontWeight: e.target.value })} className={selectCls}>
+  1646→                  <option value="normal">Normal</option>
+  1647→                  <option value="bold">Bold</option>
+  1648→                  <option value="lighter">Lighter</option>
+  1649→                  <option value="500">500</option>
+  1650→                  <option value="600">600</option>
+
+[showing lines 1101-1650 of 3265; use offset=1651 with limit to continue reading]

@@ -648,11 +648,17 @@ export const CanvasTextEditor = memo(function CanvasTextEditor({
         handleContentChangeRef.current(html);
       }, 300);
     },
-    onBlur: () => {
-      // Save immediately on blur (flush any pending debounce)
+    onBlur: ({ editor }) => {
+      // Save immediately on blur: flush any pending debounce instead of just
+      // clearing it. Blur fires when focus moves to the properties panel etc.
+      // — paths that never run exitEdit — so discarding the timer here would
+      // silently drop the last ≤300ms of typing from save/autosave/PDF export.
       if (debouncedSaveRef.current) {
         clearTimeout(debouncedSaveRef.current);
         debouncedSaveRef.current = null;
+        if (!editor.isDestroyed) {
+          handleContentChangeRef.current(editor.getHTML());
+        }
       }
     },
     immediatelyRender: false,

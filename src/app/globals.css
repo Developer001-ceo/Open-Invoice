@@ -1,15 +1,19 @@
+/* ─── Google Fonts catalog for the Text/Table font-family selectors ───────────
+   The families marked `google: true` in src/lib/fonts.ts are loaded once
+   globally via a <link> tag in src/app/layout.tsx so every canvas element,
+   floating card, properties panel dropdown, and PDF/html2canvas export renders
+   the chosen font for real (instead of falling back to the system font).
+   Web-safe fonts (Arial, Times New Roman, Courier New, etc.) are already
+   available on the user's OS. Weights 400 + 700 + italic 400 cover
+   normal/bold/italic synthesis for the display rendering; `display=swap`
+   avoids invisible-text flashes.
+   Keep the loading in layout.tsx: a remote `@import url(...)` here breaks the
+   Tailwind v4 + Turbopack CSS pipeline — placed after `@import "tailwindcss"`
+   it lands after the expanded tailwind rules and fails to parse; placed
+   before it, Turbopack silently drops it. */
+
 @import "tailwindcss";
 @import "tw-animate-css";
-
-/* ─── Google Fonts catalog for the Text/Table font-family selectors ───────────
-   Loaded once globally so every canvas element, floating card, properties panel
-   dropdown, and PDF/html2canvas export renders the chosen font for real (instead
-   of falling back to the system font). Only families marked `google: true` in
-   src/lib/fonts.ts need to be here; web-safe fonts (Arial, Times New Roman,
-   Courier New, etc.) are already available on the user's OS.
-   Weights 400 + 700 + italic 400 cover normal/bold/italic synthesis for the
-   display rendering. `display=swap` avoids invisible-text flashes. */
-@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&family=Open+Sans:wght@400;700&family=Lato:wght@400;700&family=Montserrat:wght@400;700&family=Poppins:wght@400;700&family=Nunito:wght@400;700&family=Raleway:wght@400;700&family=Source+Sans+3:wght@400;700&family=Work+Sans:wght@400;700&family=Oswald:wght@400;700&family=Barlow:wght@400;700&family=PT+Sans:wght@400;700&family=Rubik:wght@400;700&family=Quicksand:wght@400;700&family=Cormorant+Garamond:ital,wght@0,400;0,700;1,400&family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=Merriweather:ital,wght@0,400;0,700;1,400&family=Lora:ital,wght@0,400;0,700;1,400&family=PT+Serif:ital,wght@0,400;0,700;1,400&family=Source+Serif+4:ital,wght@0,400;0,700;1,400&family=EB+Garamond:ital,wght@0,400;0,700;1,400&family=Crimson+Text:ital,wght@0,400;0,700;1,400&family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&family=Roboto+Mono:wght@400;700&family=Source+Code+Pro:wght@400;700&family=JetBrains+Mono:wght@400;700&family=Fira+Code:wght@400;700&family=IBM+Plex+Mono:wght@400;700&family=Bebas+Neue&family=Anton&family=Archivo+Black&family=Righteous&family=Cinzel:wght@400;700&family=Abril+Fatface&family=Lobster&family=Pacifico&family=Caveat:wght@400;700&family=Dancing+Script:wght@400;700&family=Sacramento&family=Shadows+Into+Light&family=Kalam:wght@400;700&family=Satisfy&family=Cookie&family=Great+Vibes&display=swap');
 
 @custom-variant dark (&:is(.dark *));
 

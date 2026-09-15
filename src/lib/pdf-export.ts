@@ -850,6 +850,13 @@ export async function exportCanvasToPdf(
   document.body.appendChild(container);
 
   try {
+    // Wait for all web fonts (Google Fonts catalog) to finish loading before
+    // capture. The container is now in the document, so any font family it
+    // uses has started loading; without this wait, exporting soon after app
+    // load (or right after picking a not-yet-rendered font) silently captures
+    // the fallback system font into the PDF.
+    await document.fonts.ready;
+
     // ── Step 2: Capture with html2canvas at desired DPI ──
     const scale = options.dpi / 96;
 
@@ -877,8 +884,10 @@ export async function exportCanvasToPdf(
       scale,
       width: pageWidth,
       height: pageHeight,
+      // No allowTaint: it lets a non-CORS image taint the canvas, which makes
+      // the later toDataURL/addImage throw SecurityError. With useCORS alone,
+      // unloadable images are simply skipped instead of breaking the export.
       useCORS: true,
-      allowTaint: true,
       backgroundColor: pageBackgroundColor || '#ffffff',
       scrollX: 0,
       scrollY: 0,
@@ -958,9 +967,6 @@ export async function exportCanvasToPdf(
 
 /**
  * Render the canvas to an HTMLCanvasElement (bitmap) for preview.
- *
- * Uses OffscreenCanvas when available to avoid blocking the main thread.
- * Falls back to the same html2canvas pipeline for compatibility.
  */
 export async function renderCanvasPreview(
   elements: CanvasElement[],
@@ -992,41 +998,20 @@ export async function renderCanvasPreview(
   document.body.appendChild(container);
 
   try {
+    // Same font-wait as exportToPDF: never capture fallback fonts.
+    await document.fonts.ready;
+
     const htmlCanvas = await html2canvas(container, {
       scale,
       width: pageWidth,
       height: pageHeight,
       useCORS: true,
-      allowTaint: true,
       backgroundColor: pageBackgroundColor || '#ffffff',
       scrollX: 0,
       scrollY: 0,
       windowWidth: pageWidth,
       windowHeight: pageHeight,
     });
-
-    // If OffscreenCanvas is available, transfer to it for non-blocking usage
-    // This allows the caller to use the bitmap without blocking the main thread
-    if (typeof OffscreenCanvas !== 'undefined') {
-      try {
-        const offscreen = new OffscreenCanvas(htmlCanvas.width, htmlCanvas.height);
-        const ctx = offscreen.getContext('2d');
-        if (ctx) {
-          ctx.drawImage(htmlCanvas, 0, 0);
-          // Create a new visible canvas from the offscreen result
-          const resultCanvas = document.createElement('canvas');
-          resultCanvas.width = htmlCanvas.width;
-          resultCanvas.height = htmlCanvas.height;
-          const resultCtx = resultCanvas.getContext('2d');
-          if (resultCtx) {
-            resultCtx.drawImage(offscreen, 0, 0);
-            return resultCanvas;
-          }
-        }
-      } catch {
-        // OffscreenCanvas not supported or failed — fall through to return htmlCanvas
-      }
-    }
 
     return htmlCanvas;
   } finally {

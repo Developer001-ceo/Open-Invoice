@@ -4,6 +4,13 @@ import "./globals.css";
 import { Toaster } from "@/components/ui/toaster";
 import { NavbarStyles } from "@/components/designer/navbar-styles";
 
+// Google Fonts catalog for the Text/Table font-family selectors (`google: true`
+// entries in src/lib/fonts.ts — see the comment in globals.css). Loaded via
+// <link> because a remote @import url(...) in globals.css is dropped by the
+// Tailwind v4 + Turbopack CSS pipeline.
+const GOOGLE_FONTS_HREF =
+  "https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&family=Open+Sans:wght@400;700&family=Lato:wght@400;700&family=Montserrat:wght@400;700&family=Poppins:wght@400;700&family=Nunito:wght@400;700&family=Raleway:wght@400;700&family=Source+Sans+3:wght@400;700&family=Work+Sans:wght@400;700&family=Oswald:wght@400;700&family=Barlow:wght@400;700&family=PT+Sans:wght@400;700&family=Rubik:wght@400;700&family=Quicksand:wght@400;700&family=Cormorant+Garamond:ital,wght@0,400;0,700;1,400&family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=Merriweather:ital,wght@0,400;0,700;1,400&family=Lora:ital,wght@0,400;0,700;1,400&family=PT+Serif:ital,wght@0,400;0,700;1,400&family=Source+Serif+4:ital,wght@0,400;0,700;1,400&family=EB+Garamond:ital,wght@0,400;0,700;1,400&family=Crimson+Text:ital,wght@0,400;0,700;1,400&family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&family=Roboto+Mono:wght@400;700&family=Source+Code+Pro:wght@400;700&family=JetBrains+Mono:wght@400;700&family=Fira+Code:wght@400;700&family=IBM+Plex+Mono:wght@400;700&family=Bebas+Neue&family=Anton&family=Archivo+Black&family=Righteous&family=Cinzel:wght@400;700&family=Abril+Fatface&family=Lobster&family=Pacifico&family=Caveat:wght@400;700&family=Dancing+Script:wght@400;700&family=Sacramento&family=Shadows+Into+Light&family=Kalam:wght@400;700&family=Satisfy&family=Cookie&family=Great+Vibes&display=swap";
+
 const geistSans = Geist({
   variable: "--font-geist-sans",
   subsets: ["latin"],
@@ -64,6 +71,11 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" suppressHydrationWarning>
+      <head>
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
+        <link rel="stylesheet" href={GOOGLE_FONTS_HREF} />
+      </head>
       <body
         className={`${geistSans.variable} ${geistMono.variable} ${blackOpsOne.variable} ${inter.variable} antialiased bg-background text-foreground`}
         suppressHydrationWarning

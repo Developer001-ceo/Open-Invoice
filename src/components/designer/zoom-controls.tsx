@@ -101,7 +101,7 @@ export function ZoomControls({ viewportRef }: ZoomControlsProps) {
     <div data-tour="zoom-controls" className="flex items-center gap-1">
       {/* Zoom Level Controls */}
       <div className="flex items-center gap-1 bg-card border border-border rounded-lg px-1 py-0.5 shadow-sm">
-        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={handleZoomOut} title="Zoom out">
+        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={handleZoomOut} title="Zoom out" aria-label="Zoom out">
           <ZoomOut className="h-3.5 w-3.5" />
         </Button>
         <DropdownMenu>
@@ -123,11 +123,11 @@ export function ZoomControls({ viewportRef }: ZoomControlsProps) {
             ))}
           </DropdownMenuContent>
         </DropdownMenu>
-        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={handleZoomIn} title="Zoom in">
+        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={handleZoomIn} title="Zoom in" aria-label="Zoom in">
           <ZoomIn className="h-3.5 w-3.5" />
         </Button>
         <div className="w-px h-4 bg-border mx-0.5" />
-        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={handleFitToScreen} title="Fit to screen">
+        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={handleFitToScreen} title="Fit to screen" aria-label="Fit to screen">
           <Maximize className="h-3.5 w-3.5" />
         </Button>
       </div>

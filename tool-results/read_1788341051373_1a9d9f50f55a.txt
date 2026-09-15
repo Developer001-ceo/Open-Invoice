@@ -1,0 +1,702 @@
+     1→     1→'use client';
+     2→     2→
+     3→     3→import { useDesignerStore } from '@/store/designer-store';
+     4→     4→import { CanvasElementComponent } from './canvas-element';
+     5→     5→import { ElementType, CanvasElement, getRectRotation } from '@/lib/element-types';
+     6→     6→import { getResizeCursor } from '@/lib/resize-cursor';
+     7→     7→import { ZoomControls } from './zoom-controls';
+     8→     8→import { SnapControls } from './snap-controls';
+     9→     9→import { useCallback, useRef, useEffect, useState, useMemo } from 'react';
+    10→    10→import { AlignmentGuide } from '@/lib/snapping';
+    11→    11→import { Undo2, Redo2, Group, Ungroup, Scissors, Copy, ClipboardPaste, ClipboardCopy, Trash2 } from 'lucide-react';
+    12→    12→import { SpotlightOverlay } from './spotlight-overlay';
+    13→    13→import { PredefinedBlocksOverlay } from './predefined-blocks-overlay';
+    14→    14→import { FloatingCardsManager } from './floating-cards-manager';
+    15→    15→import { ShortcutsOverlay } from './shortcuts-overlay';
+    16→    16→
+    17→    17→const VIEWPORT_PADDING = 40;
+    18→    18→
+    19→    19→// ── Shift+S Keyboard Hint (Recommendation 4) ──────────────────────────────────
+    20→    20→// Shows a subtle hint near the bottom of the canvas when an element is selected.
+    21→    21→// Fades away permanently after the user uses Shift+S a few times.
+    22→    22→const MAX_HINT_DISPLAYS = 3; // Show hint for the first 3 element selections
+    23→    23→
+    24→    24→function ShiftSHint() {
+    25→    25→  const selectedElementIds = useDesignerStore((s) => s.selectedElementIds);
+    26→    26→  const spotlightHintShown = useDesignerStore((s) => s.spotlightHintShown);
+    27→    27→  const setSpotlightHintShown = useDesignerStore((s) => s.setSpotlightHintShown);
+    28→    28→  const spotlightOpen = useDesignerStore((s) => s.spotlightOpen);
+    29→    29→
+    30→    30→  const [visible, setVisible] = useState(false);
+    31→    31→  const [dismissed, setDismissed] = useState(false);
+    32→    32→  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    33→    33→  const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    34→    34→
+    35→    35→  const hasSelection = selectedElementIds.length > 0;
+    36→    36→  // Derive reset state: when no selection or spotlight is open, treat as dismissed
+    37→    37→  const isActive = hasSelection && !spotlightOpen;
+    38→    38→  // Dismissed only applies while active; effectively resets when selection is cleared
+    39→    39→  const effectiveDismissed = isActive && dismissed;
+    40→    40→  const shouldShow = isActive && spotlightHintShown < MAX_HINT_DISPLAYS && !effectiveDismissed;
+    41→    41→
+    42→    42→  useEffect(() => {
+    43→    43→    // Show hint when element is selected (if not already shown too many times)
+    44→    44→    if (shouldShow) {
+    45→    45→      // Small delay so it doesn't flash during quick selections
+    46→    46→      timerRef.current = setTimeout(() => {
+    47→    47→        setVisible(true);
+    48→    48→        setSpotlightHintShown(spotlightHintShown + 1);
+    49→    49→      }, 800);
+    50→    50→
+    51→    51→      // Auto-hide after 4 seconds
+    52→    52→      hideTimerRef.current = setTimeout(() => {
+    53→    53→        setVisible(false);
+    54→    54→        setDismissed(true);
+    55→    55→      }, 4800);
+    56→    56→
+    57→    57→      return () => {
+    58→    58→        if (timerRef.current) clearTimeout(timerRef.current);
+    59→    59→        if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
+    60→    60→      };
+    61→    61→    }
+    62→    62→  }, [shouldShow, spotlightHintShown, setSpotlightHintShown]);
+    63→    63→
+    64→    64→  if (!visible || spotlightOpen) return null;
+    65→    65→
+    66→    66→  return (
+    67→    67→    <div
+    68→    68→      className="absolute bottom-4 left-1/2 -translate-x-1/2 z-[9999] pointer-events-none"
+    69→    69→      style={{
+    70→    70→        opacity: visible ? 1 : 0,
+    71→    71→        transform: `translateX(-50%) translateY(${visible ? 0 : 8}px)`,
+    72→    72→        transition: 'opacity 400ms ease-out, transform 400ms ease-out',
+    73→    73→      }}
+    74→    74→    >
+    75→    75→      <div className="bg-card/90 backdrop-blur-sm border border-border/60 rounded-lg px-4 py-2 shadow-lg flex items-center gap-2">
+    76→    76→        <span className="text-xs text-muted-foreground">Press</span>
+    77→    77→        <kbd className="px-2 py-0.5 rounded bg-muted border border-border font-mono text-[11px] text-foreground font-medium">
+    78→    78→          Shift+S
+    79→    79→        </kbd>
+    80→    80→        <span className="text-xs text-muted-foreground">for quick properties</span>
+    81→    81→      </div>
+    82→    82→    </div>
+    83→    83→  );
+    84→    84→}
+    85→    85→
+    86→    86→export function Canvas() {
+    87→    87→  const elements = useDesignerStore((s) => s.elements);
+    88→    88→  const zoom = useDesignerStore((s) => s.zoom);
+    89→    89→  const panX = useDesignerStore((s) => s.panX);
+    90→    90→  const panY = useDesignerStore((s) => s.panY);
+    91→    91→  const isAutoPanning = useDesignerStore((s) => s.isAutoPanning);
+    92→    92→  // Select individual canvas settings to avoid object reference changes
+    93→    93→  const pageWidth = useDesignerStore((s) => s.canvasSettings.pageWidth);
+    94→    94→  const pageHeight = useDesignerStore((s) => s.canvasSettings.pageHeight);
+    95→    95→  const pageBackgroundColor = useDesignerStore((s) => s.canvasSettings.pageBackgroundColor);
+    96→    96→  const marginTop = useDesignerStore((s) => s.canvasSettings.marginTop);
+    97→    97→  const marginBottom = useDesignerStore((s) => s.canvasSettings.marginBottom);
+    98→    98→  const marginLeft = useDesignerStore((s) => s.canvasSettings.marginLeft);
+    99→    99→  const marginRight = useDesignerStore((s) => s.canvasSettings.marginRight);
+   100→   100→  const marginShow = useDesignerStore((s) => s.canvasSettings.marginGuideline.show);
+   101→   101→  const marginColor = useDesignerStore((s) => s.canvasSettings.marginGuideline.color);
+   102→   102→  const marginThickness = useDesignerStore((s) => s.canvasSettings.marginGuideline.thickness);
+   103→   103→  const marginStyle = useDesignerStore((s) => s.canvasSettings.marginGuideline.style);
+   104→   104→  const marginOpacity = useDesignerStore((s) => s.canvasSettings.marginGuideline.opacity);
+   105→   105→
+   106→   106→  const isPanning = useDesignerStore((s) => s.isPanning);
+   107→   107→  const isDragging = useDesignerStore((s) => s.isDragging);
+   108→   108→  const isGroupChildDragging = useDesignerStore((s) => s.isGroupChildDragging);
+   109→   109→  const isSelecting = useDesignerStore((s) => s.isSelecting);
+   110→   110→  const selectionRect = useDesignerStore((s) => s.selectionRect);
+   111→   111→  const alignmentGuidelines = useDesignerStore((s) => s.alignmentGuidelines);
+   112→   112→  const angleSnapInfo = useDesignerStore((s) => s.angleSnapInfo);
+   113→   113→  const selectedElementId = useDesignerStore((s) => s.selectedElementId);
+   114→   114→  const selectedElementIds = useDesignerStore((s) => s.selectedElementIds);
+   115→   115→  const findElementById = useDesignerStore((s) => s.findElementById);
+   116→   116→  const editingGroupId = useDesignerStore((s) => s.editingGroupId);
+   117→   117→  const contextMenu = useDesignerStore((s) => s.contextMenu);
+   118→   118→  const canUndo = useDesignerStore((s) => s.canUndo);
+   119→   119→  const canRedo = useDesignerStore((s) => s.canRedo);
+   120→   120→  const undo = useDesignerStore((s) => s.undo);
+   121→   121→  const redo = useDesignerStore((s) => s.redo);
+   122→   122→  const altHeld = useDesignerStore((s) => s.altHeld);
+   123→   123→  const selectedTableCells = useDesignerStore((s) => s.selectedTableCells);
+   124→   124→  // Active resize / corner-drag state — used to lock the cursor to the resize
+   125→   125→  // arrow for the entire drag (not just while hovering the small handle), so
+   126→   126→  // the cursor doesn't flicker between the resize arrow and the move/default
+   127→   127→  // cursor as the mouse drifts off the handle onto the element body or canvas.
+   128→   128→  const isResizing = useDesignerStore((s) => s.isResizing);
+   129→   129→  const isCornerDragging = useDesignerStore((s) => s.isCornerDragging);
+   130→   130→  const resizeHandle = useDesignerStore((s) => s.resizeHandle);
+   131→   131→  const draggingCornerIndex = useDesignerStore((s) => s.draggingCornerIndex);
+   132→   132→  // Note: addElement, groupSelected, ungroupSelected, enterGroup, exitGroup,
+   133→   133→  // setContextMenu, clearContextMenu, canGroup, canUngroup are accessed via
+   134→   134→  // getState() in event handlers to avoid unnecessary re-renders.
+   135→   135→
+   136→   136→  const viewportRef = useRef<HTMLDivElement>(null);
+   137→   137→  const isReadyRef = useRef(false);
+   138→   138→  const [spacePressed, setSpacePressed] = useState(false);
+   139→   139→  const arrowKeyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+   140→   140→  const lastMouseRef = useRef<{ x: number; y: number } | null>(null);
+   141→   141→  // Tracks whether panning was initiated by spacebar (vs. middle-click).
+   142→   142→  // Space-panning should continue until spacebar is released, not on mouseup.
+   143→   143→  const spacePanningRef = useRef(false);
+   144→   144→  // Synchronous mirror of spacePressed — avoids React re-render delay for
+   145→   145→  // critical panning logic that must respond within the same event cycle.
+   146→   146→  const spacePressedRef = useRef(false);
+   147→   147→
+   148→   148→  // Stores the pointerId from the most recent pointerdown on the viewport.
+   149→   149→  // Used to set pointer capture after startSelection is called in handleMouseDown,
+   150→   150→  // ensuring reliable pointermove delivery during fast drag-to-select operations.
+   151→   151→  const lastPointerIdRef = useRef<number | null>(null);
+   152→   152→
+   153→   153→  // ── Cursor lock during active resize / corner-drag ─────────────────────────
+   154→   154→  // While the user is dragging a resize handle (isResizing) or an individual
+   155→   155→  // corner point (isCornerDragging), lock the cursor to the matching resize
+   156→   156→  // arrow for the ENTIRE drag — not just while hovering the small handle. This
+   157→   157→  // prevents the cursor from flickering between the resize arrow and the
+   158→   158→  // move/default cursor as the mouse drifts off the handle onto the element
+   159→   159→  // body or the canvas. The cursor is computed from the active handle + the
+   160→   160→  // selected rectangle's rotation, so it matches the handle's visual direction.
+   161→   161→  const activeResizeCursor = useMemo(() => {
+   162→   162→    if (isResizing && resizeHandle) {
+   163→   163→      const el = findElementById(selectedElementId ?? '');
+   164→   164→      const rotation = el && el.type === 'rectangle' ? getRectRotation(el) : 0;
+   165→   165→      return getResizeCursor(resizeHandle, rotation);
+   166→   166→    }
+   167→   167→    if (isCornerDragging && draggingCornerIndex !== null) {
+   168→   168→      // Corner-drag uses the same handle layout as resize (nw/ne/se/sw). The
+   169→   169→      // cursor reflects the dragged corner's direction so the user sees which
+   170→   170→      // way the corner is free to move.
+   171→   171→      const handlePos = (['nw', 'ne', 'se', 'sw'] as const)[draggingCornerIndex];
+   172→   172→      const el = findElementById(selectedElementId ?? '');
+   173→   173→      const rotation = el && el.type === 'rectangle' ? getRectRotation(el) : 0;
+   174→   174→      return getResizeCursor(handlePos, rotation);
+   175→   175→    }
+   176→   176→    return null;
+   177→   177→  }, [isResizing, isCornerDragging, resizeHandle, draggingCornerIndex, selectedElementId, findElementById, elements]);
+   178→   178→
+   179→   179→  // Apply the locked cursor globally so it persists everywhere the mouse goes
+   180→   180→  // during the drag — including off the handle, off the element body, off the
+   181→   181→  // canvas viewport (over panels/menus), and even off the browser window. A
+   182→   182→  // dynamically-injected <style> rule with `* { cursor: ... !important }` is
+   183→   183→  // used so it overrides EVERY competing cursor rule (handle inline styles,
+   184→   184→  // element `cursor-move` classes, panel cursors, etc.) — this is what
+   185→   185→  // eliminates the flicker. The rule is removed on drag end so normal
+   186→   186→  // per-element cursors resume.
+   187→   187→  useEffect(() => {
+   188→   188→    if (activeResizeCursor) {
+   189→   189→      const styleId = 'active-resize-cursor-lock';
+   190→   190→      let styleEl = document.getElementById(styleId) as HTMLStyleElement | null;
+   191→   191→      if (!styleEl) {
+   192→   192→        styleEl = document.createElement('style');
+   193→   193→        styleEl.id = styleId;
+   194→   194→        document.head.appendChild(styleEl);
+   195→   195→      }
+   196→   196→      // `*` selector + !important overrides all element-level cursor rules.
+   197→   197→      // We also set body directly as a belt-and-suspenders for browsers that
+   198→   198→      // ignore the `*` rule on the root element.
+   199→   199→      styleEl.textContent = `* { cursor: ${activeResizeCursor} !important; }`;
+   200→   200→      document.body.style.cursor = activeResizeCursor;
+   201→   201→      return () => {
+   202→   202→        if (styleEl.parentNode) styleEl.parentNode.removeChild(styleEl);
+   203→   203→        document.body.style.cursor = '';
+   204→   204→      };
+   205→   205→    }
+   206→   206→  }, [activeResizeCursor]);
+   207→   207→
+   208→   208→  // When spacebar is pressed, automatically start panning at the last known
+   209→   209→  // mouse position. When released, stop space-panning. This allows the user
+   210→   210→  // to pan by simply holding space and moving the mouse/touchpad — no click
+   211→   211→  // required.
+   212→   212→  // NOTE: The keydown/keyup handlers now start/stop panning SYNCHRONOUSLY
+   213→   213→  // (via refs) for zero-delay response. This useEffect is a safety net that
+   214→   214→  // ensures the React state and refs stay in sync.
+   215→   215→  useEffect(() => {
+   216→   216→    if (spacePressed) {
+   217→   217→      // If the keydown handler didn't already start panning (shouldn't happen,
+   218→   218→      // but just in case), start it here.
+   219→   219→      if (!spacePanningRef.current) {
+   220→   220→        spacePanningRef.current = true;
+   221→   221→        const pos = lastMouseRef.current;
+   222→   222→        if (pos) {
+   223→   223→          useDesignerStore.getState().startPanning(pos.x, pos.y);
+   224→   224→        }
+   225→   225→      }
+   226→   226→    } else {
+   227→   227→      // Stop space-panning when spacebar is released (safety net — keyup
+   228→   228→      // handler already does this synchronously)
+   229→   229→      if (spacePanningRef.current) {
+   230→   230→        if (panRafRef.current) {
+   231→   231→          cancelAnimationFrame(panRafRef.current);
+   232→   232→          panRafRef.current = null;
+   233→   233→        }
+   234→   234→        if (panCoordsRef.current) {
+   235→   235→          useDesignerStore.getState().updatePan(panCoordsRef.current.x, panCoordsRef.current.y);
+   236→   236→          panCoordsRef.current = null;
+   237→   237→        }
+   238→   238→        useDesignerStore.getState().stopPanning();
+   239→   239→        spacePanningRef.current = false;
+   240→   240→      }
+   241→   241→    }
+   242→   242→  }, [spacePressed]);
+   243→   243→
+   244→   244→  // Center/re-center the page when dimensions change
+   245→   245→  const prevSizeRef = useRef({ w: pageWidth, h: pageHeight });
+   246→   246→  // Ref to hold RAF cleanup functions for the fit-on-mount effect
+   247→   247→  const rafRefCleanup = useRef<(() => void) | null>(null);
+   248→   248→
+   249→   249→  useEffect(() => {
+   250→   250→    const viewport = viewportRef.current;
+   251→   251→    if (!viewport) return;
+   252→   252→
+   253→   253→    const sizeChanged =
+   254→   254→      prevSizeRef.current.w !== pageWidth ||
+   255→   255→      prevSizeRef.current.h !== pageHeight;
+   256→   256→
+   257→   257→    if (!sizeChanged && isReadyRef.current) return;
+   258→   258→
+   259→   259→    // Use double-rAF so the viewport has its FINAL dimensions before we compute
+   260→   260→    // the fit. On initial mount (and especially on reload), the properties panel
+   261→   261→    // animates its width from 0 → 288px, so a synchronous clientWidth read gives
+   262→   262→    // the wrong value. Waiting two frames ensures the layout has settled.
+   263→   263→    const fit = () => {
+   264→   264→      const vp = viewportRef.current;
+   265→   265→      if (!vp) return;
+   266→   266→      useDesignerStore.getState().fitToPage(vp.clientWidth, vp.clientHeight);
+   267→   267→      prevSizeRef.current = { w: pageWidth, h: pageHeight };
+   268→   268→      isReadyRef.current = true;
+   269→   269→    };
+   270→   270→    const raf1 = requestAnimationFrame(() => {
+   271→   271→      const raf2 = requestAnimationFrame(fit);
+   272→   272→      rafRefCleanup.current = () => cancelAnimationFrame(raf2);
+   273→   273→    });
+   274→   274→    rafRefCleanup.current = () => cancelAnimationFrame(raf1);
+   275→   275→
+   276→   276→    return () => {
+   277→   277→      if (rafRefCleanup.current) rafRefCleanup.current();
+   278→   278→    };
+   279→   279→  }, [pageWidth, pageHeight]);
+   280→   280→
+   281→   281→  // ResizeObserver: re-fit the page when the viewport's actual size changes
+   282→   282→  // during the initial mount settling period (e.g. when the properties panel
+   283→   283→  // finishes its width animation). After the settling period, viewport resizes
+   284→   284→  // (like window resize) don't override the user's zoom/pan.
+   285→   285→  const hasObservedResizeRef = useRef(false);
+   286→   286→  const settlingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+   287→   287→  const isSettlingRef = useRef(true);
+   288→   288→  useEffect(() => {
+   289→   289→    const viewport = viewportRef.current;
+   290→   290→    if (!viewport) return;
+   291→   291→    // After 1.5s, stop re-fitting on viewport resize (user is in control now)
+   292→   292→    settlingTimerRef.current = setTimeout(() => { isSettlingRef.current = false; }, 1500);
+   293→   293→    const observer = new ResizeObserver(() => {
+   294→   294→      if (!isSettlingRef.current) return;
+   295→   295→      // Skip the very first observation (it fires on mount with the initial size)
+   296→   296→      if (!hasObservedResizeRef.current) {
+   297→   297→        hasObservedResizeRef.current = true;
+   298→   298→        return;
+   299→   299→      }
+   300→   300→      const st = useDesignerStore.getState();
+   301→   301→      const vp = viewportRef.current;
+   302→   302→      if (!vp) return;
+   303→   303→      st.fitToPage(vp.clientWidth, vp.clientHeight);
+   304→   304→    });
+   305→   305→    observer.observe(viewport);
+   306→   306→    return () => {
+   307→   307→      observer.disconnect();
+   308→   308→      if (settlingTimerRef.current) clearTimeout(settlingTimerRef.current);
+   309→   309→    };
+   310→   310→  }, []);
+   311→   311→
+   312→   312→  // RAF-throttled panning: coalesce updatePan calls to once per animation frame
+   313→   313→  const panRafRef = useRef<number | null>(null);
+   314→   314→  const panCoordsRef = useRef<{ x: number; y: number } | null>(null);
+   315→   315→  const flushPanRef = useRef(() => {});
+   316→   316→  flushPanRef.current = () => {
+   317→   317→    const raf = panRafRef.current;
+   318→   318→    const coords = panCoordsRef.current;
+   319→   319→    panRafRef.current = null;
+   320→   320→    panCoordsRef.current = null;
+   321→   321→    if (raf) cancelAnimationFrame(raf);
+   322→   322→    if (coords) {
+   323→   323→      useDesignerStore.getState().updatePan(coords.x, coords.y);
+   324→   324→    }
+   325→   325→  };
+   326→   326→
+   327→   327→  // RAF-throttled selection: coalesce updateSelection calls to once per animation frame
+   328→   328→  // for smooth drag-to-highlight without lag or jitter.
+   329→   329→  const selRafRef = useRef<number | null>(null);
+   330→   330→  const selCoordsRef = useRef<{ canvasX: number; canvasY: number } | null>(null);
+   331→   331→  const flushSelRef = useRef(() => {});
+   332→   332→  flushSelRef.current = () => {
+   333→   333→    const raf = selRafRef.current;
+   334→   334→    const coords = selCoordsRef.current;
+   335→   335→    selRafRef.current = null;
+   336→   336→    selCoordsRef.current = null;
+   337→   337→    if (raf) cancelAnimationFrame(raf);
+   338→   338→    if (coords) {
+   339→   339→      useDesignerStore.getState().updateSelection(coords.canvasX, coords.canvasY);
+   340→   340→    }
+   341→   341→  };
+   342→   342→
+   343→   343→  // RAF throttling for rectangle corner drag — prevents the store update +
+   344→   344→  // React re-render from blocking the main thread during fast mouse movement.
+   345→   345→  // Only the latest mouse position is processed per animation frame.
+   346→   346→  const cornerRafRef = useRef<number | null>(null);
+   347→   347→  const cornerCoordsRef = useRef<{ x: number; y: number } | null>(null);
+   348→   348→  const flushCornerRef = useRef(() => {});
+   349→   349→  flushCornerRef.current = () => {
+   350→   350→    const raf = cornerRafRef.current;
+   351→   351→    const coords = cornerCoordsRef.current;
+   352→   352→    cornerRafRef.current = null;
+   353→   353→    cornerCoordsRef.current = null;
+   354→   354→    if (raf) cancelAnimationFrame(raf);
+   355→   355→    if (coords) {
+   356→   356→      const s = useDesignerStore.getState();
+   357→   357→      if (s.isCornerDragging) {
+   358→   358→        s.updateCornerDrag(coords.x, coords.y, s.shiftHeld, s.ctrlHeld);
+   359→   359→      }
+   360→   360→    }
+   361→   361→  };
+   362→   362→
+   363→   363→  // Handle global mouse events
+   364→   364→  // IMPORTANT: We use getState() inside handlers for zoom/panX/panY to avoid
+   365→   365→  // re-registering listeners on every pan/zoom change, which caused an infinite
+   366→   366→  // re-render cycle (pan changes → effect re-registers → next mousemove → pan changes → ...)
+   367→   367→  useEffect(() => {
+   368→   368→    const handleMouseMove = (e: MouseEvent) => {
+   369→   369→      // Read latest state from store to avoid stale closures
+   370→   370→      const state = useDesignerStore.getState();
+   371→   371→
+   372→   372→      // When actively selecting, we MUST process ALL mousemove events so we can
+   373→   373→      // clamp the cursor to the viewport boundary — even when the cursor moves
+   374→   374→      // over panels during fast drags.  Skip the panel/input guards for selection.
+   375→   375→      // The same applies to any in-progress canvas operation (corner drag, move,
+   376→   376→      // resize, endpoint drag, table resize, group-child drag/resize): once the
+   377→   377→      // user has started the gesture on the canvas, the cursor will often sweep
+   378→   378→      // across the properties/left panel at high speed — if we `return` here the
+   379→   379→      // operation freezes mid-drag and only resumes when the cursor re-enters
+   380→   380→      // the canvas, which is the "stuck until I release" symptom. Bypass the
+   381→   381→      // panel/input guards for the duration of any active gesture.
+   382→   382→      const hasActiveGesture =
+   383→   383→        state.isSelecting ||
+   384→   384→        state.isCornerDragging ||
+   385→   385→        state.isDragging ||
+   386→   386→        state.isResizing ||
+   387→   387→        state.isEndpointDragging ||
+   388→   388→        state.isGroupChildDragging ||
+   389→   389→        state.isGroupChildResizing ||
+   390→   390→        state.isTableColResizing ||
+   391→   391→        state.isTableRowResizing ||
+   392→   392→        state.isPanning;
+   393→   393→      if (!hasActiveGesture) {
+   394→   394→        // Skip if user is interacting with a UI control outside the canvas
+   395→   395→        // (e.g., sliders, inputs, color pickers in the properties panel)
+   396→   396→        const target = e.target as HTMLElement;
+   397→   397→        if (target?.closest?.('[data-ui-panel]')) return;
+   398→   398→        if (target?.tagName === 'INPUT' || target?.tagName === 'SELECT' || target?.tagName === 'TEXTAREA') return;
+   399→   399→      }
+   400→   400→
+   401→   401→      // Space-panning: if spacebar is held but panning hasn't started yet
+   402→   402→      // (e.g., mouse wasn't over canvas when space was pressed), start now.
+   403→   403→      if (spacePanningRef.current && !state.isPanning) {
+   404→   404→        state.startPanning(e.clientX, e.clientY);
+   405→   405→      }
+   406→   406→
+   407→   407→      if (state.isPanning) {
+   408→   408→        // Throttle updatePan with RAF to avoid excessive state updates during panning
+   409→   409→        panCoordsRef.current = { x: e.clientX, y: e.clientY };
+   410→   410→        if (!panRafRef.current) {
+   411→   411→          panRafRef.current = requestAnimationFrame(() => flushPanRef.current());
+   412→   412→        }
+   413→   413→      }
+   414→   414→      if (state.isDragging) {
+   415→   415→        state.updateDrag(e.clientX, e.clientY);
+   416→   416→      }
+   417→   417→      if (state.isGroupChildDragging) {
+   418→   418→        state.updateGroupChildDrag(e.clientX, e.clientY);
+   419→   419→      }
+   420→   420→      if (state.isGroupChildResizing) {
+   421→   421→        state.updateGroupChildResize(e.clientX, e.clientY);
+   422→   422→      }
+   423→   423→      if (state.isResizing) {
+   424→   424→        state.updateResize(e.clientX, e.clientY);
+   425→   425→      }
+   426→   426→      if (state.isTableColResizing || state.isTableRowResizing) {
+   427→   427→        state.updateTableResize(e.clientX, e.clientY);
+   428→   428→        return;
+   429→   429→      }
+   430→   430→      if (state.isEndpointDragging) {
+   431→   431→        lastMouseRef.current = { x: e.clientX, y: e.clientY };
+   432→   432→        state.updateEndpointDrag(e.clientX, e.clientY, e.shiftKey);
+   433→   433→      }
+   434→   434→      if (state.isCornerDragging) {
+   435→   435→        lastMouseRef.current = { x: e.clientX, y: e.clientY };
+   436→   436→        // RAF-throttle: store the latest mouse position and process at most
+   437→   437→        // once per animation frame. This prevents fast mouse movement from
+   438→   438→        // queuing up stale store updates that cause visual lag.
+   439→   439→        cornerCoordsRef.current = { x: e.clientX, y: e.clientY };
+   440→   440→        if (!cornerRafRef.current) {
+   441→   441→          cornerRafRef.current = requestAnimationFrame(() => flushCornerRef.current());
+   442→   442→        }
+   443→   443→      }
+   444→   444→      if (state.isSelecting) {
+   445→   445→        // Clamp cursor to viewport boundaries so the selection rectangle
+   446→   446→        // never leaves the workspace area (between panels/menus).
+   447→   447→        const viewport = viewportRef.current;
+   448→   448→        if (!viewport) return;
+   449→   449→        const rect = viewport.getBoundingClientRect();
+   450→   450→        const clampedX = Math.max(rect.left, Math.min(e.clientX, rect.right));
+   451→   451→        const clampedY = Math.max(rect.top, Math.min(e.clientY, rect.bottom));
+   452→   452→        const canvasX = (clampedX - rect.left) / state.zoom - state.panX;
+   453→   453→        const canvasY = (clampedY - rect.top) / state.zoom - state.panY;
+   454→   454→        // RAF-throttle selection updates for smooth performance
+   455→   455→        selCoordsRef.current = { canvasX, canvasY };
+   456→   456→        if (!selRafRef.current) {
+   457→   457→          selRafRef.current = requestAnimationFrame(() => flushSelRef.current());
+   458→   458→        }
+   459→   459→      }
+   460→   460→    };
+   461→   461→
+   462→   462→    const flushPendingSelection = () => {
+   463→   463→      if (selRafRef.current) {
+   464→   464→        cancelAnimationFrame(selRafRef.current);
+   465→   465→        selRafRef.current = null;
+   466→   466→      }
+   467→   467→      if (selCoordsRef.current) {
+   468→   468→        useDesignerStore.getState().updateSelection(selCoordsRef.current.canvasX, selCoordsRef.current.canvasY);
+   469→   469→        selCoordsRef.current = null;
+   470→   470→      }
+   471→   471→    };
+   472→   472→
+   473→   473→    const handleMouseUp = () => {
+   474→   474→      // Flush any pending pan update before stopping
+   475→   475→      if (panRafRef.current) {
+   476→   476→        cancelAnimationFrame(panRafRef.current);
+   477→   477→        panRafRef.current = null;
+   478→   478→      }
+   479→   479→      if (panCoordsRef.current) {
+   480→   480→        useDesignerStore.getState().updatePan(panCoordsRef.current.x, panCoordsRef.current.y);
+   481→   481→        panCoordsRef.current = null;
+   482→   482→      }
+   483→   483→
+   484→   484→      // Flush any pending selection update before finishing
+   485→   485→      flushPendingSelection();
+   486→   486→
+   487→   487→      const state = useDesignerStore.getState();
+   488→   488→      // Don't stop panning on mouseup if space-panning is active —
+   489→   489→      // space-panning should only stop when the spacebar is released.
+   490→   490→      if (state.isPanning && !spacePanningRef.current) state.stopPanning();
+   491→   491→      if (state.isDragging) state.stopDragging();
+   492→   492→      if (state.isGroupChildDragging) state.stopGroupChildDrag();
+   493→   493→      if (state.isGroupChildResizing) state.stopGroupChildResize();
+   494→   494→      if (state.isResizing) state.stopResizing();
+   495→   495→      if (state.isTableColResizing || state.isTableRowResizing) {
+   496→   496→        state.stopTableResize();
+   497→   497→        return;
+   498→   498→      }
+   499→   499→      if (state.isEndpointDragging) state.stopEndpointDrag();
+   500→   500→      // Flush any pending corner-drag RAF before stopping so the final
+   501→   501→      // mouse position is applied before the drag state is cleared.
+   502→   502→      if (cornerRafRef.current) {
+   503→   503→        cancelAnimationFrame(cornerRafRef.current);
+   504→   504→        cornerRafRef.current = null;
+   505→   505→      }
+   506→   506→      if (cornerCoordsRef.current) {
+   507→   507→        const { x: cx, y: cy } = cornerCoordsRef.current;
+   508→   508→        cornerCoordsRef.current = null;
+   509→   509→        const cs = useDesignerStore.getState();
+   510→   510→        if (cs.isCornerDragging) cs.updateCornerDrag(cx, cy, cs.shiftHeld, cs.ctrlHeld);
+   511→   511→      }
+   512→   512→      if (state.isCornerDragging) state.stopCornerDrag();
+   513→   513→      if (state.isSelecting) state.finishSelection();
+   514→   514→      // Finish Alt+drag cell selection if active
+   515→   515→      if (state.isTableCellSelecting) state.finishTableCellSelecting();
+   516→   516→    };
+   517→   517→
+   518→   518→    // Also listen for pointerup as a safety net: when the custom Slider
+   519→   519→    // component calls preventDefault() on pointerdown, the browser will
+   520→   520→    // NOT dispatch compatibility mouseup events per the Pointer Events spec.
+   521→   521→    // Adding a pointerup listener ensures canvas operations are always
+   522→   522→    // properly stopped when the user releases the mouse.
+   523→   523→    const handlePointerUp = () => {
+   524→   524→      // Flush any pending pan update before stopping
+   525→   525→      if (panRafRef.current) {
+   526→   526→        cancelAnimationFrame(panRafRef.current);
+   527→   527→        panRafRef.current = null;
+   528→   528→      }
+   529→   529→      if (panCoordsRef.current) {
+   530→   530→        useDesignerStore.getState().updatePan(panCoordsRef.current.x, panCoordsRef.current.y);
+   531→   531→        panCoordsRef.current = null;
+   532→   532→      }
+   533→   533→
+   534→   534→      // Flush any pending selection update before finishing
+   535→   535→      if (selRafRef.current) {
+   536→   536→        cancelAnimationFrame(selRafRef.current);
+   537→   537→        selRafRef.current = null;
+   538→   538→      }
+   539→   539→      if (selCoordsRef.current) {
+   540→   540→        useDesignerStore.getState().updateSelection(selCoordsRef.current.canvasX, selCoordsRef.current.canvasY);
+   541→   541→        selCoordsRef.current = null;
+   542→   542→      }
+   543→   543→
+   544→   544→      const state = useDesignerStore.getState();
+   545→   545→      // Don't stop panning on pointerup if space-panning is active —
+   546→   546→      // space-panning should only stop when the spacebar is released.
+   547→   547→      if (state.isPanning && !spacePanningRef.current) state.stopPanning();
+   548→   548→      if (state.isDragging) state.stopDragging();
+   549→   549→      if (state.isGroupChildDragging) state.stopGroupChildDrag();
+   550→   550→      if (state.isGroupChildResizing) state.stopGroupChildResize();
+   551→   551→      if (state.isResizing) state.stopResizing();
+   552→   552→      if (state.isTableColResizing || state.isTableRowResizing) {
+   553→   553→        state.stopTableResize();
+   554→   554→        return;
+   555→   555→      }
+   556→   556→      if (state.isEndpointDragging) state.stopEndpointDrag();
+   557→   557→      // Flush any pending corner-drag RAF before stopping so the final
+   558→   558→      // mouse position is applied before the drag state is cleared.
+   559→   559→      if (cornerRafRef.current) {
+   560→   560→        cancelAnimationFrame(cornerRafRef.current);
+   561→   561→        cornerRafRef.current = null;
+   562→   562→      }
+   563→   563→      if (cornerCoordsRef.current) {
+   564→   564→        const { x: cx, y: cy } = cornerCoordsRef.current;
+   565→   565→        cornerCoordsRef.current = null;
+   566→   566→        const cs = useDesignerStore.getState();
+   567→   567→        if (cs.isCornerDragging) cs.updateCornerDrag(cx, cy, cs.shiftHeld, cs.ctrlHeld);
+   568→   568→      }
+   569→   569→      if (state.isCornerDragging) state.stopCornerDrag();
+   570→   570→      if (state.isSelecting) state.finishSelection();
+   571→   571→      // Finish Alt+drag cell selection if active
+   572→   572→      if (state.isTableCellSelecting) state.finishTableCellSelecting();
+   573→   573→    };
+   574→   574→
+   575→   575→    window.addEventListener('mousemove', handleMouseMove, { passive: true });
+   576→   576→    window.addEventListener('mouseup', handleMouseUp);
+   577→   577→    window.addEventListener('pointerup', handlePointerUp);
+   578→   578→    return () => {
+   579→   579→      window.removeEventListener('mousemove', handleMouseMove);
+   580→   580→      window.removeEventListener('mouseup', handleMouseUp);
+   581→   581→      window.removeEventListener('pointerup', handlePointerUp);
+   582→   582→      // Clean up any pending RAF on unmount
+   583→   583→      if (panRafRef.current) {
+   584→   584→        cancelAnimationFrame(panRafRef.current);
+   585→   585→        panRafRef.current = null;
+   586→   586→      }
+   587→   587→      if (selRafRef.current) {
+   588→   588→        cancelAnimationFrame(selRafRef.current);
+   589→   589→        selRafRef.current = null;
+   590→   590→      }
+   591→   591→    };
+   592→   592→  }, []); // flushPanRef is a stable ref — no deps needed
+   593→   593→
+   594→   594→  // ── Pointer capture for reliable selection tracking ──────────────────────────
+   595→   595→  // When the user starts a rubber-band selection, we capture the pointer on the
+   596→   596→  // viewport element. This ensures ALL subsequent pointermove / pointerup events
+   597→   597→  // are delivered to the viewport — even when the cursor moves outside the viewport
+   598→   598→  // (over panels, menus, or even outside the browser window). Combined with cursor
+   599→   599→  // clamping, this guarantees the selection rectangle never leaves the workspace.
+   600→   600→  useEffect(() => {
+   601→   601→    const viewport = viewportRef.current;
+   602→   602→    if (!viewport) return;
+   603→   603→
+   604→   604→    const handlePointerDown = (e: PointerEvent) => {
+   605→   605→      // Store the pointerId so handleMouseDown can capture the pointer
+   606→   606→      // after it determines this click should start a selection.
+   607→   607→      if (e.button === 0) {
+   608→   608→        lastPointerIdRef.current = e.pointerId;
+   609→   609→      }
+   610→   610→
+   611→   611→      // When spacebar is held, prevent the browser's default gesture
+   612→   612→      // disambiguation (tap vs drag vs scroll) which causes a ~1s delay
+   613→   613→      // on touchpads before pointermove events are dispatched.
+   614→   614→      if (spacePanningRef.current) {
+   615→   615→        e.preventDefault();
+   616→   616→      }
+   617→   617→    };
+   618→   618→
+   619→   619→    const handleViewportPointerMove = (e: PointerEvent) => {
+   620→   620→      const state = useDesignerStore.getState();
+   621→   621→
+   622→   622→      // ── Space-panning via pointermove (touchpad fix) ────────────────────
+   623→   623→      // On touchpads, mousemove events may be delayed by ~1 second after
+   624→   624→      // keyboard input due to browser gesture disambiguation. Pointermove
+   625→   625→      // events are dispatched immediately, so we handle space-panning here
+   626→   626→      // as well to eliminate the touchpad delay.
+   627→   627→      if (spacePanningRef.current) {
+   628→   628→        if (!state.isPanning) {
+   629→   629→          state.startPanning(e.clientX, e.clientY);
+   630→   630→        } else {
+   631→   631→          panCoordsRef.current = { x: e.clientX, y: e.clientY };
+   632→   632→          if (!panRafRef.current) {
+   633→   633→            panRafRef.current = requestAnimationFrame(() => flushPanRef.current());
+   634→   634→          }
+   635→   635→        }
+   636→   636→      }
+   637→   637→
+   638→   638→      if (!state.isSelecting) return;
+   639→   639→
+   640→   640→      // Clamp cursor to viewport boundaries so the selection rectangle
+   641→   641→      // never leaves the workspace area.
+   642→   642→      const rect = viewport.getBoundingClientRect();
+   643→   643→      const clampedX = Math.max(rect.left, Math.min(e.clientX, rect.right));
+   644→   644→      const clampedY = Math.max(rect.top, Math.min(e.clientY, rect.bottom));
+   645→   645→      const canvasX = (clampedX - rect.left) / state.zoom - state.panX;
+   646→   646→      const canvasY = (clampedY - rect.top) / state.zoom - state.panY;
+   647→   647→
+   648→   648→      // RAF-throttle selection updates for smooth performance.
+   649→   649→      // This shares the same selCoordsRef / selRafRef as the window-level
+   650→   650→      // mousemove handler, so double-writes are harmless — last write wins.
+   651→   651→      selCoordsRef.current = { canvasX, canvasY };
+   652→   652→      if (!selRafRef.current) {
+   653→   653→        selRafRef.current = requestAnimationFrame(() => flushSelRef.current());
+   654→   654→      }
+   655→   655→    };
+   656→   656→
+   657→   657→    const handleViewportPointerUp = (e: PointerEvent) => {
+   658→   658→      const state = useDesignerStore.getState();
+   659→   659→      if (state.isSelecting) {
+   660→   660→        // Flush any pending selection update before finishing
+   661→   661→        if (selRafRef.current) {
+   662→   662→          cancelAnimationFrame(selRafRef.current);
+   663→   663→          selRafRef.current = null;
+   664→   664→        }
+   665→   665→        if (selCoordsRef.current) {
+   666→   666→          useDesignerStore.getState().updateSelection(
+   667→   667→            selCoordsRef.current.canvasX,
+   668→   668→            selCoordsRef.current.canvasY,
+   669→   669→          );
+   670→   670→          selCoordsRef.current = null;
+   671→   671→        }
+   672→   672→        state.finishSelection();
+   673→   673→      }
+   674→   674→
+   675→   675→      // Release pointer capture
+   676→   676→      try { viewport.releasePointerCapture(e.pointerId); } catch {}
+   677→   677→      lastPointerIdRef.current = null;
+   678→   678→    };
+   679→   679→
+   680→   680→    viewport.addEventListener('pointerdown', handlePointerDown);
+   681→   681→    viewport.addEventListener('pointermove', handleViewportPointerMove);
+   682→   682→    viewport.addEventListener('pointerup', handleViewportPointerUp);
+   683→   683→
+   684→   684→    return () => {
+   685→   685→      viewport.removeEventListener('pointerdown', handlePointerDown);
+   686→   686→      viewport.removeEventListener('pointermove', handleViewportPointerMove);
+   687→   687→      viewport.removeEventListener('pointerup', handleViewportPointerUp);
+   688→   688→    };
+   689→   689→  }, []);
+   690→   690→
+   691→   691→  // Track SHIFT key state globally for angle snapping
+   692→   692→  useEffect(() => {
+   693→   693→    const handleKeyDown = (e: KeyboardEvent) => {
+   694→   694→      if (e.key === 'Shift') {
+   695→   695→        useDesignerStore.getState().setShiftHeld(true);
+   696→   696→        // When SHIFT is pressed during endpoint drag, re-trigger with current position
+   697→   697→        const state = useDesignerStore.getState();
+   698→   698→        if (state.isEndpointDragging && lastMouseRef.current) {
+   699→   699→          state.updateEndpointDrag(lastMouseRef.current.x, lastMouseRef.current.y, true);
+   700→   700→        }
+   701→
+   702→[showing lines 1-700 of 1873; use offset=701 with limit to continue reading]

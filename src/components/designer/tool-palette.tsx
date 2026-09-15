@@ -780,6 +780,8 @@ export function ToolPalette() {
               onPointerDown={(e) => handleToolPointerDown(e, tool.type)}
               onPointerMove={handleToolPointerMove}
               onPointerUp={handleToolPointerUp}
+              aria-label={`Add ${tool.label.toLowerCase()} element`}
+              title={`Add ${tool.label.toLowerCase()}`}
               style={{ animationDelay: `${index * 50}ms` }}
               className={`
                 group/tool relative flex items-center justify-center

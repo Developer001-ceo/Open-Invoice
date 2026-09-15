@@ -714,7 +714,7 @@ interface DesignerState {
   setNewProjectOpen: (open: boolean) => void;
   setRegisterIconOpen: (open: boolean) => void;
   setProjectName: (name: string) => void;
-  loadProjectFromFileData: (file: ProjectFile) => void;
+  loadProjectFromFileData: (file: ProjectFile) => boolean;
   setExportPdfOpen: (open: boolean) => void;
   setLargePreviewOpen: (open: boolean) => void;
   setWelcomeModalOpen: (open: boolean) => void;
@@ -4022,8 +4022,13 @@ export const useDesignerStore = create<DesignerState>((set, get) => {
       const result = await openProjectWithDialog();
       const { project, rawFilename, fileHandle } = result;
 
-      // Apply the loaded state using the internal method
-      get().loadProjectFromFileData(project);
+      // Apply the loaded state using the internal method. If deserialization
+      // failed (corrupt file), bail out WITHOUT touching save state — binding
+      // the new fileHandle here would make the next Ctrl+S silently write the
+      // still-on-canvas project into the unrelated file on disk.
+      if (!get().loadProjectFromFileData(project)) {
+        return false;
+      }
 
       // Update save-related state
       set({
@@ -4061,7 +4066,7 @@ export const useDesignerStore = create<DesignerState>((set, get) => {
         description: 'The project file appears to be corrupt or is in an unsupported format.',
         variant: 'destructive',
       });
-      return;
+      return false;
     }
 
     invalidateSnapCache();
@@ -4115,6 +4120,7 @@ export const useDesignerStore = create<DesignerState>((set, get) => {
       canRedo: false,
       isDirty: true,
     });
+    return true;
   },
 
   newProject: (options?: { projectName?: string; canvasSettings?: CanvasSettings }) => {
